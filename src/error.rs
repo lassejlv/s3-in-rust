@@ -89,4 +89,9 @@ impl S3Error {
         self.message = msg.into();
         self
     }
+
+    pub fn with_code(mut self, code: &'static str) -> Self {
+        self.code = code;
+        self
+    }
 }

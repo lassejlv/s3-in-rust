@@ -213,6 +213,35 @@ impl Auth {
         Err(err::AccessDenied())
     }
 
+    /// Verify the signature of a browser-form upload (POST policy). `fields` maps lowercase
+    /// form-field names to values; the signature covers the base64 policy document.
+    pub fn verify_post_policy(&self, fields: &HashMap<String, String>, policy_b64: &str) -> S3Result<Principal> {
+        if let Some(sig) = fields.get("x-amz-signature") {
+            if fields.get("x-amz-algorithm").map(String::as_str) != Some(ALGO) {
+                return Err(err::InvalidArgument().with_message("x-amz-algorithm must be AWS4-HMAC-SHA256"));
+            }
+            let cred =
+                fields.get("x-amz-credential").ok_or_else(|| err::AccessDenied().with_message("Missing x-amz-credential"))?;
+            let (ak, date, region, service) = parse_credential(cred)?;
+            let key = self.signing_key(ak, date, region, service)?;
+            let expected = hex(&hmac(&key, policy_b64.as_bytes()));
+            if !ct_eq(expected.as_bytes(), sig.trim().as_bytes()) {
+                return Err(err::SignatureDoesNotMatch());
+            }
+            return Ok(self.principal(ak));
+        }
+        if let (Some(ak), Some(sig)) = (fields.get("awsaccesskeyid"), fields.get("signature")) {
+            let secret = self.credential(ak)?.secret.as_bytes();
+            let mut m = <hmac::Hmac<sha1::Sha1> as KeyInit>::new_from_slice(secret).expect("hmac key");
+            m.update(policy_b64.as_bytes());
+            if !ct_eq(util::base64(&m.finalize().into_bytes()).as_bytes(), sig.trim().as_bytes()) {
+                return Err(err::SignatureDoesNotMatch());
+            }
+            return Ok(self.principal(ak));
+        }
+        Err(err::AccessDenied().with_message("POST policy requires a signature"))
+    }
+
     /// AWS Signature Version 2 (legacy; still used by some clients for presigned URLs).
     fn verify_v2(
         &self,

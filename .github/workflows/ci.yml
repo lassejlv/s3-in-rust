@@ -41,13 +41,16 @@ jobs:
       - name: Start s3rs
         run: |
           printf 'rokey:rosecret:ro\n' > /tmp/creds
-          ./target/release/s3rs -d /tmp/s3rs-data -l 127.0.0.1:9000 \
-            --access-key testkey --secret-key testsecret --credentials-file /tmp/creds > /tmp/s3rs.log 2>&1 &
+          # Fast lifecycle sweeps (1s) with 2-second "days" so expiration can be tested.
+          S3RS_LIFECYCLE_DAY_SECS=2 ./target/release/s3rs -d /tmp/s3rs-data -l 127.0.0.1:9000 \
+            --access-key testkey --secret-key testsecret --credentials-file /tmp/creds \
+            --lifecycle-interval 1 > /tmp/s3rs.log 2>&1 &
           for i in $(seq 50); do curl -sf http://127.0.0.1:9000/_health && break; sleep 0.1; done
       - name: boto3 suite
         env:
           S3RS_RO_ACCESS_KEY: rokey
           S3RS_RO_SECRET_KEY: rosecret
+          S3RS_FAST_LIFECYCLE: "1"
         run: python3 tests/e2e.py
       - name: aws-cli smoke test
         env:

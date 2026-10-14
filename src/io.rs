@@ -30,6 +30,24 @@ const SMALL_READ: u64 = 1024 * 1024;
 
 // ------------------------------------------------------------------ request bodies
 
+/// A stream of upload bytes: a plain request body, or the file part of a form upload.
+pub trait Source: Send {
+    fn next(&mut self) -> impl std::future::Future<Output = S3Result<Option<Bytes>>> + Send;
+    /// A trailing header (aws-chunked trailers carry checksums).
+    fn trailer(&self, _name: &str) -> Option<&str> {
+        None
+    }
+}
+
+impl Source for BodyStream {
+    async fn next(&mut self) -> S3Result<Option<Bytes>> {
+        BodyStream::next(self).await
+    }
+    fn trailer(&self, name: &str) -> Option<&str> {
+        BodyStream::trailer(self, name)
+    }
+}
+
 /// Request body with aws-chunked framing removed.
 pub struct BodyStream {
     body: Option<Incoming>,
@@ -208,7 +226,7 @@ impl Ingested {
 
 type Checksum = Option<(ChecksumAlgo, String)>;
 
-fn verify(h: Hashers, size: u64, e: &Expect, body: &BodyStream) -> S3Result<([u8; 16], Checksum)> {
+fn verify(h: Hashers, size: u64, e: &Expect, body: &impl Source) -> S3Result<([u8; 16], Checksum)> {
     if let Some(len) = e.len
         && len != size
     {
@@ -249,7 +267,7 @@ fn verify(h: Hashers, size: u64, e: &Expect, body: &BodyStream) -> S3Result<([u8
 }
 
 /// Stream a request body into storage, verifying lengths, digests and checksums.
-pub async fn ingest(store: &Arc<Store>, mut body: BodyStream, e: Expect) -> S3Result<Ingested> {
+pub async fn ingest(store: &Arc<Store>, mut body: impl Source, e: Expect) -> S3Result<Ingested> {
     if e.len.is_some_and(|l| l > e.max_len) {
         return Err(err::EntityTooLarge());
     }

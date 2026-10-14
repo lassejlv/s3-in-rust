@@ -31,6 +31,8 @@ pub struct Options {
     pub verbose: bool,
     /// Origins allowed by default for buckets without their own CORS configuration.
     pub cors_origins: Vec<String>,
+    /// If set, `/_metrics` requires `Authorization: Bearer <token>`.
+    pub metrics_token: Option<String>,
 }
 
 pub struct Server {
@@ -43,6 +45,10 @@ pub struct Server {
     default_cors: Option<Vec<CorsRule>>,
     /// Parsed ACL / policy / CORS per bucket; invalidated whenever they change.
     access_cache: RwLock<HashMap<String, Arc<BucketAccess>>>,
+    /// Bumped on every invalidation; a load only populates the cache if no invalidation
+    /// happened while it was reading, so a stale (e.g. revoked public) entry is never cached.
+    access_gen: AtomicU64,
+    metrics_token: Option<String>,
     req_counter: AtomicU64,
     rid_base: u64,
 }
@@ -306,6 +312,8 @@ impl Server {
             metrics: Default::default(),
             default_cors,
             access_cache: RwLock::new(HashMap::new()),
+            access_gen: AtomicU64::new(0),
+            metrics_token: opts.metrics_token,
             req_counter: AtomicU64::new(1),
             rid_base: util::new_id() as u64,
         }
@@ -316,6 +324,7 @@ impl Server {
         if let Some(a) = self.access_cache.read().unwrap().get(bucket) {
             return Ok(a.clone());
         }
+        let generation = self.access_gen.load(Ordering::SeqCst);
         let acl = match self.store.bucket_config(bucket, "acl")? {
             Some(v) => CannedAcl::parse(&String::from_utf8_lossy(&v)).unwrap_or_default(),
             None => CannedAcl::Private,
@@ -329,15 +338,19 @@ impl Server {
             .and_then(|d| access::parse_cors(&d).ok());
         let a = Arc::new(BucketAccess { acl, policy, cors });
         let mut cache = self.access_cache.write().unwrap();
-        if cache.len() > 10_000 {
-            cache.clear();
+        if self.access_gen.load(Ordering::SeqCst) == generation {
+            if cache.len() > 10_000 {
+                cache.clear();
+            }
+            cache.insert(bucket.to_string(), a.clone());
         }
-        cache.insert(bucket.to_string(), a.clone());
         Ok(a)
     }
 
     fn invalidate_access(&self, bucket: &str) {
-        self.access_cache.write().unwrap().remove(bucket);
+        let mut cache = self.access_cache.write().unwrap();
+        self.access_gen.fetch_add(1, Ordering::SeqCst);
+        cache.remove(bucket);
     }
 
     async fn set_bucket_config(&self, bucket: &str, kind: &'static str, value: Option<Vec<u8>>) -> S3Result<()> {
@@ -382,15 +395,18 @@ impl Server {
         let (Some(origin), Some(method)) = (origin, method) else {
             return Err(err::InvalidRequest().with_message("Insufficient information. Origin request header needed."));
         };
-        if let Some(b) = bucket {
-            self.store.require_bucket(b)?;
+        let forbidden =
+            || S3Error::new("AccessForbidden", StatusCode::FORBIDDEN, "CORSResponse: This CORS request is not allowed.");
+        // Same answer for missing and existing buckets, so preflights don't reveal which exist.
+        if let Some(b) = bucket
+            && !self.store.bucket_exists(b)?
+        {
+            return Err(forbidden());
         }
         let req_headers: Vec<String> = header(&parts.headers, "access-control-request-headers")
             .map(|h| h.split(',').map(|s| s.trim().to_ascii_lowercase()).filter(|s| !s.is_empty()).collect())
             .unwrap_or_default();
         let hdr_refs: Vec<&str> = req_headers.iter().map(String::as_str).collect();
-        let forbidden =
-            || S3Error::new("AccessForbidden", StatusCode::FORBIDDEN, "CORSResponse: This CORS request is not allowed.");
         let rules = self.cors_rules(bucket).ok_or_else(forbidden)?;
         let rule = access::find_cors_rule(&rules, origin, method, &hdr_refs).ok_or_else(forbidden)?;
         let wildcard = rule.origins.iter().any(|o| o == "*");
@@ -465,7 +481,7 @@ impl Server {
         let query = req.uri().query().map(|q| format!("?{q}")).unwrap_or_default();
         let origin = header(req.headers(), "origin").map(str::to_string);
         let cors_bucket = origin.as_ref().and_then(|_| self.resolve(req.uri(), req.headers()).ok()).and_then(|(b, _, _)| b);
-        self.metrics.start();
+        let _inflight = self.metrics.start();
         let mut resp = match self.route(req).await {
             Ok(r) => r,
             Err(e) => {
@@ -527,21 +543,36 @@ impl Server {
 
     async fn route(&self, req: Request<Incoming>) -> S3Result<Resp> {
         let (parts, body) = req.into_parts();
-        if parts.uri.path() == "/_health" {
+        let raw_query = parts.uri.query().unwrap_or("");
+        let (bucket, key, vhost) = self.resolve(&parts.uri, &parts.headers)?;
+        // Built-in endpoints. `_` cannot start a bucket name, so these never shadow a bucket;
+        // with virtual-hosted addressing they are only matched when no bucket was resolved.
+        if !vhost && parts.uri.path() == "/_health" {
             let mut r = Resp::ok();
             r.body = Body::full(Bytes::from_static(b"ok\n"));
             return Ok(r);
         }
-        if parts.uri.path() == "/_metrics" {
+        if !vhost && parts.uri.path() == "/_metrics" {
+            if let Some(token) = &self.metrics_token {
+                let given = header(&parts.headers, "authorization").and_then(|h| h.strip_prefix("Bearer ")).unwrap_or("");
+                if !util::ct_eq(given.trim().as_bytes(), token.as_bytes()) {
+                    return Err(err::AccessDenied());
+                }
+            }
             let mut r = Resp::ok();
             r.set("content-type", "text/plain; version=0.0.4");
             r.body = Body::full(self.metrics.render(&self.store));
             return Ok(r);
         }
-        let raw_query = parts.uri.query().unwrap_or("");
-        let (bucket, key, vhost) = self.resolve(&parts.uri, &parts.headers)?;
         if parts.method == Method::OPTIONS {
             return self.preflight(&parts, bucket.as_deref());
+        }
+        if parts.method == Method::POST
+            && key.is_none()
+            && let Some(b) = &bucket
+            && let Some(boundary) = header(&parts.headers, "content-type").and_then(crate::post::boundary)
+        {
+            return self.post_object(&parts, body, b, &boundary).await;
         }
         let (mut payload, principal) = match &self.auth {
             None => (auth::payload_mode(&parts)?, Principal::Everyone),
@@ -645,7 +676,10 @@ impl Server {
                         let doc = self.store.bucket_config(bucket, "tagging")?.ok_or_else(err::NoSuchTagSet)?;
                         Ok(Resp::xml(String::from_utf8_lossy(&doc).into_owned()))
                     }
-                    "lifecycle" => Err(err::NoSuchLifecycleConfiguration()),
+                    "lifecycle" => {
+                        let doc = self.store.bucket_config(bucket, "lifecycle")?.ok_or_else(err::NoSuchLifecycleConfiguration)?;
+                        Ok(Resp::xml(String::from_utf8_lossy(&doc).into_owned()))
+                    }
                     "encryption" => Err(err::ServerSideEncryptionConfigurationNotFoundError()),
                     "logging" => Ok(Resp::xml(Xml::new("BucketLoggingStatus").finish("BucketLoggingStatus"))),
                     "notification" => Ok(Resp::xml(Xml::new("NotificationConfiguration").finish("NotificationConfiguration"))),
@@ -694,6 +728,13 @@ impl Server {
                 self.set_bucket_config(bucket, "tagging", Some(access::tagging_xml(&tags).into_bytes())).await?;
                 Ok(Resp::new(StatusCode::NO_CONTENT))
             }
+            Method::PUT if sub == Some("lifecycle") => {
+                let body = self.read_body(r, MAX_XML_BODY).await?;
+                let doc = xml::parse(&String::from_utf8_lossy(&body)).ok_or_else(err::MalformedXML)?;
+                crate::lifecycle::parse(&doc)?;
+                self.set_bucket_config(bucket, "lifecycle", Some(body.to_vec())).await?;
+                Ok(Resp::ok())
+            }
             Method::PUT if sub.is_some() || r.has("versioning") => Err(err::NotImplemented()),
             Method::PUT => {
                 if !valid_bucket_name(bucket) {
@@ -711,7 +752,7 @@ impl Server {
                 resp.set("location", &format!("/{bucket}"));
                 Ok(resp)
             }
-            Method::DELETE if matches!(sub, Some("policy" | "cors" | "tagging")) => {
+            Method::DELETE if matches!(sub, Some("policy" | "cors" | "tagging" | "lifecycle")) => {
                 let kind = sub.unwrap();
                 let kind: &'static str = store::CONFIG_KINDS.iter().find(|k| **k == kind).unwrap();
                 self.set_bucket_config(bucket, kind, None).await?;
@@ -1336,6 +1377,107 @@ impl Server {
         Err(err::NoSuchKey())
     }
 
+    /// Browser-based upload: `POST /bucket` with a multipart form (and usually a signed policy).
+    async fn post_object(&self, parts: &Parts, body: Incoming, bucket: &str, boundary: &str) -> S3Result<Resp> {
+        let mut payload = Payload::Unsigned;
+        let stream = BodyStream::new(body, &mut payload);
+        let (form, file) = crate::post::parse_form(stream, boundary).await?;
+        let f = &form.fields;
+        let key = form_key(
+            f.get("key").ok_or_else(|| err::InvalidArgument().with_message("Bucket POST must contain a field named 'key'."))?,
+            form.file_name.as_deref(),
+        );
+        if key.is_empty() {
+            return Err(err::InvalidArgument().with_message("User key must have a length greater than 0."));
+        }
+        check_key(&key)?;
+
+        let range = match f.get("policy") {
+            Some(policy) => {
+                if let Some(a) = &self.auth
+                    && a.verify_post_policy(f, policy)? == (Principal::User { read_only: true })
+                {
+                    return Err(err::AccessDenied().with_message("This access key is read-only"));
+                }
+                crate::post::PostPolicy::parse(policy)?.check(f, bucket)?
+            }
+            None => {
+                // Unsigned form: allowed only when the bucket accepts anonymous uploads.
+                if self.auth.is_some() {
+                    let access = self.bucket_access(bucket).map_err(|_| err::AccessDenied())?;
+                    if !access.allows_anonymous("s3:PutObject", &format!("arn:aws:s3:::{bucket}/{key}")) {
+                        return Err(err::AccessDenied());
+                    }
+                }
+                None
+            }
+        };
+        self.store.require_bucket(bucket)?;
+
+        let tags = match f.get("tagging") {
+            Some(doc) => access::parse_tagging_xml(&xml::parse(doc).ok_or_else(err::MalformedXML)?, 10)?,
+            None => Vec::new(),
+        };
+        let mut headers = Vec::new();
+        for (name, value) in f {
+            if matches!(name.as_str(), "content-type" | "cache-control" | "content-disposition" | "content-encoding" | "expires")
+                || name.starts_with("x-amz-meta-")
+            {
+                headers.push((name.clone(), value.clone()));
+            }
+        }
+        if !f.contains_key("content-type")
+            && let Some(ct) = &form.file_content_type
+        {
+            headers.push(("content-type".into(), ct.clone()));
+        }
+        headers.sort();
+
+        let (min, max) = range.unwrap_or((0, MAX_OBJECT_SIZE));
+        let expect = Expect { max_len: max.min(MAX_OBJECT_SIZE), allow_inline: true, ..Default::default() };
+        let ing = io::ingest(&self.store, file, expect).await?;
+        let (storage, inline, files) = ing.storage();
+        if ing.size < min {
+            self.store.discard(files);
+            return Err(err::EntityTooSmall());
+        }
+        self.metrics.add_bytes_in(ing.size);
+        let etag = ing.etag();
+        let meta = ObjectMeta { size: ing.size, mtime_ms: now_ms(), etag: etag.clone(), headers, checksum: None, storage, tags };
+        self.store
+            .submit_owning(Op::PutObject { bucket: bucket.into(), key: key.clone(), meta, inline, cond: None }, files)
+            .await?;
+
+        let host = header(&parts.headers, "host").unwrap_or("localhost");
+        let location = format!("http://{host}/{bucket}/{}", uri_encode(&key, true));
+        let redirect = f.get("success_action_redirect").or_else(|| f.get("redirect")).filter(|u| !u.is_empty());
+        if let Some(url) = redirect {
+            let sep = if url.contains('?') { '&' } else { '?' };
+            let target = format!(
+                "{url}{sep}bucket={}&key={}&etag={}",
+                uri_encode(bucket, false),
+                uri_encode(&key, false),
+                uri_encode(&etag, false)
+            );
+            let mut resp = Resp::new(StatusCode::SEE_OTHER);
+            resp.set("location", &target).set("etag", &etag);
+            return Ok(resp);
+        }
+        let mut resp = match f.get("success_action_status").map(String::as_str) {
+            Some("201") => {
+                let mut x = Xml::new("PostResponse");
+                x.elem("Location", &location).elem("Bucket", bucket).elem("Key", &key).elem("ETag", &etag);
+                let mut r = Resp::xml(x.finish("PostResponse"));
+                r.status = StatusCode::CREATED;
+                r
+            }
+            Some("200") => Resp::ok(),
+            _ => Resp::new(StatusCode::NO_CONTENT),
+        };
+        resp.set("etag", &etag).set("location", &location);
+        Ok(resp)
+    }
+
     async fn read_xml(&self, r: &mut Req) -> S3Result<xml::Node> {
         let body = self.read_body(r, MAX_XML_BODY).await?;
         let text = std::str::from_utf8(&body).map_err(|_| err::MalformedXML())?;
@@ -1423,6 +1565,12 @@ impl Server {
 /// Tags from the `x-amz-tagging` request header.
 fn request_tags(r: &Req) -> S3Result<Vec<(String, String)>> {
     r.header("x-amz-tagging").map(access::parse_tagging_header).transpose().map(Option::unwrap_or_default)
+}
+
+/// Expand `${filename}` in a form-upload key.
+fn form_key(key: &str, filename: Option<&str>) -> String {
+    let base = filename.map(|f| f.rsplit(['/', '\\']).next().unwrap_or(f)).unwrap_or("");
+    key.replace("${filename}", base)
 }
 
 fn parse_upload_id(r: &Req) -> S3Result<u128> {

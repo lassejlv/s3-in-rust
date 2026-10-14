@@ -30,7 +30,7 @@ const PARTS: TableDefinition<(u128, u32), &[u8]> = TableDefinition::new("parts")
 const CONFIG: TableDefinition<(&str, &str), &[u8]> = TableDefinition::new("bucket_config");
 
 /// Kinds of bucket configuration stored in `CONFIG`.
-pub const CONFIG_KINDS: &[&str] = &["acl", "policy", "cors", "tagging"];
+pub const CONFIG_KINDS: &[&str] = &["acl", "policy", "cors", "tagging", "lifecycle"];
 
 pub const MIN_PART_SIZE: u64 = 5 * 1024 * 1024;
 const MAX_BATCH: usize = 1024;
@@ -71,14 +71,56 @@ pub enum WriteCond {
 pub enum Op {
     CreateBucket(String),
     DeleteBucket(String),
-    PutObject { bucket: String, key: String, meta: ObjectMeta, inline: Option<Bytes>, cond: Option<WriteCond> },
-    DeleteObjects { bucket: String, keys: Vec<String> },
-    CreateUpload { id: u128, meta: UploadMeta },
-    PutPart { upload: u128, bucket: String, key: String, part: u32, meta: PartMeta },
-    Complete { bucket: String, key: String, upload: u128, parts: Vec<(u32, String)>, cond: Option<WriteCond> },
-    Abort { bucket: String, key: String, upload: u128 },
-    SetBucketConfig { bucket: String, kind: &'static str, value: Option<Vec<u8>> },
-    SetObjectTags { bucket: String, key: String, tags: Vec<(String, String)> },
+    PutObject {
+        bucket: String,
+        key: String,
+        meta: ObjectMeta,
+        inline: Option<Bytes>,
+        cond: Option<WriteCond>,
+    },
+    DeleteObjects {
+        bucket: String,
+        keys: Vec<String>,
+    },
+    CreateUpload {
+        id: u128,
+        meta: UploadMeta,
+    },
+    PutPart {
+        upload: u128,
+        bucket: String,
+        key: String,
+        part: u32,
+        meta: PartMeta,
+    },
+    Complete {
+        bucket: String,
+        key: String,
+        upload: u128,
+        parts: Vec<(u32, String)>,
+        cond: Option<WriteCond>,
+    },
+    Abort {
+        bucket: String,
+        key: String,
+        upload: u128,
+    },
+    SetBucketConfig {
+        bucket: String,
+        kind: &'static str,
+        value: Option<Vec<u8>>,
+    },
+    SetObjectTags {
+        bucket: String,
+        key: String,
+        tags: Vec<(String, String)>,
+    },
+    /// Lifecycle expiration: delete each (key, mtime_ms) only if the object still has that
+    /// mtime, so an object overwritten after the sweeper looked at it is left alone.
+    Expire {
+        bucket: String,
+        items: Vec<(String, u64)>,
+    },
     Flush,
 }
 
@@ -86,6 +128,7 @@ pub enum OpOut {
     Done,
     Object(ObjectMeta),
     Deleted(Vec<S3Result<()>>),
+    Count(usize),
 }
 
 struct Job {
@@ -401,6 +444,45 @@ impl Store {
         Ok((out, truncated))
     }
 
+    /// Objects with full metadata, in key order: keys starting with `prefix` and greater than
+    /// `after`, at most `limit`. Used by background jobs that need tags.
+    pub fn scan_objects(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        after: Option<&str>,
+        limit: usize,
+    ) -> S3Result<Vec<(String, ObjectMeta)>> {
+        let txn = self.db.begin_read()?;
+        let t = txn.open_table(OBJECTS)?;
+        let base_len = bucket.len() + 1;
+        let full_prefix = obj_key(bucket, prefix);
+        let end = prefix_successor(&full_prefix).unwrap_or_else(|| {
+            let mut e = bucket.as_bytes().to_vec();
+            e.push(1);
+            e
+        });
+        let start = match after {
+            Some(a) if a >= prefix => Bound::Excluded(obj_key(bucket, a)),
+            _ => Bound::Included(full_prefix),
+        };
+        let lower = match &start {
+            Bound::Included(v) => Bound::Included(v.as_slice()),
+            Bound::Excluded(v) => Bound::Excluded(v.as_slice()),
+            Bound::Unbounded => Bound::Unbounded,
+        };
+        let mut out = Vec::new();
+        for e in t.range::<&[u8]>((lower, Bound::Excluded(end.as_slice())))? {
+            if out.len() >= limit {
+                break;
+            }
+            let (k, v) = e?;
+            let key = String::from_utf8(k.value()[base_len..].to_vec()).map_err(|_| S3Error::internal("bad key"))?;
+            out.push((key, ObjectMeta::decode(v.value())?));
+        }
+        Ok(out)
+    }
+
     pub fn list_uploads(&self, bucket: &str, prefix: &str) -> S3Result<Vec<UploadEntry>> {
         let t = self.db.begin_read()?.open_table(UPLOADS)?;
         let mut out = Vec::new();
@@ -674,6 +756,17 @@ fn apply(tx: &mut Tables, op: Op, garbage: &mut Vec<u128>) -> S3Result<OpOut> {
             }
             replace_object(tx, &k, Some(&meta), garbage)?;
             Ok(OpOut::Object(meta))
+        }
+        Op::Expire { bucket, items } => {
+            let mut n = 0;
+            for (key, mtime) in items {
+                let k = obj_key(&bucket, &key);
+                if get_meta(tx, &k)?.is_some_and(|m| m.mtime_ms == mtime) {
+                    replace_object(tx, &k, None, garbage)?;
+                    n += 1;
+                }
+            }
+            Ok(OpOut::Count(n))
         }
         Op::DeleteObjects { bucket, keys } => {
             if tx.buckets.get(bucket.as_str())?.is_none() {

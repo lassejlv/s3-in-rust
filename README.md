@@ -53,6 +53,8 @@ Each flag can also be set with the environment variable shown.
 | `--credentials-file` | `S3RS_CREDENTIALS_FILE` | | More keys, one `access_key:secret_key[:ro]` per line. `ro` keys can only read. |
 | `--anonymous` | | off | Turns off authentication. Use it only on trusted networks. |
 | `--cors-origins` | `S3RS_CORS_ORIGINS` | | Comma-separated origins (e.g. `*`) allowed for buckets that have no CORS configuration of their own |
+| `--metrics-token` | `S3RS_METRICS_TOKEN` | | Requires `Authorization: Bearer <token>` on `/_metrics` |
+| `--lifecycle-interval` | `S3RS_LIFECYCLE_INTERVAL` | `3600` | Seconds between lifecycle sweeps. `0` turns lifecycle off. |
 | `--region` | `S3RS_REGION` | `us-east-1` | Region reported to clients |
 | `--domain` | `S3RS_DOMAIN` | | Turns on virtual-hosted-style requests (`<bucket>.<domain>`) |
 | `--inline-threshold` | `S3RS_INLINE_THRESHOLD` | `65536` | Objects up to this many bytes are stored inside the metadata DB |
@@ -63,8 +65,8 @@ Each flag can also be set with the environment variable shown.
 The server refuses to start without credentials unless you pass `--anonymous`.
 
 `GET /_health` returns `200 ok`. `GET /_metrics` serves Prometheus metrics: request counts by method
-and status, a latency histogram, bytes in and out, and the bucket count. Neither endpoint needs
-authentication.
+and status, a latency histogram, bytes in and out, lifecycle activity, and the bucket count. Both
+endpoints are public unless you set `--metrics-token`, which applies to `/_metrics` only.
 
 On `SIGTERM` or Ctrl-C the server stops accepting connections and waits up to 30 seconds for
 in-flight requests to finish. It then flushes metadata and records a clean shutdown. If a run
@@ -102,6 +104,34 @@ requests are answered without authentication. Matching responses get `Access-Con
 error responses get them too, so browsers can read the error. Use `--cors-origins` to set a
 server-wide default for buckets that have no CORS configuration.
 
+## Lifecycle rules
+
+`PutBucketLifecycleConfiguration` supports:
+- `Expiration` with `Days` or `Date`.
+- `AbortIncompleteMultipartUpload`.
+- Filters by `Prefix`, `Tag`, `And`, `ObjectSizeGreaterThan` and `ObjectSizeLessThan`.
+
+A background task applies the rules every `--lifecycle-interval` seconds. As on S3, a `Days` rule
+expires an object at the first midnight (UTC) after its age reaches that many days. Expiration is a
+compare-and-delete: an object overwritten after the sweeper looked at it is kept. `Transition` and
+noncurrent-version actions are accepted but have no effect, since there is one storage class and no
+versioning.
+
+## Browser uploads (POST policy)
+
+`POST /<bucket>` with `multipart/form-data` accepts browser form uploads, including those made with
+`generate_presigned_post` from boto3 and the equivalent helpers in other SDKs. Supported:
+- SigV4 and SigV2 policy signatures.
+- Policy conditions `eq`, `starts-with` and `content-length-range`. Every form field must be
+  covered by a condition, as on S3.
+- `${filename}` in the key.
+- The `success_action_status` (200/201/204) and `success_action_redirect` responses.
+- Metadata, `Content-Type` and `tagging` fields.
+
+The file is streamed straight to storage and never buffered in memory. A form without a policy is
+only accepted when the bucket allows anonymous `s3:PutObject`. Combine form uploads with CORS for
+direct uploads from web apps.
+
 ## S3 API coverage
 
 | Area | Operations |
@@ -110,14 +140,16 @@ server-wide default for buckets that have no CORS configuration.
 | Objects | PutObject, GetObject, HeadObject, DeleteObject, DeleteObjects, CopyObject (COPY/REPLACE for metadata and tags), Get/Put/DeleteObjectTagging, `x-amz-tagging` on upload, GetObjectAcl |
 | Listing | ListObjects (v1), ListObjectsV2, ListObjectVersions (one `null` version per key); prefix, delimiter, pagination, `start-after`, `encoding-type=url` |
 | Multipart | CreateMultipartUpload, UploadPart, UploadPartCopy (with ranges), CompleteMultipartUpload, AbortMultipartUpload, ListParts, ListMultipartUploads |
+| Lifecycle | Get/Put/DeleteBucketLifecycleConfiguration (expiration, abort incomplete uploads) |
+| Forms | POST Object (browser uploads with POST policies) |
 | Reads | Single `Range` requests, `partNumber` reads, `If-Match` / `If-None-Match` / `If-Modified-Since` / `If-Unmodified-Since`, `response-*` header overrides |
 | Writes | Conditional writes (`If-None-Match: *`, `If-Match`), `Content-MD5`, `x-amz-content-sha256` verification, user metadata (`x-amz-meta-*`) and standard headers |
 | Checksums | CRC32, CRC32C, CRC64NVME, SHA1 and SHA256, sent as headers or as aws-chunked trailers. They are verified on upload and returned with `x-amz-checksum-mode: ENABLED`. |
 | Auth | SigV4 headers, SigV4 presigned URLs, SigV4 streaming (`STREAMING-AWS4-HMAC-SHA256-PAYLOAD[-TRAILER]`, `STREAMING-UNSIGNED-PAYLOAD-TRAILER`), SigV2 headers and presigned URLs |
 | Transport | HTTP/1.1 keep-alive, HTTP/2 (h2c), path-style and virtual-hosted-style addressing |
 
-Not implemented: versioning, per-user IAM policies, server-side encryption, object lock, lifecycle
-rules, website hosting, and SigV4A. These requests return
+Not implemented: versioning, per-user IAM policies, server-side encryption, object lock, storage
+class transitions, website hosting, and SigV4A. These requests return
 `NotImplemented` or the matching "not found" configuration error.
 
 ## Architecture

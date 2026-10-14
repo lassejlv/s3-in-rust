@@ -140,6 +140,26 @@ pub fn parse_amz_date(s: &str) -> Option<u64> {
     Some((days * 86_400 + (h * 3600 + mi * 60 + se) as i64) as u64)
 }
 
+/// Parse `2026-01-01T00:00:00Z` or `2026-01-01T00:00:00.000Z` into unix seconds.
+pub fn parse_iso8601(s: &str) -> Option<u64> {
+    let b = s.as_bytes();
+    if b.len() < 20 || b[4] != b'-' || b[7] != b'-' || b[10] != b'T' || b[13] != b':' || b[16] != b':' || !s.ends_with('Z') {
+        return None;
+    }
+    let frac = &s[19..s.len() - 1];
+    if !(frac.is_empty() || (frac.starts_with('.') && frac.len() > 1 && frac[1..].bytes().all(|c| c.is_ascii_digit()))) {
+        return None;
+    }
+    let num = |r: std::ops::Range<usize>| -> Option<u32> { s.get(r)?.parse().ok() };
+    let (y, mo, d) = (num(0..4)?, num(5..7)?, num(8..10)?);
+    let (h, mi, se) = (num(11..13)?, num(14..16)?, num(17..19)?);
+    if !(1970..=9999).contains(&y) || !(1..=12).contains(&mo) || !(1..=31).contains(&d) || h > 23 || mi > 59 || se > 60 {
+        return None;
+    }
+    let days = days_from_civil(y as i64, mo, d);
+    Some((days * 86_400 + (h * 3600 + mi * 60 + se) as i64) as u64)
+}
+
 /// Format unix seconds as `20130524T000000Z`.
 pub fn amz_date(secs: u64) -> String {
     let (y, mo, d) = civil_from_days((secs / 86_400) as i64);
@@ -276,6 +296,10 @@ mod tests {
         assert_eq!(iso8601(1_255_369_830_000), "2009-10-12T17:50:30.000Z");
         assert_eq!(parse_amz_date("20091012T175030Z"), Some(1_255_369_830));
         assert_eq!(amz_date(1_255_369_830), "20091012T175030Z");
+        assert_eq!(parse_iso8601("2009-10-12T17:50:30.000Z"), Some(1_255_369_830));
+        assert_eq!(parse_iso8601("2009-10-12T17:50:30Z"), Some(1_255_369_830));
+        assert_eq!(parse_iso8601("2009-10-12 17:50:30Z"), None);
+        assert_eq!(parse_iso8601(&iso8601(1_700_000_000_123)), Some(1_700_000_000));
     }
 
     #[test]

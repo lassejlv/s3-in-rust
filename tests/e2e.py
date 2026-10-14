@@ -463,6 +463,116 @@ def t_metrics_and_health():
     assert "s3rs_request_duration_seconds_bucket" in text and "s3rs_buckets" in text
 
 
+def t_lifecycle():
+    # Needs a server started with --lifecycle-interval 1 and S3RS_LIFECYCLE_DAY_SECS=2.
+    if not os.environ.get("S3RS_FAST_LIFECYCLE"):
+        print("        (skipped: set S3RS_FAST_LIFECYCLE=1 with a fast-sweeping server)")
+        return
+    lb = B + "-lc"
+    s3.create_bucket(Bucket=lb)
+    expect_error("NoSuchLifecycleConfiguration", lambda: s3.get_bucket_lifecycle_configuration(Bucket=lb))
+    rules = [
+        {"ID": "tmp", "Status": "Enabled", "Filter": {"Prefix": "tmp/"}, "Expiration": {"Days": 1}},
+        {"ID": "dated", "Status": "Enabled", "Filter": {"Prefix": "dated/"}, "Expiration": {"Date": "2020-01-01T00:00:00Z"}},
+        {"ID": "tagged", "Status": "Enabled",
+         "Filter": {"And": {"Prefix": "tagged/", "Tags": [{"Key": "ttl", "Value": "short"}]}}, "Expiration": {"Days": 1}},
+        {"ID": "off", "Status": "Disabled", "Filter": {"Prefix": "keep/"}, "Expiration": {"Days": 1}},
+        {"ID": "mpu", "Status": "Enabled", "Filter": {"Prefix": ""}, "AbortIncompleteMultipartUpload": {"DaysAfterInitiation": 1}},
+    ]
+    s3.put_bucket_lifecycle_configuration(Bucket=lb, LifecycleConfiguration={"Rules": rules})
+    got = s3.get_bucket_lifecycle_configuration(Bucket=lb)["Rules"]
+    assert [r["ID"] for r in got] == ["tmp", "dated", "tagged", "off", "mpu"], got
+    for k in ["tmp/a", "dated/b", "keep/c", "other/d", "tagged/untagged"]:
+        s3.put_object(Bucket=lb, Key=k, Body=b"x")
+    s3.put_object(Bucket=lb, Key="tagged/short", Body=b"x", Tagging="ttl=short")
+    s3.create_multipart_upload(Bucket=lb, Key="stale-upload")
+    deadline = time.time() + 15
+    gone = {"tmp/a", "dated/b", "tagged/short"}
+    while time.time() < deadline:
+        keys = {o["Key"] for o in s3.list_objects_v2(Bucket=lb).get("Contents", [])}
+        if not (keys & gone) and not s3.list_multipart_uploads(Bucket=lb).get("Uploads"):
+            break
+        time.sleep(0.5)
+    keys = {o["Key"] for o in s3.list_objects_v2(Bucket=lb).get("Contents", [])}
+    assert keys == {"keep/c", "other/d", "tagged/untagged"}, keys
+    assert not s3.list_multipart_uploads(Bucket=lb).get("Uploads")
+    st, _, body = http("GET", "/_metrics")
+    assert b"s3rs_lifecycle_expired_objects_total" in body
+    s3.delete_bucket_lifecycle(Bucket=lb)
+    expect_error("NoSuchLifecycleConfiguration", lambda: s3.get_bucket_lifecycle_configuration(Bucket=lb))
+    expect_error("InvalidRequest", lambda: s3.put_bucket_lifecycle_configuration(
+        Bucket=lb, LifecycleConfiguration={"Rules": [{"ID": "x", "Status": "Enabled", "Filter": {"Prefix": ""}}]}))
+    for k in keys:
+        s3.delete_object(Bucket=lb, Key=k)
+    s3.delete_bucket(Bucket=lb)
+
+
+def _form_post(url, fields, file_bytes, filename="upload.bin", file_type="application/octet-stream"):
+    """Send a multipart/form-data POST with the file as the last part."""
+    boundary = "----s3rs" + uuid.uuid4().hex
+    parts = []
+    for k, v in fields.items():
+        parts.append(f'--{boundary}\r\nContent-Disposition: form-data; name="{k}"\r\n\r\n{v}\r\n'.encode())
+    parts.append(f'--{boundary}\r\nContent-Disposition: form-data; name="file"; filename="{filename}"\r\n'
+                 f"Content-Type: {file_type}\r\n\r\n".encode() + file_bytes + b"\r\n")
+    parts.append(f"--{boundary}--\r\n".encode())
+    return http("POST", url[len(ENDPOINT):], data=b"".join(parts),
+                headers={"Content-Type": f"multipart/form-data; boundary={boundary}"})
+
+
+def t_presigned_post():
+    for sigver in ["s3v4", "s3"]:
+        c = client(signature_version=sigver)
+        post = c.generate_presigned_post(
+            B, "forms/${filename}",
+            Fields={"success_action_status": "201", "x-amz-meta-origin": "browser"},
+            Conditions=[["starts-with", "$key", "forms/"], ["content-length-range", 1, 1_000_000],
+                        {"success_action_status": "201"}, {"x-amz-meta-origin": "browser"}],
+            ExpiresIn=300)
+        data = os.urandom(150_000)
+        st, h, body = _form_post(post["url"], post["fields"], data, filename=f"photo-{sigver}.jpg", file_type="image/jpeg")
+        assert st == 201, (sigver, st, body)
+        assert b"<Key>forms/photo-%s.jpg</Key>" % sigver.encode() in body, body
+        r = s3.get_object(Bucket=B, Key=f"forms/photo-{sigver}.jpg")
+        assert r["Body"].read() == data and r["ContentType"] == "image/jpeg" and r["Metadata"] == {"origin": "browser"}
+        assert r["ETag"] == h["ETag"]
+        # Too large for the policy's content-length-range.
+        st, _, body = _form_post(post["url"], post["fields"], b"x" * 1_000_001)
+        assert st == 400 and b"EntityTooLarge" in body, (st, body)
+        # Tampered signature / extra field / policy violation.
+        bad = dict(post["fields"])
+        sig_field = "x-amz-signature" if "x-amz-signature" in bad else "signature"
+        bad[sig_field] = ("0" + bad[sig_field])[: len(bad[sig_field])]
+        assert _form_post(post["url"], bad, b"data")[0] == 403
+        extra = dict(post["fields"], **{"x-amz-meta-sneaky": "1"})
+        st, _, body = _form_post(post["url"], extra, b"data")
+        assert st == 403 and b"Extra input fields" in body, body
+        wrong = dict(post["fields"], key="elsewhere/${filename}")
+        assert _form_post(post["url"], wrong, b"data")[0] == 403
+    # Default response (204) and redirect.
+    post = s3.generate_presigned_post(B, "forms/plain.txt", ExpiresIn=60)
+    st, _, _ = _form_post(post["url"], post["fields"], b"plain")
+    assert st == 204, st
+    assert s3.get_object(Bucket=B, Key="forms/plain.txt")["Body"].read() == b"plain"
+    post = s3.generate_presigned_post(B, "forms/r.txt", Fields={"success_action_redirect": "https://app.example/done"},
+                                      Conditions=[{"success_action_redirect": "https://app.example/done"}], ExpiresIn=60)
+    class NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, *a, **k):
+            return None
+    boundary = "b" + uuid.uuid4().hex
+    body = b"".join(f'--{boundary}\r\nContent-Disposition: form-data; name="{k}"\r\n\r\n{v}\r\n'.encode() for k, v in post["fields"].items())
+    body += f'--{boundary}\r\nContent-Disposition: form-data; name="file"; filename="r.txt"\r\n\r\nR\r\n--{boundary}--\r\n'.encode()
+    req = urllib.request.Request(post["url"], data=body, method="POST", headers={"Content-Type": f"multipart/form-data; boundary={boundary}"})
+    try:
+        urllib.request.build_opener(NoRedirect).open(req)
+        raise AssertionError("expected redirect")
+    except urllib.error.HTTPError as e:
+        assert e.code == 303 and e.headers["Location"].startswith("https://app.example/done?bucket="), (e.code, e.headers["Location"])
+    # Unsigned form to a private bucket is refused.
+    st, _, _ = _form_post(f"{ENDPOINT}/{B}", {"key": "anon.txt"}, b"x")
+    assert st == 403
+
+
 def t_overwrite():
     s3.put_object(Bucket=B, Key="ow", Body=b"x" * 300_000)
     s3.put_object(Bucket=B, Key="ow", Body=b"small")

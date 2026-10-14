@@ -21,6 +21,15 @@ pub struct Metrics {
     latency_sum_us: AtomicU64,
     bytes_in: AtomicU64,
     bytes_out: AtomicU64,
+    pub lifecycle: std::sync::Arc<crate::lifecycle::Stats>,
+}
+
+pub struct Inflight<'a>(&'a Metrics);
+
+impl Drop for Inflight<'_> {
+    fn drop(&mut self) {
+        self.0.inflight.fetch_sub(1, Relaxed);
+    }
 }
 
 fn method_idx(m: &Method) -> usize {
@@ -28,13 +37,15 @@ fn method_idx(m: &Method) -> usize {
 }
 
 impl Metrics {
-    pub fn start(&self) {
+    /// Count a request as in flight until the returned guard drops (which also happens when a
+    /// client disconnects and the request future is cancelled).
+    pub fn start(&self) -> Inflight<'_> {
         self.started.get_or_init(Instant::now);
         self.inflight.fetch_add(1, Relaxed);
+        Inflight(self)
     }
 
     pub fn finish(&self, m: &Method, status: u16, elapsed: Duration) {
-        self.inflight.fetch_sub(1, Relaxed);
         let class = (status / 100).clamp(1, 5) as usize - 1;
         self.requests[method_idx(m)][class].fetch_add(1, Relaxed);
         let secs = elapsed.as_secs_f64();
@@ -78,6 +89,16 @@ impl Metrics {
         let _ =
             writeln!(o, "# TYPE s3rs_received_bytes_total counter\ns3rs_received_bytes_total {}", self.bytes_in.load(Relaxed));
         let _ = writeln!(o, "# TYPE s3rs_sent_bytes_total counter\ns3rs_sent_bytes_total {}", self.bytes_out.load(Relaxed));
+        let _ = writeln!(
+            o,
+            "# TYPE s3rs_lifecycle_expired_objects_total counter\ns3rs_lifecycle_expired_objects_total {}",
+            self.lifecycle.expired.load(Relaxed)
+        );
+        let _ = writeln!(
+            o,
+            "# TYPE s3rs_lifecycle_aborted_uploads_total counter\ns3rs_lifecycle_aborted_uploads_total {}",
+            self.lifecycle.aborted_uploads.load(Relaxed)
+        );
         if let Ok(b) = store.list_buckets() {
             let _ = writeln!(o, "# TYPE s3rs_buckets gauge\ns3rs_buckets {}", b.len());
         }

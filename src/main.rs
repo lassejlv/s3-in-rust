@@ -4,6 +4,7 @@ mod access;
 mod auth;
 mod body;
 mod chunked;
+mod console;
 mod crypt;
 mod error;
 mod io;
@@ -56,6 +57,8 @@ OPTIONS (each also settable through the environment variable shown):
         --encryption-key-file <P> Read the master key from a file
         --encrypt-by-default     Encrypt every new object with the master key
                                                                  [S3RS_ENCRYPT_BY_DEFAULT=1]
+        --no-console             Do not serve the web console at /_console/
+                                                                 [S3RS_NO_CONSOLE=1]
         --metrics-token <T>      Require `Authorization: Bearer <T>` for /_metrics
                                                                  [S3RS_METRICS_TOKEN]
         --region <REGION>        Region reported to clients      [S3RS_REGION, default us-east-1]
@@ -85,6 +88,7 @@ struct Config {
     anonymous: bool,
     cors_origins: Vec<String>,
     metrics_token: Option<String>,
+    console: bool,
     encryption_key: Option<[u8; 32]>,
     encrypt_by_default: bool,
     region: String,
@@ -123,6 +127,7 @@ fn parse_args() -> Result<Config, String> {
         anonymous: false,
         cors_origins: env("S3RS_CORS_ORIGINS").map(|v| split_list(&v)).unwrap_or_default(),
         metrics_token: env("S3RS_METRICS_TOKEN"),
+        console: !env_flag("S3RS_NO_CONSOLE")?,
         encryption_key: env("S3RS_ENCRYPTION_KEY")
             .map(|k| parse_key(&k))
             .transpose()
@@ -164,6 +169,7 @@ fn parse_args() -> Result<Config, String> {
             "--anonymous" => c.anonymous = true,
             "--cors-origins" => c.cors_origins = split_list(&val()?),
             "--metrics-token" => c.metrics_token = Some(val()?),
+            "--no-console" => c.console = false,
             "--encryption-key" => c.encryption_key = Some(parse_key(&val()?).map_err(|e| format!("--encryption-key: {e}"))?),
             "--encryption-key-file" => {
                 let path = val()?;
@@ -328,6 +334,7 @@ async fn serve(cfg: Config, store: Arc<store::Store>, auth: Option<auth::Auth>) 
         master_key: cfg.encryption_key,
         encrypt_by_default: cfg.encrypt_by_default,
         website_domain: cfg.website_domain.clone(),
+        console: cfg.console,
     };
     let server = Arc::new(s3::Server::new(store.clone(), auth, opts));
     if cfg.lifecycle_interval > 0 {
@@ -351,6 +358,9 @@ async fn serve(cfg: Config, store: Arc<store::Store>, auth: Option<auth::Auth>) 
             (true, true) => "all objects (SSE-S3 default)",
         }
     );
+    if cfg.console {
+        eprintln!("s3rs web console on http://{}/_console/", cfg.listen);
+    }
     if let Some(a) = cfg.website_listen {
         eprintln!("s3rs website endpoint on http://{a}");
     }

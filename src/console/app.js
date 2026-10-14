@@ -1,0 +1,692 @@
+// s3rs web console: a small S3 client that signs every request in the browser (SigV4).
+"use strict";
+
+const $ = (id) => document.getElementById(id);
+const enc = new TextEncoder();
+const EMPTY_SHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+
+// ------------------------------------------------------------------ helpers
+
+function el(tag, attrs = {}, ...children) {
+  const e = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs)) {
+    if (v == null || v === false) continue;
+    if (k.startsWith("on")) e.addEventListener(k.slice(2), v);
+    else if (k === "class") e.className = v;
+    else e.setAttribute(k, v === true ? "" : v);
+  }
+  for (const c of children.flat()) {
+    if (c != null && c !== false) e.append(c instanceof Node ? c : String(c));
+  }
+  return e;
+}
+
+function hex(buf) {
+  return Array.from(new Uint8Array(buf), (b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+async function sha256Hex(data) {
+  return hex(await crypto.subtle.digest("SHA-256", typeof data === "string" ? enc.encode(data) : data));
+}
+
+async function hmac(key, msg) {
+  const k = await crypto.subtle.importKey("raw", key, { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+  return new Uint8Array(await crypto.subtle.sign("HMAC", k, enc.encode(msg)));
+}
+
+// RFC 3986 encoding as SigV4 expects (optionally keeping "/").
+function uriEncode(s, keepSlash = false) {
+  let out = "";
+  for (const b of enc.encode(s)) {
+    const c = String.fromCharCode(b);
+    if (/[A-Za-z0-9\-_.~]/.test(c) || (keepSlash && c === "/")) out += c;
+    else out += "%" + b.toString(16).toUpperCase().padStart(2, "0");
+  }
+  return out;
+}
+
+function formatSize(n) {
+  if (n == null || n === "") return "";
+  n = Number(n);
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  let i = 0;
+  while (n >= 1024 && i < units.length - 1) { n /= 1024; i++; }
+  return (i === 0 ? n : n.toFixed(n < 10 ? 1 : 0)) + " " + units[i];
+}
+
+function formatDate(s) {
+  if (!s) return "";
+  const d = new Date(s);
+  return isNaN(d) ? s : d.toLocaleString();
+}
+
+function toast(msg, isError = false) {
+  const t = el("div", { class: "toast" + (isError ? " error" : "") }, msg);
+  $("toasts").append(t);
+  setTimeout(() => t.remove(), isError ? 7000 : 3500);
+}
+
+function xmlText(node, tag) {
+  const n = node.getElementsByTagName(tag)[0];
+  return n ? n.textContent : null;
+}
+
+function baseName(key) {
+  const k = key.endsWith("/") ? key.slice(0, -1) : key;
+  return k.slice(k.lastIndexOf("/") + 1) + (key.endsWith("/") ? "/" : "");
+}
+
+// ------------------------------------------------------------------ S3 client
+
+class S3Error extends Error {
+  constructor(status, code, message) {
+    super(message || code || `HTTP ${status}`);
+    this.status = status;
+    this.code = code;
+  }
+}
+
+const S3 = {
+  ak: "", sk: "", region: "us-east-1",
+  keyCache: new Map(),
+
+  async signingKey(date) {
+    const id = `${date}/${this.region}`;
+    if (!this.keyCache.has(id)) {
+      let k = await hmac(enc.encode("AWS4" + this.sk), date);
+      k = await hmac(k, this.region);
+      k = await hmac(k, "s3");
+      this.keyCache.set(id, await hmac(k, "aws4_request"));
+    }
+    return this.keyCache.get(id);
+  },
+
+  // Sign a request; returns { url, headers } ready for fetch / XHR.
+  async sign(method, path, { query = {}, headers = {}, payloadHash = EMPTY_SHA256 } = {}) {
+    const amzDate = new Date().toISOString().replace(/[-:]|\.\d{3}/g, "");
+    const date = amzDate.slice(0, 8);
+    const h = {};
+    for (const [k, v] of Object.entries(headers)) h[k.toLowerCase()] = String(v).trim();
+    h["x-amz-date"] = amzDate;
+    h["x-amz-content-sha256"] = payloadHash;
+    const all = { host: location.host, ...h };
+    const names = Object.keys(all).sort();
+    const canonicalUri = uriEncode(path, true);
+    const canonicalQuery = Object.keys(query)
+      .map((k) => [uriEncode(k), uriEncode(String(query[k]))])
+      .sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0))
+      .map(([k, v]) => `${k}=${v}`)
+      .join("&");
+    const creq = [method, canonicalUri, canonicalQuery, names.map((n) => `${n}:${all[n]}\n`).join(""), names.join(";"), payloadHash].join("\n");
+    const scope = `${date}/${this.region}/s3/aws4_request`;
+    const sts = ["AWS4-HMAC-SHA256", amzDate, scope, await sha256Hex(creq)].join("\n");
+    const sig = hex(await hmac(await this.signingKey(date), sts));
+    h["authorization"] = `AWS4-HMAC-SHA256 Credential=${this.ak}/${scope}, SignedHeaders=${names.join(";")}, Signature=${sig}`;
+    return { url: canonicalUri + (canonicalQuery ? "?" + canonicalQuery : ""), headers: h };
+  },
+
+  // Presigned GET URL (query-string authentication).
+  async presign(path, expires, extraQuery = {}) {
+    const amzDate = new Date().toISOString().replace(/[-:]|\.\d{3}/g, "");
+    const date = amzDate.slice(0, 8);
+    const scope = `${date}/${this.region}/s3/aws4_request`;
+    const query = {
+      ...extraQuery,
+      "X-Amz-Algorithm": "AWS4-HMAC-SHA256",
+      "X-Amz-Credential": `${this.ak}/${scope}`,
+      "X-Amz-Date": amzDate,
+      "X-Amz-Expires": String(expires),
+      "X-Amz-SignedHeaders": "host",
+    };
+    const canonicalUri = uriEncode(path, true);
+    const canonicalQuery = Object.keys(query)
+      .map((k) => [uriEncode(k), uriEncode(query[k])])
+      .sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0))
+      .map(([k, v]) => `${k}=${v}`)
+      .join("&");
+    const creq = ["GET", canonicalUri, canonicalQuery, `host:${location.host}\n`, "host", "UNSIGNED-PAYLOAD"].join("\n");
+    const sts = ["AWS4-HMAC-SHA256", amzDate, scope, await sha256Hex(creq)].join("\n");
+    const sig = hex(await hmac(await this.signingKey(date), sts));
+    return `${location.origin}${canonicalUri}?${canonicalQuery}&X-Amz-Signature=${sig}`;
+  },
+
+  async request(method, path, { query = {}, headers = {}, body = null } = {}) {
+    const bytes = typeof body === "string" ? enc.encode(body) : body;
+    const payloadHash = bytes ? await sha256Hex(bytes) : EMPTY_SHA256;
+    const s = await this.sign(method, path, { query, headers, payloadHash });
+    const resp = await fetch(s.url, { method, headers: s.headers, body: bytes, cache: "no-store" });
+    if (!resp.ok && resp.status !== 304) {
+      let code = null, message = null;
+      const text = method === "HEAD" ? "" : await resp.text();
+      if (text.startsWith("<")) {
+        const doc = new DOMParser().parseFromString(text, "application/xml");
+        code = xmlText(doc, "Code");
+        message = xmlText(doc, "Message");
+      }
+      throw new S3Error(resp.status, code, message ? `${code}: ${message}` : code || `HTTP ${resp.status}`);
+    }
+    return resp;
+  },
+
+  async xml(method, path, opts) {
+    const resp = await this.request(method, path, opts);
+    return new DOMParser().parseFromString(await resp.text(), "application/xml");
+  },
+
+  async listBuckets() {
+    const doc = await this.xml("GET", "/");
+    return [...doc.getElementsByTagName("Bucket")].map((b) => ({ name: xmlText(b, "Name"), created: xmlText(b, "CreationDate") }));
+  },
+
+  async list(bucket, prefix, token, delimiter = "/") {
+    const query = { "list-type": "2", prefix, "max-keys": "500" };
+    if (delimiter) query.delimiter = delimiter;
+    if (token) query["continuation-token"] = token;
+    const doc = await this.xml("GET", `/${bucket}`, { query });
+    return {
+      prefixes: [...doc.getElementsByTagName("CommonPrefixes")].map((p) => xmlText(p, "Prefix")),
+      objects: [...doc.getElementsByTagName("Contents")].map((c) => ({
+        key: xmlText(c, "Key"), size: xmlText(c, "Size"), modified: xmlText(c, "LastModified"),
+      })),
+      next: xmlText(doc, "IsTruncated") === "true" ? xmlText(doc, "NextContinuationToken") : null,
+    };
+  },
+
+  // Delete keys (or versions) in batches of 1000.
+  async deleteMany(bucket, items) {
+    let failed = 0;
+    for (let i = 0; i < items.length; i += 1000) {
+      const batch = items.slice(i, i + 1000);
+      const body = "<Delete><Quiet>true</Quiet>" + batch.map((it) => {
+        const k = new XMLSerializer().serializeToString(document.createTextNode(it.key));
+        return `<Object><Key>${k}</Key>${it.version ? `<VersionId>${it.version}</VersionId>` : ""}</Object>`;
+      }).join("") + "</Delete>";
+      const doc = await this.xml("POST", `/${bucket}`, { query: { delete: "" }, body, headers: { "content-type": "application/xml" } });
+      failed += doc.getElementsByTagName("Error").length;
+    }
+    return failed;
+  },
+
+  async allKeys(bucket, prefix) {
+    const keys = [];
+    let token = null;
+    do {
+      const page = await this.list(bucket, prefix, token, "");
+      keys.push(...page.objects.map((o) => ({ key: o.key })));
+      token = page.next;
+    } while (token);
+    return keys;
+  },
+
+  async allVersions(bucket) {
+    const out = [];
+    let km = null, vm = null;
+    for (;;) {
+      const query = { versions: "", "max-keys": "1000" };
+      if (km) { query["key-marker"] = km; if (vm) query["version-id-marker"] = vm; }
+      const doc = await this.xml("GET", `/${bucket}`, { query });
+      for (const tag of ["Version", "DeleteMarker"]) {
+        for (const v of doc.getElementsByTagName(tag)) out.push({ key: xmlText(v, "Key"), version: xmlText(v, "VersionId") });
+      }
+      if (xmlText(doc, "IsTruncated") !== "true") return out;
+      km = xmlText(doc, "NextKeyMarker");
+      vm = xmlText(doc, "NextVersionIdMarker");
+    }
+  },
+};
+
+// ------------------------------------------------------------------ state
+
+const state = { buckets: [], bucket: null, prefix: "", token: null, selected: new Set(), items: [] };
+
+function objectPath(key) {
+  return `/${state.bucket}/${key}`;
+}
+
+// ------------------------------------------------------------------ login
+
+async function login(ak, sk, region) {
+  S3.ak = ak; S3.sk = sk; S3.region = region; S3.keyCache.clear();
+  state.buckets = await S3.listBuckets();
+  try { sessionStorage.setItem("s3rs-console", JSON.stringify({ ak, sk, region })); } catch (_) { /* private mode */ }
+  $("login").classList.add("hidden");
+  $("app").classList.remove("hidden");
+  $("whoami").textContent = `${ak} @ ${location.host}`;
+  renderBuckets();
+  let fromHash = "";
+  try { fromHash = decodeURIComponent(location.hash.slice(1)); } catch (_) { /* malformed link */ }
+  if (fromHash) {
+    const [b, ...rest] = fromHash.split("/");
+    if (state.buckets.some((x) => x.name === b)) openBucket(b, rest.join("/"));
+  }
+}
+
+function logout() {
+  try { sessionStorage.removeItem("s3rs-console"); } catch (_) { /* ignore */ }
+  location.hash = "";
+  location.reload();
+}
+
+// ------------------------------------------------------------------ buckets
+
+function renderBuckets() {
+  const f = $("bucket-filter").value.trim().toLowerCase();
+  const list = $("buckets");
+  list.replaceChildren(...state.buckets.filter((b) => b.name.includes(f)).map((b) =>
+    el("li", { class: b.name === state.bucket ? "active" : "", title: b.name, onclick: () => openBucket(b.name, "") }, b.name)));
+  if (!state.buckets.length) list.append(el("li", { class: "muted" }, "No buckets yet"));
+}
+
+async function refreshBuckets() {
+  state.buckets = await S3.listBuckets();
+  renderBuckets();
+}
+
+async function createBucket() {
+  const name = await prompt("Create bucket", [
+    el("label", {}, "Bucket name", el("input", { id: "f-name", required: true, pattern: "[a-z0-9][a-z0-9.\\-]{1,61}[a-z0-9]", placeholder: "my-bucket" })),
+    el("p", { class: "muted" }, "3-63 characters: lowercase letters, digits, dots and hyphens."),
+    el("label", { class: "radio" }, el("input", { type: "checkbox", id: "f-versioning" }), "Enable versioning"),
+    el("label", { class: "radio" }, el("input", { type: "checkbox", id: "f-lock" }), "Enable Object Lock (implies versioning)"),
+  ], "Create", () => ({ name: $("f-name").value.trim(), versioning: $("f-versioning").checked, lock: $("f-lock").checked }));
+  if (!name) return;
+  try {
+    await S3.request("PUT", `/${name.name}`, { headers: name.lock ? { "x-amz-bucket-object-lock-enabled": "true" } : {} });
+    if (name.versioning && !name.lock) await setVersioning(name.name, "Enabled");
+    await refreshBuckets();
+    openBucket(name.name, "");
+    toast(`Bucket ${name.name} created`);
+  } catch (e) { toast(e.message, true); }
+}
+
+async function setVersioning(bucket, status) {
+  await S3.request("PUT", `/${bucket}`, {
+    query: { versioning: "" },
+    body: `<VersioningConfiguration><Status>${status}</Status></VersioningConfiguration>`,
+    headers: { "content-type": "application/xml" },
+  });
+}
+
+// ------------------------------------------------------------------ object browser
+
+function openBucket(bucket, prefix) {
+  state.bucket = bucket;
+  state.prefix = prefix;
+  $("search").value = "";
+  closeDetails();
+  renderBuckets();
+  $("empty-state").classList.add("hidden");
+  $("browser").classList.remove("hidden");
+  history.replaceState(null, "", "#" + encodeURIComponent(`${bucket}/${prefix}`).replace(/%2F/g, "/"));
+  loadList(false);
+}
+
+function renderCrumbs() {
+  const parts = state.prefix.split("/").filter(Boolean);
+  const crumbs = [el("a", { onclick: () => openBucket(state.bucket, "") }, state.bucket)];
+  let acc = "";
+  for (const p of parts) {
+    acc += p + "/";
+    const target = acc;
+    crumbs.push(el("span", { class: "sep" }, "/"), el("a", { onclick: () => openBucket(state.bucket, target) }, p));
+  }
+  $("crumbs").replaceChildren(...crumbs);
+}
+
+async function loadList(append) {
+  renderCrumbs();
+  if (!append) { state.items = []; state.token = null; state.selected.clear(); }
+  const filter = $("search").value;
+  try {
+    const page = await S3.list(state.bucket, state.prefix + filter, append ? state.token : null);
+    state.token = page.next;
+    state.items.push(...page.prefixes.map((p) => ({ key: p, folder: true })));
+    state.items.push(...page.objects.filter((o) => o.key !== state.prefix).map((o) => ({ ...o, folder: false })));
+    renderRows();
+  } catch (e) {
+    toast(e.message, true);
+    if (e.code === "NoSuchBucket") { await refreshBuckets(); $("browser").classList.add("hidden"); $("empty-state").classList.remove("hidden"); }
+  }
+}
+
+function renderRows() {
+  const rows = state.items.map((it) => {
+    const name = baseName(it.key);
+    const check = el("input", { type: "checkbox", "aria-label": "Select " + name, onchange: (ev) => {
+      ev.target.checked ? state.selected.add(it.key) : state.selected.delete(it.key);
+      renderSelection();
+    } });
+    check.checked = state.selected.has(it.key);
+    if (it.folder) {
+      return el("tr", {},
+        el("td", { class: "check" }, check),
+        el("td", { class: "name" }, el("span", { class: "icon" }, "▸"), el("a", { onclick: () => openBucket(state.bucket, it.key) }, name)),
+        el("td", { class: "num" }, ""), el("td", { class: "hide-sm" }, ""),
+        el("td", { class: "actions" }, el("button", { class: "ghost small danger", onclick: () => deleteKeys([it.key]) }, "Delete")));
+    }
+    return el("tr", {},
+      el("td", { class: "check" }, check),
+      el("td", { class: "name" }, el("span", { class: "icon" }, "·"), el("a", { onclick: () => showDetails(it.key) }, name)),
+      el("td", { class: "num" }, formatSize(it.size)),
+      el("td", { class: "hide-sm muted" }, formatDate(it.modified)),
+      el("td", { class: "actions" },
+        el("button", { class: "ghost small", onclick: () => download(it.key) }, "Download"),
+        el("button", { class: "ghost small", onclick: () => share(it.key) }, "Share")));
+  });
+  $("rows").replaceChildren(...rows);
+  $("list-empty").classList.toggle("hidden", state.items.length > 0);
+  $("load-more").classList.toggle("hidden", !state.token);
+  renderSelection();
+}
+
+function renderSelection() {
+  const n = state.selected.size;
+  $("selection-bar").classList.toggle("hidden", n === 0);
+  $("selection-count").textContent = `${n} selected`;
+  $("select-all").checked = n > 0 && n === state.items.length;
+}
+
+async function deleteKeys(keys) {
+  const folders = keys.filter((k) => k.endsWith("/"));
+  const what = keys.length === 1 ? `“${baseName(keys[0])}”` : `${keys.length} items`;
+  const ok = await confirmDialog("Delete", `Delete ${what}?` + (folders.length ? " Folders are deleted with everything in them." : "") +
+    " In versioned buckets this adds delete markers; older versions are kept.", "Delete");
+  if (!ok) return;
+  try {
+    const items = keys.filter((k) => !k.endsWith("/")).map((key) => ({ key }));
+    for (const f of folders) items.push(...await S3.allKeys(state.bucket, f));
+    const failed = await S3.deleteMany(state.bucket, items);
+    toast(failed ? `${failed} of ${items.length} objects could not be deleted` : `Deleted ${items.length} object(s)`, failed > 0);
+  } catch (e) { toast(e.message, true); }
+  closeDetails();
+  loadList(false);
+}
+
+async function newFolder() {
+  const name = await prompt("New folder", [el("label", {}, "Folder name", el("input", { id: "f-folder", required: true }))],
+    "Create", () => $("f-folder").value.trim().replace(/^\/+|\/+$/g, ""));
+  if (!name) return;
+  try {
+    await S3.request("PUT", objectPath(state.prefix + name + "/"), { body: new Uint8Array(0) });
+    loadList(false);
+  } catch (e) { toast(e.message, true); }
+}
+
+async function download(key) {
+  try {
+    const url = await S3.presign(objectPath(key), 300, { "response-content-disposition": `attachment; filename="${baseName(key).replace(/["\\]/g, "_")}"` });
+    el("a", { href: url, download: baseName(key) }).click();
+  } catch (e) { toast(e.message, true); }
+}
+
+async function share(key) {
+  const choice = await prompt("Share link", [
+    el("p", { class: "muted" }, "Anyone with the link can download this object until it expires."),
+    el("label", {}, "Expires after", el("select", { id: "f-exp" },
+      el("option", { value: "3600" }, "1 hour"), el("option", { value: "86400", selected: true }, "1 day"),
+      el("option", { value: "604800" }, "7 days (maximum)"))),
+  ], "Create link", () => Number($("f-exp").value));
+  if (!choice) return;
+  const url = await S3.presign(objectPath(key), choice);
+  try { await navigator.clipboard.writeText(url); toast("Link copied to the clipboard"); } catch (_) { /* fall through */ }
+  await prompt("Share link", [el("input", { class: "share-url", value: url, readonly: true, onfocus: (e) => e.target.select() })], "Done", () => true);
+}
+
+// ------------------------------------------------------------------ uploads
+
+let uploadQueue = [];
+let activeUploads = 0;
+
+function enqueueUploads(files) {
+  if (!state.bucket) return;
+  $("uploads").classList.remove("hidden");
+  for (const file of files) {
+    const key = state.prefix + (file.webkitRelativePath || file.name);
+    const bar = el("div");
+    const status = el("span", {}, "waiting");
+    const row = el("div", { class: "upload" }, el("div", { class: "label" }, el("span", { title: key }, key), status), el("div", { class: "bar" }, bar));
+    $("uploads").append(row);
+    uploadQueue.push({ file, key, bar, status, row, bucket: state.bucket });
+  }
+  pumpUploads();
+}
+
+function pumpUploads() {
+  while (activeUploads < 3 && uploadQueue.length) {
+    const job = uploadQueue.shift();
+    activeUploads++;
+    uploadOne(job).finally(() => {
+      activeUploads--;
+      pumpUploads();
+      if (!activeUploads && !uploadQueue.length) {
+        if (state.bucket === job.bucket) loadList(false);
+        setTimeout(() => { if (!activeUploads && !uploadQueue.length) $("uploads").replaceChildren(); $("uploads").classList.toggle("hidden", !$("uploads").children.length); }, 4000);
+      }
+    });
+  }
+}
+
+async function uploadOne(job) {
+  const headers = { "content-type": job.file.type || "application/octet-stream" };
+  const s = await S3.sign("PUT", `/${job.bucket}/${job.key}`, { headers, payloadHash: "UNSIGNED-PAYLOAD" });
+  return new Promise((resolve) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open("PUT", s.url);
+    for (const [k, v] of Object.entries(s.headers)) xhr.setRequestHeader(k, v);
+    xhr.upload.onprogress = (e) => {
+      if (e.lengthComputable) {
+        const pct = Math.round((e.loaded / e.total) * 100);
+        job.bar.style.width = pct + "%";
+        job.status.textContent = pct + "%";
+      }
+    };
+    xhr.onload = () => {
+      if (xhr.status >= 200 && xhr.status < 300) {
+        job.row.classList.add("done"); job.bar.style.width = "100%"; job.status.textContent = "done";
+      } else {
+        const code = xhr.responseXML ? xmlText(xhr.responseXML, "Code") : null;
+        job.row.classList.add("failed"); job.status.textContent = code || `HTTP ${xhr.status}`;
+      }
+      resolve();
+    };
+    xhr.onerror = () => { job.row.classList.add("failed"); job.status.textContent = "network error"; resolve(); };
+    xhr.send(job.file);
+  });
+}
+
+// ------------------------------------------------------------------ details panel
+
+function closeDetails() {
+  $("details").classList.add("hidden");
+}
+
+async function showDetails(key) {
+  $("details-title").textContent = baseName(key);
+  const body = $("details-body");
+  body.replaceChildren(el("p", { class: "muted" }, "Loading…"));
+  $("details").classList.remove("hidden");
+  try {
+    const head = await S3.request("HEAD", objectPath(key));
+    const h = head.headers;
+    const rows = [
+      ["Key", key], ["Size", `${formatSize(h.get("content-length"))} (${h.get("content-length")} bytes)`],
+      ["Type", h.get("content-type")], ["Modified", formatDate(h.get("last-modified"))], ["ETag", h.get("etag")],
+      ["Version", h.get("x-amz-version-id")], ["Encryption", h.get("x-amz-server-side-encryption") || (h.get("x-amz-server-side-encryption-customer-algorithm") ? "SSE-C" : null)],
+      ["Lock mode", h.get("x-amz-object-lock-mode")], ["Retain until", h.get("x-amz-object-lock-retain-until-date") && formatDate(h.get("x-amz-object-lock-retain-until-date"))],
+      ["Legal hold", h.get("x-amz-object-lock-legal-hold")], ["Cache-Control", h.get("cache-control")],
+    ];
+    for (const [k, v] of h.entries()) if (k.startsWith("x-amz-meta-")) rows.push([k.slice(11), v]);
+    const kv = el("dl", { class: "kv" }, rows.filter(([, v]) => v).flatMap(([k, v]) => [el("dt", {}, k), el("dd", {}, v)]));
+    const actions = el("div", { class: "row-actions" },
+      el("button", { class: "primary small", onclick: () => download(key) }, "Download"),
+      el("button", { class: "small", onclick: () => share(key) }, "Share link"),
+      el("button", { class: "small danger", onclick: () => deleteKeys([key]) }, "Delete"));
+    const preview = await renderPreview(key, h);
+    body.replaceChildren(...[actions, preview, kv].filter(Boolean));
+  } catch (e) {
+    body.replaceChildren(el("p", { class: "error" }, e.message));
+  }
+}
+
+async function renderPreview(key, h) {
+  const type = h.get("content-type") || "";
+  const size = Number(h.get("content-length"));
+  if (type.startsWith("image/") && size < 20 * 1024 * 1024) {
+    return el("div", { class: "preview" }, el("img", { alt: "", src: await S3.presign(objectPath(key), 300) }));
+  }
+  const texty = type.startsWith("text/") || /json|xml|javascript|yaml|csv/.test(type) || /\.(txt|md|json|csv|log|ya?ml|toml|ini|html?|css|js|ts|rs|py|go|sh)$/i.test(key);
+  if (texty && size > 0) {
+    const resp = await S3.request("GET", objectPath(key), { headers: { range: "bytes=0-16383" } });
+    let text = new TextDecoder().decode(await resp.arrayBuffer());
+    if (size > 16384) text += "\n…";
+    return el("div", { class: "preview" }, el("pre", { class: "mono" }, text));
+  }
+  return null;
+}
+
+// ------------------------------------------------------------------ bucket settings
+
+async function bucketSettings() {
+  const b = state.bucket;
+  let versioning = "Off", publicRead = false, lock = false, website = null;
+  try {
+    const v = await S3.xml("GET", `/${b}`, { query: { versioning: "" } });
+    versioning = xmlText(v, "Status") || "Off";
+    const acl = await S3.xml("GET", `/${b}`, { query: { acl: "" } });
+    publicRead = [...acl.getElementsByTagName("Grant")].some((g) => (xmlText(g, "URI") || "").endsWith("/AllUsers") && xmlText(g, "Permission") === "READ");
+    try { await S3.request("GET", `/${b}`, { query: { "object-lock": "" } }); lock = true; } catch (_) { /* not enabled */ }
+    try { const w = await S3.xml("GET", `/${b}`, { query: { website: "" } }); website = { index: xmlText(w, "Suffix"), error: xmlText(w, "Key") }; } catch (_) { /* none */ }
+  } catch (e) { toast(e.message, true); return; }
+
+  let wantsDelete = false;
+  const choice = await prompt(`Settings: ${b}`, [
+    el("label", {}, "Versioning", el("select", { id: "f-ver", disabled: lock },
+      el("option", { value: "Off", selected: versioning === "Off", disabled: versioning !== "Off" }, "Off"),
+      el("option", { value: "Enabled", selected: versioning === "Enabled" }, "Enabled"),
+      el("option", { value: "Suspended", selected: versioning === "Suspended", disabled: versioning === "Off" }, "Suspended"))),
+    lock ? el("p", { class: "muted" }, "Object Lock is enabled, so versioning stays on.") : null,
+    el("label", {}, "Access", el("select", { id: "f-acl" },
+      el("option", { value: "private", selected: !publicRead }, "Private"),
+      el("option", { value: "public-read", selected: publicRead }, "Public read (anyone can download and list)"))),
+    el("label", { class: "radio" }, el("input", { type: "checkbox", id: "f-web", checked: !!website }), "Static website hosting"),
+    el("label", {}, "Index document", el("input", { id: "f-index", value: website?.index || "index.html" })),
+    el("label", {}, "Error document (optional)", el("input", { id: "f-error", value: website?.error || "" })),
+    el("p", { class: "muted" }, "Websites are served on the server's website endpoint (--website-listen) and need public read access."),
+    el("hr"),
+    el("button", { type: "button", class: "danger", onclick: () => { wantsDelete = true; $("modal").close("cancel"); } }, "Delete bucket…"),
+  ], "Save", () => ({ ver: $("f-ver").value, acl: $("f-acl").value, web: $("f-web").checked, index: $("f-index").value.trim(), error: $("f-error").value.trim() }));
+  if (wantsDelete) return deleteBucket(b);
+  if (!choice) return;
+  try {
+    if (choice.ver !== versioning && choice.ver !== "Off") await setVersioning(b, choice.ver);
+    if ((choice.acl === "public-read") !== publicRead) await S3.request("PUT", `/${b}`, { query: { acl: "" }, headers: { "x-amz-acl": choice.acl } });
+    if (choice.web) {
+      const esc = (s) => new XMLSerializer().serializeToString(document.createTextNode(s));
+      const doc = `<WebsiteConfiguration><IndexDocument><Suffix>${esc(choice.index || "index.html")}</Suffix></IndexDocument>` +
+        (choice.error ? `<ErrorDocument><Key>${esc(choice.error)}</Key></ErrorDocument>` : "") + "</WebsiteConfiguration>";
+      await S3.request("PUT", `/${b}`, { query: { website: "" }, body: doc, headers: { "content-type": "application/xml" } });
+    } else if (website) {
+      await S3.request("DELETE", `/${b}`, { query: { website: "" } });
+    }
+    toast("Settings saved");
+  } catch (e) { toast(e.message, true); }
+}
+
+async function deleteBucket(b) {
+  const ok = await confirmDialog("Delete bucket", `Delete bucket “${b}” and everything in it, including old versions? This cannot be undone.`, "Delete bucket");
+  if (!ok) return;
+  try {
+    const items = await S3.allVersions(b);
+    const failed = items.length ? await S3.deleteMany(b, items) : 0;
+    if (failed) throw new Error(`${failed} object version(s) could not be deleted (Object Lock?)`);
+    await S3.request("DELETE", `/${b}`);
+    toast(`Bucket ${b} deleted`);
+    state.bucket = null;
+    history.replaceState(null, "", "#");
+    $("browser").classList.add("hidden");
+    $("empty-state").classList.remove("hidden");
+    await refreshBuckets();
+  } catch (e) { toast(e.message, true); }
+}
+
+// ------------------------------------------------------------------ dialogs
+
+function prompt(title, fields, okLabel, collect) {
+  return new Promise((resolve) => {
+    const modal = $("modal");
+    $("modal-title").textContent = title;
+    $("modal-body").replaceChildren(...fields.filter(Boolean));
+    $("modal-ok").textContent = okLabel;
+    $("modal-ok").className = /delete/i.test(okLabel) ? "danger" : "primary";
+    let result = null;
+    const form = $("modal-form");
+    const onSubmit = (ev) => {
+      if (ev.submitter && ev.submitter.value === "ok") {
+        if (!form.reportValidity()) { ev.preventDefault(); return; }
+        result = collect();
+      }
+    };
+    form.addEventListener("submit", onSubmit);
+    modal.addEventListener("close", () => { form.removeEventListener("submit", onSubmit); resolve(result); }, { once: true });
+    modal.showModal();
+    const first = $("modal-body").querySelector("input:not([type=checkbox]), select");
+    if (first) first.focus();
+  });
+}
+
+function confirmDialog(title, text, okLabel) {
+  return prompt(title, [el("p", {}, text)], okLabel, () => true);
+}
+
+// ------------------------------------------------------------------ wiring
+
+document.addEventListener("DOMContentLoaded", () => {
+  const region = document.querySelector('meta[name="s3rs-region"]').content || "us-east-1";
+  $("region").value = region;
+  if (!window.crypto || !crypto.subtle) {
+    $("login-error").textContent = "This page needs a secure context (HTTPS or localhost) for request signing.";
+  }
+  $("login-form").addEventListener("submit", async (ev) => {
+    ev.preventDefault();
+    $("login-error").textContent = "";
+    try {
+      await login($("ak").value.trim(), $("sk").value, $("region").value.trim());
+    } catch (e) {
+      $("login-error").textContent = e.code === "InvalidAccessKeyId" || e.code === "SignatureDoesNotMatch" ? "Wrong access key or secret key." : e.message;
+    }
+  });
+  $("logout").addEventListener("click", logout);
+  $("new-bucket").addEventListener("click", createBucket);
+  $("bucket-filter").addEventListener("input", renderBuckets);
+  $("refresh").addEventListener("click", () => loadList(false));
+  $("load-more").addEventListener("click", () => loadList(true));
+  $("new-folder").addEventListener("click", newFolder);
+  $("settings").addEventListener("click", bucketSettings);
+  $("details-close").addEventListener("click", closeDetails);
+  $("delete-selected").addEventListener("click", () => deleteKeys([...state.selected]));
+  $("clear-selection").addEventListener("click", () => { state.selected.clear(); renderRows(); });
+  $("select-all").addEventListener("change", (e) => {
+    state.selected = new Set(e.target.checked ? state.items.map((i) => i.key) : []);
+    renderRows();
+  });
+  let searchTimer = null;
+  $("search").addEventListener("input", () => { clearTimeout(searchTimer); searchTimer = setTimeout(() => loadList(false), 250); });
+  $("upload-input").addEventListener("change", (e) => { enqueueUploads([...e.target.files]); e.target.value = ""; });
+  const drop = $("drop");
+  let depth = 0;
+  drop.addEventListener("dragenter", (e) => { e.preventDefault(); depth++; drop.classList.add("dragging"); });
+  drop.addEventListener("dragleave", () => { if (--depth <= 0) { depth = 0; drop.classList.remove("dragging"); } });
+  drop.addEventListener("dragover", (e) => e.preventDefault());
+  drop.addEventListener("drop", (e) => {
+    e.preventDefault(); depth = 0; drop.classList.remove("dragging");
+    enqueueUploads([...e.dataTransfer.files]);
+  });
+
+  let saved = null;
+  try { saved = JSON.parse(sessionStorage.getItem("s3rs-console") || "null"); } catch (_) { /* ignore */ }
+  if (saved) {
+    login(saved.ak, saved.sk, saved.region).catch(() => $("login").classList.remove("hidden"));
+  } else {
+    $("login").classList.remove("hidden");
+  }
+});

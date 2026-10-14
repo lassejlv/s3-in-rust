@@ -33,12 +33,31 @@ s3 = boto3.client("s3", endpoint_url="http://localhost:9000",
 s3.put_object(Bucket="photos", Key="hello.txt", Body=b"hi")
 ```
 
+Or open `http://localhost:9000` in a browser to use the [web console](#web-console).
+
 ### Docker
 
 ```bash
 docker build -t s3rs .
 docker run -p 9000:9000 -v $PWD/data:/data -e S3RS_ACCESS_KEY=mykey -e S3RS_SECRET_KEY=mysecret s3rs
 ```
+
+## Web console
+
+Open the server's address in a browser (it redirects to `/_console/`) and sign in with an access
+key. From the console you can:
+- Create and delete buckets, with versioning or Object Lock.
+- Browse folders, upload files by drag and drop (with progress), and create folders.
+- Preview text and images, download objects, and create time-limited share links (presigned
+  URLs).
+- Delete objects and whole folders, and change a bucket's versioning, public access and website
+  settings.
+
+The console is three static files compiled into the binary. Every request is signed with SigV4
+inside the browser tab, so the server keeps no sessions and the console can do nothing an S3
+client with the same key couldn't. The key is kept in `sessionStorage` and forgotten when the tab
+closes. Signing needs a secure context, so use HTTPS or `localhost`. The pages are served with a
+strict Content-Security-Policy and refuse to be framed. Turn the console off with `--no-console`.
 
 ## Configuration
 
@@ -54,6 +73,7 @@ Each flag can also be set with the environment variable shown (switches take `1`
 | `--anonymous` | | off | Turns off authentication. Use it only on trusted networks. |
 | `--cors-origins` | `S3RS_CORS_ORIGINS` | | Comma-separated origins (e.g. `*`) allowed for buckets that have no CORS configuration of their own |
 | `--metrics-token` | `S3RS_METRICS_TOKEN` | | Requires `Authorization: Bearer <token>` on `/_metrics` |
+| `--no-console` | `S3RS_NO_CONSOLE` | off | Turns off the web console at `/_console/` |
 | `--lifecycle-interval` | `S3RS_LIFECYCLE_INTERVAL` | `3600` | Seconds between lifecycle sweeps. `0` turns lifecycle off. |
 | `--encryption-key` | `S3RS_ENCRYPTION_KEY` | | Master key for SSE-S3, as 64 hex characters or base64 (e.g. `openssl rand -hex 32`) |
 | `--encryption-key-file` | | | Reads the master key from a file |
@@ -341,7 +361,8 @@ cd tests/minio-go && S3RS_ACCESS_KEY=testkey S3RS_SECRET_KEY=testsecret go run .
 ```
 
 CI (`.github/workflows/ci.yml`) runs fmt, clippy, the unit tests, the boto3 suite, an AWS CLI sync
-round-trip and the minio-go suite on every push.
+round-trip, the minio-go suite and a Playwright test of the web console (`tests/console.js`) on
+every push.
 
 ## Limitations and notes
 

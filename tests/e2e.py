@@ -1073,6 +1073,19 @@ def t_website():
     s3.delete_bucket(Bucket=wb)
 
 
+def t_console():
+    st, h, body = http("GET", "/_console/")
+    assert st == 200 and h["Content-Type"].startswith("text/html") and b"s3rs console" in body, (st, body[:100])
+    assert "frame-ancestors 'none'" in h["Content-Security-Policy"] and h["X-Frame-Options"] == "DENY", dict(h)
+    assert http("GET", "/_console/app.js")[0] == 200
+    assert http("GET", "/_console/nope")[0] == 404
+    assert http("POST", "/_console/")[0] == 405
+    # Browsers opening the endpoint without credentials land on the console; API clients don't.
+    st, _, body = http("GET", "/", headers={"Accept": "text/html,application/xhtml+xml"})
+    assert st == 200 and b"s3rs console" in body, st
+    assert http("GET", "/")[0] == 403
+
+
 def t_overwrite():
     s3.put_object(Bucket=B, Key="ow", Body=b"x" * 300_000)
     s3.put_object(Bucket=B, Key="ow", Body=b"small")

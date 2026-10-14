@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="s3rs-region" content="{{REGION}}">
+<title>s3rs console</title>
+<link rel="stylesheet" href="/_console/app.css">
+<script src="/_console/app.js" defer></script>
+</head>
+<body>
+<div id="login" class="login hidden">
+  <form id="login-form" class="card login-card" autocomplete="on">
+    <h1><span class="logo">s3rs</span> console</h1>
+    <p class="muted">Sign in with an access key. Requests are signed in your browser; the secret never leaves this tab.</p>
+    <label>Access key <input id="ak" name="username" autocomplete="username" required></label>
+    <label>Secret key <input id="sk" name="password" type="password" autocomplete="current-password" required></label>
+    <label>Region <input id="region" required></label>
+    <button class="primary" type="submit">Sign in</button>
+    <p id="login-error" class="error" role="alert"></p>
+  </form>
+</div>
+
+<div id="app" class="app hidden">
+  <header class="topbar">
+    <span class="logo">s3rs</span>
+    <span class="muted" id="whoami"></span>
+    <span class="spacer"></span>
+    <button id="logout" class="ghost">Sign out</button>
+  </header>
+  <aside class="sidebar">
+    <div class="sidebar-head">
+      <h2>Buckets</h2>
+      <button id="new-bucket" class="ghost small" title="Create bucket">+ New</button>
+    </div>
+    <input id="bucket-filter" class="filter" placeholder="Filter buckets">
+    <ul id="buckets" class="bucket-list"></ul>
+  </aside>
+  <main class="main">
+    <div id="empty-state" class="empty">
+      <h2>Select a bucket</h2>
+      <p class="muted">Pick a bucket from the list, or create a new one.</p>
+    </div>
+    <section id="browser" class="hidden">
+      <div class="toolbar">
+        <nav id="crumbs" class="crumbs" aria-label="Path"></nav>
+        <span class="spacer"></span>
+        <input id="search" class="filter" placeholder="Filter by prefix">
+        <button id="refresh" class="ghost" title="Refresh">Refresh</button>
+        <button id="new-folder" class="ghost">New folder</button>
+        <button id="settings" class="ghost">Settings</button>
+        <label class="button primary">Upload<input id="upload-input" type="file" multiple hidden></label>
+      </div>
+      <div class="selection-bar hidden" id="selection-bar">
+        <span id="selection-count"></span>
+        <button id="delete-selected" class="danger small">Delete</button>
+        <button id="clear-selection" class="ghost small">Clear</button>
+      </div>
+      <div id="drop" class="table-wrap">
+        <table class="objects">
+          <thead><tr>
+            <th class="check"><input type="checkbox" id="select-all" aria-label="Select all"></th>
+            <th>Name</th><th class="num">Size</th><th>Last modified</th><th class="actions"></th>
+          </tr></thead>
+          <tbody id="rows"></tbody>
+        </table>
+        <div id="list-empty" class="empty hidden"><p class="muted">This folder is empty. Drop files here to upload.</p></div>
+        <div class="more"><button id="load-more" class="ghost hidden">Load more</button></div>
+        <div class="drop-hint">Drop files to upload</div>
+      </div>
+    </section>
+  </main>
+  <aside id="details" class="details hidden">
+    <div class="details-head">
+      <h2 id="details-title"></h2>
+      <button id="details-close" class="ghost small" aria-label="Close">Close</button>
+    </div>
+    <div id="details-body"></div>
+  </aside>
+  <div id="uploads" class="uploads hidden"></div>
+  <div id="toasts" class="toasts" aria-live="polite"></div>
+</div>
+
+<dialog id="modal" class="modal">
+  <form method="dialog" id="modal-form">
+    <h2 id="modal-title"></h2>
+    <div id="modal-body"></div>
+    <div class="modal-actions">
+      <button value="cancel" class="ghost" formnovalidate>Cancel</button>
+      <button value="ok" id="modal-ok" class="primary">OK</button>
+    </div>
+  </form>
+</dialog>
+</body>
+</html>

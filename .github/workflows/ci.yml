@@ -84,6 +84,15 @@ jobs:
       - name: minio-go suite
         working-directory: tests/minio-go
         run: go run .
+      - name: web console (Playwright)
+        env:
+          S3RS_CONSOLE_URL: http://localhost:9000
+          S3RS_ACCESS_KEY: testkey
+          S3RS_SECRET_KEY: testsecret
+        run: |
+          npm install --no-save --no-package-lock playwright@1.56.1
+          npx playwright install --with-deps chromium
+          node tests/console.js
       - name: Server log
         if: always()
         run: cat /tmp/s3rs.log

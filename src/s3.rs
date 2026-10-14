@@ -41,6 +41,8 @@ pub struct Options {
     pub encrypt_by_default: bool,
     /// Website endpoint requests for `<bucket>.<website_domain>` serve that bucket's website.
     pub website_domain: Option<String>,
+    /// Serve the web console at `/_console/`.
+    pub console: bool,
 }
 
 pub struct Server {
@@ -60,6 +62,7 @@ pub struct Server {
     master_key: Option<WrapKey>,
     encrypt_by_default: bool,
     website_domain: Option<String>,
+    console: bool,
     req_counter: AtomicU64,
     rid_base: u64,
 }
@@ -340,6 +343,7 @@ impl Server {
             master_key: opts.master_key.map(|k| WrapKey::new(KeyKind::Master, k)),
             encrypt_by_default: opts.encrypt_by_default,
             website_domain: opts.website_domain,
+            console: opts.console,
             req_counter: AtomicU64::new(1),
             rid_base: util::new_id() as u64,
         }
@@ -558,6 +562,25 @@ impl Server {
         out
     }
 
+    fn console_asset(&self, parts: &Parts) -> S3Result<Resp> {
+        if !matches!(parts.method, Method::GET | Method::HEAD) {
+            return Err(err::MethodNotAllowed());
+        }
+        let (ctype, body) = crate::console::asset(parts.uri.path(), &self.region).ok_or_else(err::NoSuchKey)?;
+        let mut r = Resp::ok();
+        r.set("content-type", ctype)
+            .set("cache-control", "no-cache")
+            .set("content-security-policy", crate::console::CSP)
+            .set("x-frame-options", "DENY")
+            .set("x-content-type-options", "nosniff")
+            // Share links carry signatures; never leak them (or page URLs) in Referer headers.
+            .set("referrer-policy", "no-referrer");
+        if parts.method == Method::GET {
+            r.body = Body::full(body);
+        }
+        Ok(r)
+    }
+
     /// Entry point for the static website endpoint (`--website-listen`).
     pub async fn handle_website(self: Arc<Self>, req: Request<Incoming>) -> Response<Body> {
         let started = Instant::now();
@@ -733,6 +756,23 @@ impl Server {
             let mut r = Resp::ok();
             r.set("content-type", "text/plain; version=0.0.4");
             r.body = Body::full(self.metrics.render(&self.store));
+            return Ok(r);
+        }
+        if !vhost && self.console && (parts.uri.path() == "/_console" || parts.uri.path().starts_with("/_console/")) {
+            return self.console_asset(&parts);
+        }
+        // A browser opening the endpoint without credentials is sent to the console.
+        if !vhost
+            && self.console
+            && self.auth.is_some()
+            && parts.method == Method::GET
+            && parts.uri.path() == "/"
+            && raw_query.is_empty()
+            && !auth::has_credentials(&parts, raw_query)
+            && header(&parts.headers, "accept").is_some_and(|a| a.contains("text/html"))
+        {
+            let mut r = Resp::new(StatusCode::FOUND);
+            r.set("location", "/_console/");
             return Ok(r);
         }
         if parts.method == Method::OPTIONS {

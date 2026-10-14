@@ -73,6 +73,7 @@ label input, label select { margin-top: 4px; font-weight: 400; }
 .crumbs a { color: var(--text); text-decoration: none; padding: 2px 4px; border-radius: 5px; cursor: pointer; }
 .crumbs a:hover { background: var(--hover); }
 .crumbs .sep { color: var(--muted); }
+.usage { font-size: 12.5px; white-space: nowrap; }
 .selection-bar { display: flex; align-items: center; gap: 10px; padding: 8px 12px; margin-bottom: 10px; border-radius: 8px; background: var(--hover); }
 
 .table-wrap { position: relative; background: var(--panel); border: 1px solid var(--border); border-radius: 10px; min-height: 160px; }

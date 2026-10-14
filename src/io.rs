@@ -221,7 +221,7 @@ impl Ingested {
 
     pub fn storage(&self) -> (Storage, Option<Bytes>, Vec<u128>) {
         match &self.data {
-            Data::Inline(b) => (Storage::Inline(util::new_id()), Some(b.clone()), vec![]),
+            Data::Inline(b) => (Storage::Inline(util::new_seq_id()), Some(b.clone()), vec![]),
             Data::File(id) => (Storage::Segments(vec![(*id, self.size)]), None, vec![*id]),
         }
     }
@@ -451,7 +451,11 @@ struct SegReader {
 
 impl SegReader {
     fn open(store: &Store, id: u128, seg_len: u64, key: Option<&WrapKey>) -> io::Result<Self> {
-        let mut f = File::open(store.data_path(id))?;
+        Self::open_path(&store.data_path(id), seg_len, key)
+    }
+
+    fn open_path(path: &std::path::Path, seg_len: u64, key: Option<&WrapKey>) -> io::Result<Self> {
+        let mut f = File::open(path)?;
         let cipher = match key {
             Some(k) => {
                 let mut h = [0u8; crypt::HEADER];
@@ -479,6 +483,24 @@ impl SegReader {
             }
         }
     }
+}
+
+/// MD5 of a stored data file's plaintext (decrypted with `key`, which also authenticates
+/// every chunk), read in bounded steps.
+pub fn segment_md5(path: &std::path::Path, seg_len: u64, key: Option<&WrapKey>) -> io::Result<[u8; 16]> {
+    use md5::Digest;
+    let mut r = SegReader::open_path(path, seg_len, key)?;
+    let mut h = md5::Md5::new();
+    let mut buf = Vec::with_capacity(4 << 20);
+    let mut off = 0;
+    while off < seg_len {
+        let n = (seg_len - off).min(4 << 20);
+        buf.clear();
+        r.read(off, n, &mut buf)?;
+        h.update(&buf);
+        off += n;
+    }
+    Ok(h.finalize().into())
 }
 
 /// Plaintext `[start, start+len)` of an inline object.

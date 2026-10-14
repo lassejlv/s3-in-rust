@@ -257,6 +257,18 @@ pub fn new_id() -> u128 {
     ((hi as u128) << 64) | lo as u128
 }
 
+/// A unique id that increases over time: milliseconds since the epoch, then a counter that
+/// starts at a random value each run. Used as the key of inline object data, so new entries
+/// are appended at the end of the table instead of scattered across it (far fewer pages to
+/// write per commit). The random counter start keeps ids unique even if the clock steps back.
+pub fn new_seq_id() -> u128 {
+    static START: OnceLock<u64> = OnceLock::new();
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let start = *START.get_or_init(|| (new_id() >> 64) as u64);
+    let c = COUNTER.fetch_add(1, Ordering::Relaxed);
+    ((now_ms() as u128) << 64) | start.wrapping_add(c) as u128
+}
+
 fn splitmix64(mut z: u64) -> u64 {
     z = z.wrapping_add(0x9E37_79B9_7F4A_7C15);
     z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);

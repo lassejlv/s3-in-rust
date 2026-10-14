@@ -348,6 +348,7 @@ async function loadList(append) {
   // Only the latest listing request may update the view (navigation can overtake a slow one).
   const seq = ++listSeq;
   const filter = $("search").value;
+  if (!append) refreshUsage();
   try {
     const page = await S3.list(state.bucket, state.prefix + filter, append ? state.token : null);
     if (seq !== listSeq) return;
@@ -361,6 +362,20 @@ async function loadList(append) {
     toast(e.message, true);
     if (e.code === "NoSuchBucket") { await refreshBuckets(); $("browser").classList.add("hidden"); $("empty-state").classList.remove("hidden"); }
   }
+}
+
+async function refreshUsage() {
+  const bucket = state.bucket;
+  $("usage").textContent = "";
+  try {
+    const doc = await S3.xml("GET", `/${bucket}`, { query: { usage: "" } });
+    if (bucket !== state.bucket) return;
+    const n = Number(xmlText(doc, "Objects") || 0);
+    const maxBytes = xmlText(doc, "MaxBytes");
+    let text = `${n.toLocaleString()} object${n === 1 ? "" : "s"} · ${formatSize(xmlText(doc, "Bytes") || 0)}`;
+    if (maxBytes) text += ` of ${formatSize(maxBytes)}`;
+    $("usage").textContent = text;
+  } catch (_) { /* usage needs s3:GetBucketUsage; just leave it out */ }
 }
 
 function renderRows() {
@@ -576,7 +591,7 @@ async function renderPreview(key, h) {
 
 async function bucketSettings() {
   const b = state.bucket;
-  let versioning = "Off", publicRead = false, lock = false, website = null;
+  let versioning = "Off", publicRead = false, lock = false, website = null, quota = { bytes: "", objects: "" };
   try {
     const v = await S3.xml("GET", `/${b}`, { query: { versioning: "" } });
     versioning = xmlText(v, "Status") || "Off";
@@ -584,6 +599,11 @@ async function bucketSettings() {
     publicRead = [...acl.getElementsByTagName("Grant")].some((g) => (xmlText(g, "URI") || "").endsWith("/AllUsers") && xmlText(g, "Permission") === "READ");
     try { await S3.request("GET", `/${b}`, { query: { "object-lock": "" } }); lock = true; } catch (_) { /* not enabled */ }
     try { const w = await S3.xml("GET", `/${b}`, { query: { website: "" } }); website = { index: xmlText(w, "Suffix"), error: xmlText(w, "Key") }; } catch (_) { /* none */ }
+    try {
+      const q = await S3.xml("GET", `/${b}`, { query: { quota: "" } });
+      const mb = xmlText(q, "MaxBytes");
+      quota = { bytes: mb ? String(Number(mb) / 2 ** 30) : "", objects: xmlText(q, "MaxObjects") || "" };
+    } catch (_) { /* no permission */ }
   } catch (e) { toast(e.message, true); return; }
 
   let wantsDelete = false;
@@ -600,9 +620,14 @@ async function bucketSettings() {
     el("label", {}, "Index document", el("input", { id: "f-index", value: website?.index || "index.html" })),
     el("label", {}, "Error document (optional)", el("input", { id: "f-error", value: website?.error || "" })),
     el("p", { class: "muted" }, "Websites are served on the server's website endpoint (--website-listen) and need public read access."),
+    el("label", {}, "Quota: maximum size in GiB (empty = unlimited)", el("input", { id: "f-qbytes", type: "number", min: "0", step: "any", value: quota.bytes })),
+    el("label", {}, "Quota: maximum number of objects (empty = unlimited)", el("input", { id: "f-qobjects", type: "number", min: "0", step: "1", value: quota.objects })),
     el("hr"),
     el("button", { type: "button", class: "danger", onclick: () => { wantsDelete = true; $("modal").close("cancel"); } }, "Delete bucket…"),
-  ], "Save", () => ({ ver: $("f-ver").value, acl: $("f-acl").value, web: $("f-web").checked, index: $("f-index").value.trim(), error: $("f-error").value.trim() }));
+  ], "Save", () => ({
+    ver: $("f-ver").value, acl: $("f-acl").value, web: $("f-web").checked, index: $("f-index").value.trim(), error: $("f-error").value.trim(),
+    qbytes: $("f-qbytes").value.trim(), qobjects: $("f-qobjects").value.trim(),
+  }));
   if (wantsDelete) return deleteBucket(b);
   if (!choice) return;
   try {
@@ -616,7 +641,21 @@ async function bucketSettings() {
     } else if (website) {
       await S3.request("DELETE", `/${b}`, { query: { website: "" } });
     }
+    if (choice.qbytes !== quota.bytes || choice.qobjects !== quota.objects) {
+      const bytes = choice.qbytes ? Math.round(Number(choice.qbytes) * 2 ** 30) : 0;
+      const objects = choice.qobjects ? Math.round(Number(choice.qobjects)) : 0;
+      if (bytes || objects) {
+        await S3.request("PUT", `/${b}`, {
+          query: { quota: "" },
+          body: `<BucketQuota><MaxBytes>${bytes}</MaxBytes><MaxObjects>${objects}</MaxObjects></BucketQuota>`,
+          headers: { "content-type": "application/xml" },
+        });
+      } else {
+        await S3.request("DELETE", `/${b}`, { query: { quota: "" } });
+      }
+    }
     toast("Settings saved");
+    refreshUsage();
   } catch (e) { toast(e.message, true); }
 }
 

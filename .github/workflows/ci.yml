@@ -41,11 +41,12 @@ jobs:
       - name: Start s3rs
         run: |
           cp tests/policies/home.json /tmp/home.json
+          openssl rand -hex 32 > /tmp/s3rs.key
           printf 'rokey:rosecret:ro\nscoped:scopedsecret:rw:scoped-*,shared-scope\nalice:alicesecret:policy=home.json\n' > /tmp/creds
           # Fast lifecycle sweeps (1s) with 2-second "days" so expiration can be tested.
           S3RS_LIFECYCLE_DAY_SECS=2 ./target/release/s3rs -d /tmp/s3rs-data -l 127.0.0.1:9000 \
             --access-key testkey --secret-key testsecret --credentials-file /tmp/creds \
-            --lifecycle-interval 1 --encryption-key "$(openssl rand -hex 32)" \
+            --lifecycle-interval 1 --encryption-key-file /tmp/s3rs.key \
             --website-listen 127.0.0.1:9001 --website-domain web.localhost \
             --webhook test=http://127.0.0.1:9399/hook --webhook-secret hooksecret > /tmp/s3rs.log 2>&1 &
           echo $! > /tmp/s3rs.pid
@@ -112,6 +113,11 @@ jobs:
           npm install --no-save --no-package-lock playwright@1.56.1
           npx playwright install --with-deps chromium
           node tests/console.js
+      - name: fsck after a graceful shutdown
+        run: |
+          kill -TERM "$(cat /tmp/s3rs.pid)"
+          while kill -0 "$(cat /tmp/s3rs.pid)" 2>/dev/null; do sleep 0.2; done
+          ./target/release/s3rs fsck -d /tmp/s3rs-data --deep --encryption-key-file /tmp/s3rs.key
       - name: Server log
         if: always()
         run: cat /tmp/s3rs.log

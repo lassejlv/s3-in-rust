@@ -324,7 +324,89 @@ fn collect_credentials(cfg: &Config) -> Result<Vec<auth::Credential>, String> {
     Ok(creds)
 }
 
+/// `s3rs fsck [--data-dir DIR] [--deep] [--repair] [--encryption-key K | --encryption-key-file F]`
+fn fsck(args: &[String]) -> ! {
+    let mut dir: PathBuf = env("S3RS_DATA_DIR").unwrap_or_else(|| "./data".into()).into();
+    let (mut deep, mut repair) = (false, false);
+    let mut key = env("S3RS_ENCRYPTION_KEY").map(|k| parse_key(&k));
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        let mut val = || {
+            it.next().cloned().unwrap_or_else(|| {
+                eprintln!("{a} requires a value");
+                std::process::exit(2)
+            })
+        };
+        match a.as_str() {
+            "-d" | "--data-dir" => dir = val().into(),
+            "--deep" => deep = true,
+            "--repair" => repair = true,
+            "--encryption-key" => key = Some(parse_key(&val())),
+            "--encryption-key-file" => {
+                let p = val();
+                key = Some(std::fs::read_to_string(&p).map_err(|e| format!("{p}: {e}")).and_then(|t| parse_key(t.trim())));
+            }
+            "-h" | "--help" => {
+                println!(
+                    "usage: s3rs fsck [--data-dir DIR] [--deep] [--repair] [--encryption-key K | --encryption-key-file F]
+
+Checks a data directory while the server is stopped:
+  - every object version's data exists with the right size
+  - orphaned data files and usage counters that disagree with the stored objects
+  --deep    also re-reads all data and verifies each ETag (and decrypts SSE-S3 objects
+            when the encryption key is given)
+  --repair  removes orphaned data files and rebuilds usage counters (never touches objects)"
+                );
+                std::process::exit(0);
+            }
+            other => {
+                eprintln!("unknown fsck argument: {other}");
+                std::process::exit(2);
+            }
+        }
+    }
+    let key = match key.transpose() {
+        Ok(k) => k,
+        Err(e) => {
+            eprintln!("error: encryption key: {e}");
+            std::process::exit(2);
+        }
+    };
+    let started = std::time::Instant::now();
+    let r = match store::fsck::run(&dir, deep, key, repair) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("error: {e}");
+            std::process::exit(2);
+        }
+    };
+    println!("checked {} object version(s), {} bytes, in {:.1}s", r.versions, r.bytes, started.elapsed().as_secs_f64());
+    if deep {
+        println!("deep: {} verified, {} skipped (SSE-C, or SSE-S3 without --encryption-key)", r.deep_verified, r.deep_skipped);
+    }
+    for p in &r.problems {
+        println!("PROBLEM {p}");
+    }
+    for m in &r.usage_mismatches {
+        println!("USAGE {m}{}", if repair { " (rebuilt)" } else { "" });
+    }
+    if r.orphans > 0 {
+        println!("orphans: {} data file(s), {} bytes{}", r.orphans, r.orphan_bytes, if repair { " (removed)" } else { "" });
+    }
+    let fixed = repair && r.problems.is_empty();
+    if r.ok() || fixed {
+        println!("{}", if r.ok() { "OK" } else { "REPAIRED" });
+        std::process::exit(0);
+    }
+    println!("{} problem(s) found", r.problems.len() + r.usage_mismatches.len() + usize::from(r.orphans > 0));
+    std::process::exit(1);
+}
+
 fn main() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().map(String::as_str) == Some("fsck") {
+        fsck(&args[1..]);
+    }
     let cfg = match parse_args() {
         Ok(c) => c,
         Err(e) => {

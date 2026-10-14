@@ -117,15 +117,22 @@ const shot = (page, name) => (out ? page.screenshot({ path: `${out}/${name}.png`
   await page.waitForSelector('#app:not(.hidden)');
   await page.waitForSelector('tr:has-text("evil.html")');
 
+  step('usage shown');
+  await page.waitForFunction(() => /object/.test(document.querySelector('#usage').textContent));
+  console.log('  usage:', await page.textContent('#usage'));
+
   step('settings: public read + website');
   await page.click('#settings');
   await page.waitForSelector('#f-acl');
   await page.selectOption('#f-acl', 'public-read');
   await page.check('#f-web');
+  await page.fill('#f-qbytes', '1');
   await page.click('#modal-ok');
   await page.waitForSelector('.toast:has-text("Settings saved")');
   const anon = await fetch(`${BASE}/${BUCKET}/hello.txt`);
   console.log('  anonymous GET after public-read:', anon.status);
+  await page.waitForFunction(() => /of 1\.0 GB/.test(document.querySelector('#usage').textContent));
+  console.log('  usage with quota:', await page.textContent('#usage'));
   if (anon.status !== 200) throw new Error('public read not applied');
 
   step('delete selected (folder + files)');

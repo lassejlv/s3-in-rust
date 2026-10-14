@@ -326,6 +326,62 @@ Supported: index documents (`/` and `/dir/`, and `/dir` redirects to `/dir/`), e
 accepts only anonymous GET and HEAD, and never lists buckets. Behind a TLS-terminating proxy,
 redirects use the scheme from `X-Forwarded-Proto`.
 
+## Usage and quotas
+
+The server keeps a running count of each bucket's stored object versions and bytes. It is updated
+in the same transaction as every write, so it is always exact and costs no scans. Delete markers
+don't count, and noncurrent versions do. `/_metrics` exports these counts as
+`s3rs_bucket_objects{bucket=...}` and `s3rs_bucket_bytes{bucket=...}`, and the console shows
+them.
+
+Quotas cap a bucket's size and/or object count. Writes that would exceed them fail with
+`403 QuotaExceeded`:
+- Plain uploads with a known length are refused before any data is received.
+- Multipart uploads are checked when they complete.
+- An unversioned overwrite counts only the size difference.
+
+These are s3rs extensions (bucket subresources, signed like any S3 request):
+
+```bash
+# usage: <BucketUsage><Objects>…</Objects><Bytes>…</Bytes>[<MaxObjects/MaxBytes>]</BucketUsage>
+GET    /photos?usage
+# set a quota (0 or a missing element = unlimited)
+PUT    /photos?quota      <BucketQuota><MaxBytes>10737418240</MaxBytes><MaxObjects>100000</MaxObjects></BucketQuota>
+GET    /photos?quota
+DELETE /photos?quota
+```
+
+Reading usage needs `s3:GetBucketUsage`, and changing quotas needs `s3:PutBucketQuota`. Keys without
+a policy have both (read-only keys only the first). The console's bucket settings include quota
+fields.
+
+## Integrity checks (`s3rs fsck`)
+
+Run `s3rs fsck` while the server is stopped. It refuses to run while the data directory is in
+use:
+
+```bash
+s3rs fsck --data-dir /data                          # fast: metadata vs. data files
+s3rs fsck --data-dir /data --deep --encryption-key-file /etc/s3rs.key
+s3rs fsck --data-dir /data --repair                 # remove orphans, rebuild usage counters
+```
+
+The fast check confirms:
+- Every object version's data (files or inline blobs) exists with exactly the expected size.
+- Multipart parts exist.
+- There are no orphaned data files.
+- Usage counters match the stored objects.
+
+`--deep` also reads all data back:
+- Each ETag is verified: the MD5 for single-part objects, and the composite `md5-of-part-md5s-N`
+  for multipart objects and their copies.
+- SSE-S3 objects are decrypted with the given key, which authenticates every 64 KiB chunk.
+- SSE-C objects can't be verified without their customer keys and are counted as skipped.
+
+`--repair` only removes orphaned files and rebuilds usage counters. It never modifies or deletes
+object data. The exit status is 0 when everything is consistent, and 1 when it found problems.
+CI runs `fsck --deep` on the data left by the full test suite after a graceful shutdown.
+
 ## Event notifications
 
 s3rs can tell other services when objects are created or removed, in S3's event format.
@@ -402,7 +458,7 @@ direct uploads from web apps.
 | Area | Operations |
 |---|---|
 | Buckets | ListBuckets, CreateBucket (with canned ACL), DeleteBucket, HeadBucket, GetBucketLocation, Get/PutBucketVersioning, Get/PutBucketAcl, Get/Put/DeleteBucketPolicy, GetBucketPolicyStatus, Get/Put/DeleteBucketCors, Get/Put/DeleteBucketTagging, Get/Put/DeleteBucketEncryption, Get/PutObjectLockConfiguration, Get/Put/DeleteBucketWebsite, Get/PutBucketNotificationConfiguration, ListenBucketNotification (MinIO) |
-| Objects | PutObject, GetObject, HeadObject, DeleteObject, DeleteObjects, CopyObject (COPY/REPLACE for metadata and tags), Get/Put/DeleteObjectTagging, `x-amz-tagging` on upload, GetObjectAcl, Get/PutObjectRetention, Get/PutObjectLegalHold, SSE-S3 and SSE-C on every read/write/copy path |
+| Objects | PutObject, GetObject, HeadObject, GetObjectAttributes, DeleteObject, DeleteObjects, CopyObject (COPY/REPLACE for metadata and tags), Get/Put/DeleteObjectTagging, `x-amz-tagging` on upload, GetObjectAcl, Get/PutObjectRetention, Get/PutObjectLegalHold, SSE-S3 and SSE-C on every read/write/copy path |
 | Listing | ListObjects (v1), ListObjectsV2, ListObjectVersions (versions and delete markers); prefix, delimiter, pagination, `start-after`, `encoding-type=url` |
 | Multipart | CreateMultipartUpload, UploadPart, UploadPartCopy (with ranges), CompleteMultipartUpload, AbortMultipartUpload, ListParts, ListMultipartUploads |
 | Lifecycle | Get/Put/DeleteBucketLifecycleConfiguration (expiration, abort incomplete uploads) |

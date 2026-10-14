@@ -111,6 +111,16 @@ impl Metrics {
         {
             let _ = writeln!(o, "s3rs_notifications_total{{result=\"{name}\"}} {}", v.load(Relaxed));
         }
+        if let Ok(usage) = store.all_usage() {
+            let _ = writeln!(o, "# TYPE s3rs_bucket_objects gauge");
+            for (b, n, _) in &usage {
+                let _ = writeln!(o, "s3rs_bucket_objects{{bucket=\"{b}\"}} {n}");
+            }
+            let _ = writeln!(o, "# TYPE s3rs_bucket_bytes gauge");
+            for (b, _, bytes) in &usage {
+                let _ = writeln!(o, "s3rs_bucket_bytes{{bucket=\"{b}\"}} {bytes}");
+            }
+        }
         if let Ok(b) = store.list_buckets() {
             let _ = writeln!(o, "# TYPE s3rs_buckets gauge\ns3rs_buckets {}", b.len());
         }

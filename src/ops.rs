@@ -87,6 +87,9 @@ pub const BUCKET_SUBS: &[Sub] = &[
     sub("versions", Some("s3:ListBucketVersions"), None, None),
     sub("delete", None, None, None),
     sub("events", Some("s3:ListenBucketNotification"), None, None),
+    // s3rs extensions: storage used by a bucket, and its quota.
+    sub("usage", Some("s3:GetBucketUsage"), None, None),
+    sub("quota", Some("s3:GetBucketQuota"), Some("s3:PutBucketQuota"), Some("s3:PutBucketQuota")),
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -172,6 +175,7 @@ pub enum ObjectOp {
     GetTagging,
     GetRetention,
     GetLegalHold,
+    GetAttributes,
     Put,
     Copy,
     UploadPart,
@@ -206,7 +210,7 @@ const OBJECT_SUBS: &[&str] = &[
 pub fn classify_object(m: &Method, query: &[(String, String)], copy_source: bool) -> S3Result<ObjectOp> {
     let sub = one_subresource(OBJECT_SUBS.iter().copied().filter(|s| has(query, s)).collect())?;
     let part = has(query, "partNumber");
-    if matches!(sub, Some("torrent" | "restore" | "select" | "attributes" | "renameObject")) {
+    if matches!(sub, Some("torrent" | "restore" | "select" | "renameObject")) {
         return Ok(ObjectOp::Unsupported);
     }
     let missing = |msg: &str| Err(err::InvalidRequest().with_message(msg.to_string()));
@@ -218,6 +222,7 @@ pub fn classify_object(m: &Method, query: &[(String, String)], copy_source: bool
         (&Method::GET, Some("tagging")) => ObjectOp::GetTagging,
         (&Method::GET, Some("retention")) => ObjectOp::GetRetention,
         (&Method::GET, Some("legal-hold")) => ObjectOp::GetLegalHold,
+        (&Method::GET, Some("attributes")) => ObjectOp::GetAttributes,
         (&Method::PUT, None) if part => return missing("partNumber requires uploadId"),
         (&Method::PUT, None) if copy_source => ObjectOp::Copy,
         (&Method::PUT, None) => ObjectOp::Put,
@@ -248,6 +253,7 @@ impl ObjectOp {
             ObjectOp::GetTagging => v("s3:GetObjectTagging", "s3:GetObjectVersionTagging"),
             ObjectOp::GetRetention => Some("s3:GetObjectRetention"),
             ObjectOp::GetLegalHold => Some("s3:GetObjectLegalHold"),
+            ObjectOp::GetAttributes => v("s3:GetObjectAttributes", "s3:GetObjectVersionAttributes"),
             ObjectOp::Put
             | ObjectOp::Copy
             | ObjectOp::UploadPart
@@ -331,6 +337,7 @@ mod tests {
         assert!(c(Method::HEAD, &["acl"], false).is_err());
         assert_eq!(c(Method::GET, &["partNumber"], false).unwrap(), ObjectOp::Get);
         assert_eq!(c(Method::GET, &["select"], false).unwrap(), ObjectOp::Unsupported);
+        assert_eq!(c(Method::GET, &["attributes"], false).unwrap(), ObjectOp::GetAttributes);
         assert_eq!(c(Method::DELETE, &["versionId"], false).unwrap().action(true), Some("s3:DeleteObjectVersion"));
         assert!(c(Method::PUT, &[], true).unwrap().creates_object());
         assert!(!c(Method::PUT, &["tagging"], false).unwrap().creates_object());

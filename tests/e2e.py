@@ -1204,11 +1204,11 @@ def t_authz_regressions():
     s3.delete_bucket(Bucket=rb)
 
 
-def _signed_request(c, method, path):
+def _signed_request(c, method, path, data=b""):
     """A botocore-signed raw request (for URLs boto3 has no operation for)."""
     from botocore.auth import S3SigV4Auth
     from botocore.awsrequest import AWSRequest
-    req = AWSRequest(method=method, url=f"{ENDPOINT}{path}", data=b"")
+    req = AWSRequest(method=method, url=f"{ENDPOINT}{path}", data=data)
     S3SigV4Auth(c._request_signer._credentials.get_frozen_credentials(), "s3", "us-east-1").add_auth(req)
     return req
 
@@ -1347,6 +1347,74 @@ def t_notifications():
             s3.delete_object(Bucket=nb, Key=o["Key"])
         s3.delete_bucket(Bucket=nb)
         srv.shutdown()
+
+
+def _raw(method, path, data=b""):
+    """Signed request with the main key: (status, body)."""
+    r = s3._endpoint.http_session.send(_signed_request(s3, method, path, data).prepare())
+    return r.status_code, r.content
+
+
+def t_usage_and_quota():
+    qb = B + "-quota"
+    s3.create_bucket(Bucket=qb)
+    try:
+        s3.put_object(Bucket=qb, Key="a", Body=b"x" * 1000)
+        s3.put_object(Bucket=qb, Key="b", Body=b"y" * 500)
+        s3.put_object(Bucket=qb, Key="a", Body=b"z" * 100)  # overwrite replaces
+        st, body = _raw("GET", f"/{qb}?usage")
+        assert st == 200 and b"<Objects>2</Objects>" in body and b"<Bytes>600</Bytes>" in body, body
+        st, _ = _raw("PUT", f"/{qb}?quota", b"<BucketQuota><MaxBytes>1000</MaxBytes><MaxObjects>3</MaxObjects></BucketQuota>")
+        assert st == 200, st
+        st, body = _raw("GET", f"/{qb}?quota")
+        assert b"<MaxBytes>1000</MaxBytes>" in body and b"<MaxObjects>3</MaxObjects>" in body, body
+        s3.put_object(Bucket=qb, Key="c", Body=b"c" * 300)  # 900 bytes, 3 objects
+        expect_error("QuotaExceeded", lambda: s3.put_object(Bucket=qb, Key="d", Body=b"d"))  # 4th object
+        expect_error("QuotaExceeded", lambda: s3.put_object(Bucket=qb, Key="c", Body=b"c" * 401))  # 1001 bytes
+        s3.put_object(Bucket=qb, Key="c", Body=b"c" * 400)  # exactly 1000 bytes: fits
+        # Multipart uploads are checked when they complete.
+        up = s3.create_multipart_upload(Bucket=qb, Key="m")
+        e = s3.upload_part(Bucket=qb, Key="m", UploadId=up["UploadId"], PartNumber=1, Body=b"m")["ETag"]
+        expect_error("QuotaExceeded", lambda: s3.complete_multipart_upload(
+            Bucket=qb, Key="m", UploadId=up["UploadId"], MultipartUpload={"Parts": [{"PartNumber": 1, "ETag": e}]}))
+        s3.abort_multipart_upload(Bucket=qb, Key="m", UploadId=up["UploadId"])
+        assert _raw("DELETE", f"/{qb}?quota")[0] == 204
+        s3.put_object(Bucket=qb, Key="d", Body=b"d" * 5000)
+        st, body = _raw("GET", f"/{qb}?usage")
+        assert b"<Objects>4</Objects>" in body and b"<Bytes>6000</Bytes>" in body and b"MaxBytes" not in body, body
+        metrics = urllib.request.urlopen(f"{ENDPOINT}/_metrics").read().decode()
+        assert f's3rs_bucket_bytes{{bucket="{qb}"}} 6000' in metrics, [l for l in metrics.splitlines() if qb in l]
+        # Read-only keys may see usage but not change quotas.
+        if RO_AK:
+            ro = boto3.client("s3", endpoint_url=ENDPOINT, aws_access_key_id=RO_AK, aws_secret_access_key=RO_SK, region_name="us-east-1",
+                              config=Config(s3={"addressing_style": "path"}, retries={"max_attempts": 1}))
+            assert ro._endpoint.http_session.send(_signed_request(ro, "PUT", f"/{qb}?quota", b"<BucketQuota/>").prepare()).status_code == 403
+    finally:
+        for o in s3.list_objects_v2(Bucket=qb).get("Contents", []):
+            s3.delete_object(Bucket=qb, Key=o["Key"])
+        s3.delete_bucket(Bucket=qb)
+
+
+def t_object_attributes():
+    s3.put_object(Bucket=B, Key="attrs.txt", Body=b"hello attributes", ChecksumAlgorithm="CRC32")
+    a = s3.get_object_attributes(Bucket=B, Key="attrs.txt", ObjectAttributes=["ETag", "Checksum", "ObjectSize", "StorageClass"])
+    head = s3.head_object(Bucket=B, Key="attrs.txt")
+    assert a["ETag"] == head["ETag"].strip('"') and a["ObjectSize"] == 16 and a["StorageClass"] == "STANDARD", a
+    assert "ChecksumCRC32" in a["Checksum"], a
+    up = s3.create_multipart_upload(Bucket=B, Key="attrs-mp")
+    parts = []
+    for n, size in ((1, 5 << 20), (2, 1234)):
+        e = s3.upload_part(Bucket=B, Key="attrs-mp", UploadId=up["UploadId"], PartNumber=n, Body=b"p" * size)["ETag"]
+        parts.append({"PartNumber": n, "ETag": e})
+    s3.complete_multipart_upload(Bucket=B, Key="attrs-mp", UploadId=up["UploadId"], MultipartUpload={"Parts": parts})
+    a = s3.get_object_attributes(Bucket=B, Key="attrs-mp", ObjectAttributes=["ObjectParts", "ObjectSize"], MaxParts=1)
+    op = a["ObjectParts"]
+    assert op["TotalPartsCount"] == 2 and op["IsTruncated"] and op["Parts"][0]["Size"] == 5 << 20, op
+    a = s3.get_object_attributes(Bucket=B, Key="attrs-mp", ObjectAttributes=["ObjectParts"], PartNumberMarker=1)
+    assert [p["PartNumber"] for p in a["ObjectParts"]["Parts"]] == [2], a
+    expect_error("NoSuchKey", lambda: s3.get_object_attributes(Bucket=B, Key="nope", ObjectAttributes=["ETag"]))
+    s3.delete_object(Bucket=B, Key="attrs.txt")
+    s3.delete_object(Bucket=B, Key="attrs-mp")
 
 
 def t_overwrite():

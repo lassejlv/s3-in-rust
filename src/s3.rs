@@ -1029,6 +1029,23 @@ impl Server {
                         let doc = self.store.bucket_config(bucket, "website")?.ok_or_else(err::NoSuchWebsiteConfiguration)?;
                         Ok(Resp::xml(String::from_utf8_lossy(&doc).into_owned()))
                     }
+                    "usage" | "quota" => {
+                        let q =
+                            self.store.bucket_config(bucket, "quota")?.and_then(|v| store::Quota::decode(&v)).unwrap_or_default();
+                        let root = if sub == "usage" { "BucketUsage" } else { "BucketQuota" };
+                        let mut x = Xml::new(root);
+                        if sub == "usage" {
+                            let (objects, bytes) = self.store.bucket_usage(bucket)?;
+                            x.elem("Objects", objects.to_string()).elem("Bytes", bytes.to_string());
+                        }
+                        if q.max_objects > 0 {
+                            x.elem("MaxObjects", q.max_objects.to_string());
+                        }
+                        if q.max_bytes > 0 {
+                            x.elem("MaxBytes", q.max_bytes.to_string());
+                        }
+                        Ok(Resp::xml(x.finish(root)))
+                    }
                     "logging" => Ok(Resp::xml(Xml::new("BucketLoggingStatus").finish("BucketLoggingStatus"))),
                     "notification" => Ok(Resp::xml(match self.store.bucket_config(bucket, "notification")? {
                         Some(doc) => String::from_utf8_lossy(&doc).into_owned(),
@@ -1150,6 +1167,21 @@ impl Server {
                 res?;
                 Ok(Resp::ok())
             }
+            BucketOp::PutConfig("quota") => {
+                let doc = self.read_xml(r).await?;
+                if doc.name != "BucketQuota" {
+                    return Err(err::MalformedXML());
+                }
+                let num = |n: &str| -> S3Result<u64> {
+                    doc.child_text(n).map_or(Ok(0), |v| {
+                        v.trim().parse().map_err(|_| err::InvalidArgument().with_message(format!("{n} must be a whole number")))
+                    })
+                };
+                let q = store::Quota { max_objects: num("MaxObjects")?, max_bytes: num("MaxBytes")? };
+                let value = (q != store::Quota::default()).then(|| q.encode());
+                self.set_bucket_config(bucket, "quota", value).await?;
+                Ok(Resp::ok())
+            }
             BucketOp::PutConfig(_) => Err(err::NotImplemented()),
             BucketOp::Create => {
                 if !valid_bucket_name(bucket) {
@@ -1173,7 +1205,7 @@ impl Server {
                 resp.set("location", &format!("/{bucket}"));
                 Ok(resp)
             }
-            BucketOp::DeleteConfig(kind @ ("policy" | "cors" | "tagging" | "lifecycle" | "encryption" | "website")) => {
+            BucketOp::DeleteConfig(kind @ ("policy" | "cors" | "tagging" | "lifecycle" | "encryption" | "website" | "quota")) => {
                 let kind: &'static str = store::CONFIG_KINDS.iter().find(|k| **k == kind).unwrap();
                 self.set_bucket_config(bucket, kind, None).await?;
                 Ok(Resp::new(StatusCode::NO_CONTENT))
@@ -1237,6 +1269,7 @@ impl Server {
                 };
                 Ok(Resp::xml(doc))
             }
+            ObjectOp::GetAttributes => self.object_attributes(r, bucket, key, vref),
             ObjectOp::Get | ObjectOp::Head => {
                 let mut resp = self.get_object(r, bucket, key, op == ObjectOp::Head).await?;
                 if self.console {
@@ -1607,6 +1640,78 @@ impl Server {
             && self.authorize(&r.principal, "s3:BypassGovernanceRetention", Some(bucket), Some(key), &self.req_ctx(r)).is_ok()
     }
 
+    /// GetObjectAttributes: the attributes named in `x-amz-object-attributes`.
+    fn object_attributes(&self, r: &Req, bucket: &str, key: &str, version: Option<&str>) -> S3Result<Resp> {
+        let wanted: Vec<String> = r
+            .parts
+            .headers
+            .get_all("x-amz-object-attributes")
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .flat_map(|v| v.split(','))
+            .map(|a| a.trim().to_string())
+            .filter(|a| !a.is_empty())
+            .collect();
+        const KNOWN: &[&str] = &["ETag", "Checksum", "ObjectParts", "StorageClass", "ObjectSize"];
+        if wanted.is_empty() || wanted.iter().any(|a| !KNOWN.contains(&a.as_str())) {
+            return Err(err::InvalidArgument().with_message(
+                "x-amz-object-attributes must list one or more of ETag, Checksum, ObjectParts, StorageClass, ObjectSize",
+            ));
+        }
+        let (meta, _) = self.lookup(bucket, key, version)?;
+        if meta.delete_marker {
+            return Err(err::NoSuchKey().with_header("x-amz-delete-marker", "true"));
+        }
+        // SSE-C objects reveal nothing without their key.
+        self.read_key(&meta.headers, &r.parts.headers, "x-amz-")?;
+        let has = |a: &str| wanted.iter().any(|w| w == a);
+        let mut x = Xml::new("GetObjectAttributesResponse");
+        if has("ETag") {
+            x.elem("ETag", meta.etag.trim_matches('"'));
+        }
+        if has("Checksum")
+            && let Some((algo, value)) = &meta.checksum
+        {
+            let tag = match algo {
+                ChecksumAlgo::Crc32 => "ChecksumCRC32",
+                ChecksumAlgo::Crc32c => "ChecksumCRC32C",
+                ChecksumAlgo::Crc64Nvme => "ChecksumCRC64NVME",
+                ChecksumAlgo::Sha1 => "ChecksumSHA1",
+                ChecksumAlgo::Sha256 => "ChecksumSHA256",
+            };
+            x.open("Checksum").elem(tag, value).close("Checksum");
+        }
+        if has("ObjectParts")
+            && let Storage::Segments(segs) = &meta.storage
+            && meta.etag.contains('-')
+        {
+            let max = r.header("x-amz-max-parts").and_then(|v| v.trim().parse::<usize>().ok()).unwrap_or(1000).clamp(1, 1000);
+            let marker = r.header("x-amz-part-number-marker").and_then(|v| v.trim().parse::<usize>().ok()).unwrap_or(0);
+            let parts: Vec<(usize, u64)> =
+                segs.iter().enumerate().map(|(i, (_, len))| (i + 1, *len)).skip(marker).take(max).collect();
+            let truncated = marker + parts.len() < segs.len();
+            x.open("ObjectParts").elem("PartsCount", segs.len().to_string()).elem("PartNumberMarker", marker.to_string());
+            if let Some((last, _)) = parts.last() {
+                x.elem("NextPartNumberMarker", last.to_string());
+            }
+            x.elem("MaxParts", max.to_string()).elem("IsTruncated", truncated.to_string());
+            for (n, size) in &parts {
+                x.open("Part").elem("PartNumber", n.to_string()).elem("Size", size.to_string()).close("Part");
+            }
+            x.close("ObjectParts");
+        }
+        if has("StorageClass") {
+            x.elem("StorageClass", "STANDARD");
+        }
+        if has("ObjectSize") {
+            x.elem("ObjectSize", meta.size.to_string());
+        }
+        let mut resp = Resp::xml(x.finish("GetObjectAttributesResponse"));
+        resp.set("last-modified", &http_date(meta.mtime_ms));
+        set_version_header(&mut resp, &meta);
+        Ok(resp)
+    }
+
     // -------------------------------------------------------------- event notifications
 
     fn event(&self, principal: &Principal, ip: IpAddr, rid: &str, name: &'static str, bucket: &str, key: &str) -> events::Event {
@@ -1864,6 +1969,10 @@ impl Server {
         let enc = self.write_encryption(&r.parts.headers, bucket, None)?;
         let mut expect = self.expect(r, MAX_OBJECT_SIZE, !versioned)?;
         expect.encrypt = enc.as_ref().map(|(k, _)| k.clone());
+        // Refuse uploads that cannot fit before receiving them.
+        if let Some(len) = expect.len {
+            self.store.quota_allows(bucket, key, len)?;
+        }
         let body = std::mem::replace(&mut r.body, BodyStream::empty());
         let ing = io::ingest(&self.store, body, expect).await?;
         let etag = etag_of(ing.md5, enc.as_ref().map(|(k, _)| k));
@@ -2072,7 +2181,7 @@ impl Server {
                         Err(e) => return Err(e.into()),
                     }
                 }
-                Storage::Inline(_) => (Storage::Inline(util::new_id()), vec![], None),
+                Storage::Inline(_) => (Storage::Inline(util::new_seq_id()), vec![], None),
                 Storage::Segments(segs) => {
                     let (st, segs) = (self.store.clone(), segs.clone());
                     match tokio::task::spawn_blocking(move || io::link_segments_blocking(&st, &segs))

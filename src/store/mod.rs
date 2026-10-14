@@ -7,6 +7,7 @@
 //!   mutations go through one writer thread that group-commits batches of operations so a burst
 //!   of small PUTs costs one fsync instead of one each.
 
+pub mod fsck;
 pub mod meta;
 
 use crate::error::{S3Error, S3Result, err};
@@ -31,8 +32,47 @@ const PARTS: TableDefinition<(u128, u32), &[u8]> = TableDefinition::new("parts")
 const CONFIG: TableDefinition<(&str, &str), &[u8]> = TableDefinition::new("bucket_config");
 
 /// Kinds of bucket configuration stored in `CONFIG`.
-pub const CONFIG_KINDS: &[&str] =
-    &["acl", "policy", "cors", "tagging", "lifecycle", "versioning", "encryption", "object-lock", "website"];
+pub const CONFIG_KINDS: &[&str] = &[
+    "acl",
+    "policy",
+    "cors",
+    "tagging",
+    "lifecycle",
+    "versioning",
+    "encryption",
+    "object-lock",
+    "website",
+    "notification",
+    "quota",
+];
+/// Per-bucket usage: bucket -> (stored object versions, bytes). Delete markers don't count.
+const USAGE: TableDefinition<&str, (u64, u64)> = TableDefinition::new("usage");
+/// Small server-wide state values (e.g. the usage bookkeeping version).
+const STATE: TableDefinition<&str, u64> = TableDefinition::new("state");
+const USAGE_VERSION: u64 = 1;
+
+/// A bucket quota; 0 means unlimited.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Quota {
+    pub max_objects: u64,
+    pub max_bytes: u64,
+}
+
+impl Quota {
+    pub fn encode(self) -> Vec<u8> {
+        let mut v = self.max_objects.to_le_bytes().to_vec();
+        v.extend_from_slice(&self.max_bytes.to_le_bytes());
+        v
+    }
+    pub fn decode(v: &[u8]) -> Option<Quota> {
+        let (a, b) = (v.get(..8)?, v.get(8..16)?);
+        Some(Quota { max_objects: u64::from_le_bytes(a.try_into().ok()?), max_bytes: u64::from_le_bytes(b.try_into().ok()?) })
+    }
+}
+
+pub fn quota_exceeded() -> S3Error {
+    S3Error::new("QuotaExceeded", hyper::StatusCode::FORBIDDEN, "The bucket's quota does not allow this upload.")
+}
 /// Noncurrent object versions and delete markers: `bucket \0 key \0 (u64::MAX - seq)` -> meta.
 /// Keys sort newest-first within an object. The current version of a key always lives in
 /// OBJECTS (if it is not a delete marker), so unversioned reads never touch this table.
@@ -357,8 +397,11 @@ impl Store {
             txn.open_table(PARTS)?;
             txn.open_table(CONFIG)?;
             txn.open_table(VERSIONS)?;
+            txn.open_table(USAGE)?;
+            txn.open_table(STATE)?;
             txn.commit()?;
         }
+        rebuild_usage_if_needed(&db)?;
         if unclean {
             let started = std::time::Instant::now();
             match collect_orphans(&db, &root) {
@@ -581,6 +624,52 @@ impl Store {
     }
 
     /// A bucket configuration document, if set. Errors with NoSuchBucket.
+    /// (object versions, bytes) stored in a bucket.
+    pub fn bucket_usage(&self, bucket: &str) -> S3Result<(u64, u64)> {
+        Ok(self.db.begin_read()?.open_table(USAGE)?.get(bucket)?.map(|v| v.value()).unwrap_or((0, 0)))
+    }
+
+    /// Early quota check before receiving an upload of `size` bytes to `key` (the writer
+    /// checks again atomically when the upload is committed).
+    pub fn quota_allows(&self, bucket: &str, key: &str, size: u64) -> S3Result<()> {
+        let txn = self.db.begin_read()?;
+        let Some(q) = txn.open_table(CONFIG)?.get((bucket, "quota"))?.and_then(|v| Quota::decode(v.value())) else {
+            return Ok(());
+        };
+        let (n, b) = txn.open_table(USAGE)?.get(bucket)?.map(|v| v.value()).unwrap_or((0, 0));
+        let versioned = Versioning::parse(txn.open_table(CONFIG)?.get((bucket, "versioning"))?.as_ref().map(|v| v.value()))
+            == Versioning::Enabled;
+        let replaced = if versioned {
+            None
+        } else {
+            txn.open_table(OBJECTS)?
+                .get(obj_key(bucket, key).as_slice())?
+                .map(|v| ObjectMeta::decode_summary(v.value()))
+                .transpose()?
+                .map(|m| m.size)
+        };
+        let (n_after, b_after) = match replaced {
+            Some(old) => (n, b.saturating_sub(old).saturating_add(size)),
+            None => (n + 1, b.saturating_add(size)),
+        };
+        if (q.max_objects > 0 && n_after > q.max_objects) || (q.max_bytes > 0 && b_after > q.max_bytes) {
+            return Err(quota_exceeded());
+        }
+        Ok(())
+    }
+
+    /// Usage of every bucket (for metrics).
+    pub fn all_usage(&self) -> S3Result<Vec<(String, u64, u64)>> {
+        let t = self.db.begin_read()?.open_table(USAGE)?;
+        let mut out = Vec::new();
+        for e in t.iter()? {
+            let (k, v) = e?;
+            let (n, b) = v.value();
+            out.push((k.value().to_string(), n, b));
+        }
+        Ok(out)
+    }
+
     pub fn bucket_config(&self, bucket: &str, kind: &str) -> S3Result<Option<Vec<u8>>> {
         let txn = self.db.begin_read()?;
         if txn.open_table(BUCKETS)?.get(bucket)?.is_none() {
@@ -1039,6 +1128,7 @@ fn writer_loop(db: Arc<Database>, rx: mpsc::Receiver<Job>, deleter: mpsc::Sender
                     parts: txn.open_table(PARTS)?,
                     config: txn.open_table(CONFIG)?,
                     versions: txn.open_table(VERSIONS)?,
+                    usage: txn.open_table(USAGE)?,
                 };
                 for job in batch.iter_mut() {
                     let mut garbage = Vec::new();
@@ -1099,6 +1189,79 @@ struct Tables<'t> {
     parts: redb::Table<'t, (u128, u32), &'static [u8]>,
     config: redb::Table<'t, (&'static str, &'static str), &'static [u8]>,
     versions: redb::Table<'t, &'static [u8], &'static [u8]>,
+    usage: redb::Table<'t, &'static str, (u64, u64)>,
+}
+
+fn usage_add(tx: &mut Tables, bucket: &str, objects: i64, bytes: i64) -> S3Result<()> {
+    let (n, b) = tx.usage.get(bucket)?.map(|v| v.value()).unwrap_or((0, 0));
+    let n = n.saturating_add_signed(objects);
+    let b = b.saturating_add_signed(bytes);
+    tx.usage.insert(bucket, (n, b))?;
+    Ok(())
+}
+
+/// Refuse a write that would take the bucket over its quota. `freed` is what the write
+/// replaces (an unversioned overwrite discards the old object).
+fn check_quota(tx: &Tables, bucket: &str, add_bytes: u64, freed: Option<u64>) -> S3Result<()> {
+    let Some(q) = tx.config.get((bucket, "quota"))?.and_then(|v| Quota::decode(v.value())) else { return Ok(()) };
+    let (n, b) = tx.usage.get(bucket)?.map(|v| v.value()).unwrap_or((0, 0));
+    let (n_after, b_after) = match freed {
+        Some(old) => (n, b.saturating_sub(old).saturating_add(add_bytes)),
+        None => (n + 1, b.saturating_add(add_bytes)),
+    };
+    if (q.max_objects > 0 && n_after > q.max_objects) || (q.max_bytes > 0 && b_after > q.max_bytes) {
+        return Err(quota_exceeded());
+    }
+    Ok(())
+}
+
+/// Bytes an upload of `key` would free: the current object, if the bucket keeps no history of it.
+fn replaced_size(tx: &Tables, bucket: &str, key: &str) -> S3Result<Option<u64>> {
+    let state = versioning_state(tx, bucket)?;
+    Ok(match get_meta(tx, &obj_key(bucket, key))? {
+        Some(cur) if state == Versioning::Unversioned || (state == Versioning::Suspended && cur.version.is_none()) => {
+            Some(cur.size)
+        }
+        _ => None,
+    })
+}
+
+/// Compute per-bucket usage from scratch (first start with usage tracking).
+fn rebuild_usage_if_needed(db: &Database) -> S3Result<()> {
+    let txn = db.begin_write()?;
+    if txn.open_table(STATE)?.get("usage_version")?.map(|v| v.value()) == Some(USAGE_VERSION) {
+        return Ok(());
+    }
+    let started = Instant::now();
+    let mut usage: std::collections::HashMap<String, (u64, u64)> = std::collections::HashMap::new();
+    let bucket_of = |k: &[u8]| String::from_utf8_lossy(&k[..k.iter().position(|b| *b == 0).unwrap_or(k.len())]).into_owned();
+    for e in txn.open_table(OBJECTS)?.iter()? {
+        let (k, v) = e?;
+        let m = ObjectMeta::decode_summary(v.value())?;
+        let u = usage.entry(bucket_of(k.value())).or_default();
+        *u = (u.0 + 1, u.1 + m.size);
+    }
+    for e in txn.open_table(VERSIONS)?.iter()? {
+        let (k, v) = e?;
+        let m = ObjectMeta::decode(v.value())?;
+        if !m.delete_marker {
+            let u = usage.entry(bucket_of(k.value())).or_default();
+            *u = (u.0 + 1, u.1 + m.size);
+        }
+    }
+    {
+        let mut t = txn.open_table(USAGE)?;
+        t.retain(|_, _| false)?;
+        for (b, u) in &usage {
+            t.insert(b.as_str(), *u)?;
+        }
+        txn.open_table(STATE)?.insert("usage_version", USAGE_VERSION)?;
+    }
+    txn.commit()?;
+    if !usage.is_empty() {
+        eprintln!("usage: computed for {} bucket(s) in {:.1}s", usage.len(), started.elapsed().as_secs_f64());
+    }
+    Ok(())
 }
 
 fn check_cond(existing: Option<&ObjectMeta>, cond: &Option<WriteCond>) -> S3Result<()> {
@@ -1145,7 +1308,11 @@ fn versioning_state(tx: &Tables, bucket: &str) -> S3Result<Versioning> {
 }
 
 /// Release the storage behind a version (no-op for delete markers).
-fn release(tx: &mut Tables, meta: &ObjectMeta, garbage: &mut Vec<u128>) -> S3Result<()> {
+fn release(tx: &mut Tables, bucket: &str, meta: &ObjectMeta, garbage: &mut Vec<u128>) -> S3Result<()> {
+    if meta.delete_marker {
+        return Ok(());
+    }
+    usage_add(tx, bucket, -1, -(meta.size as i64))?;
     match &meta.storage {
         Storage::Inline(id) => {
             tx.inline.remove(*id)?;
@@ -1195,7 +1362,7 @@ fn remove_null_versions(tx: &mut Tables, bucket: &str, key: &str, garbage: &mut 
     }
     for (k, m) in doomed {
         tx.versions.remove(k.as_slice())?;
-        release(tx, &m, garbage)?;
+        release(tx, bucket, &m, garbage)?;
     }
     Ok(())
 }
@@ -1214,7 +1381,7 @@ fn retire_current(tx: &mut Tables, state: Versioning, bucket: &str, key: &str, g
         Versioning::Enabled => false,
     };
     if discard {
-        release(tx, &old, garbage)
+        release(tx, bucket, &old, garbage)
     } else {
         tx.versions.insert(ver_key(bucket, key, old.seq).as_slice(), old.encode().as_slice())?;
         Ok(())
@@ -1241,6 +1408,7 @@ fn put_version(
         remove_null_versions(tx, bucket, key, garbage)?;
     }
     tx.objects.insert(k.as_slice(), meta.encode().as_slice())?;
+    usage_add(tx, bucket, 1, meta.size as i64)?;
     Ok(meta)
 }
 
@@ -1356,7 +1524,7 @@ fn delete_version(
         }
         out.delete_marker = m.delete_marker;
         out.removed = true;
-        release(tx, &m, garbage)?;
+        release(tx, bucket, &m, garbage)?;
         promote(tx, bucket, key)?;
     }
     Ok(out)
@@ -1432,6 +1600,7 @@ fn apply(tx: &mut Tables, op: Op, garbage: &mut Vec<u128>, last_seq: &mut u64) -
             for kind in CONFIG_KINDS {
                 tx.config.remove((name.as_str(), *kind))?;
             }
+            tx.usage.remove(name.as_str())?;
             tx.buckets.remove(name.as_str())?;
             Ok(OpOut::Done)
         }
@@ -1444,6 +1613,7 @@ fn apply(tx: &mut Tables, op: Op, garbage: &mut Vec<u128>, last_seq: &mut u64) -
             if cond.is_some() {
                 check_cond(get_meta(tx, &k)?.as_ref(), &cond)?;
             }
+            check_quota(tx, &bucket, meta.size, replaced_size(tx, &bucket, &key)?)?;
             if let (Storage::Inline(id), Some(data)) = (&meta.storage, &inline) {
                 tx.inline.insert(*id, data.as_ref())?;
             }
@@ -1598,7 +1768,7 @@ fn apply(tx: &mut Tables, op: Op, garbage: &mut Vec<u128>, last_seq: &mut u64) -
                 // Lifecycle never removes a version that Object Lock protects.
                 if still_due && lock::State::of(&m.headers).check_delete(now_ms() / 1000, false).is_ok() {
                     tx.versions.remove(vk.as_slice())?;
-                    release(tx, &m, garbage)?;
+                    release(tx, &bucket, &m, garbage)?;
                     promote(tx, &bucket, &key)?;
                     let seq = next_seq(last_seq);
                     out.push(Removed {
@@ -1648,6 +1818,7 @@ fn apply(tx: &mut Tables, op: Op, garbage: &mut Vec<u128>, last_seq: &mut u64) -
             }
             let k = obj_key(&bucket, &key);
             check_cond(get_meta(tx, &k)?.as_ref(), &cond)?;
+            check_quota(tx, &bucket, size, replaced_size(tx, &bucket, &key)?)?;
 
             use md5::Digest;
             let etag = format!("\"{}-{}\"", util::hex(&md5::Md5::digest(&md5s)), parts.len());
@@ -1770,6 +1941,79 @@ mod tests {
         };
         assert!(r[0].as_ref().unwrap().delete_marker);
         assert_eq!(store.get_object_version("b", "k", &v1).unwrap().1.unwrap(), "one");
+        drop(store);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn usage_tracking_and_quotas() {
+        let (store, dir) = temp_store();
+        store.submit(Op::CreateBucket("b".into())).await.unwrap();
+        let usage = |s: &Store| s.bucket_usage("b").unwrap();
+        put(&store, "a", "12345").await;
+        put(&store, "b", "123").await;
+        assert_eq!(usage(&store), (2, 8));
+        put(&store, "a", "1").await; // unversioned overwrite replaces
+        assert_eq!(usage(&store), (2, 4));
+        let del = |key: &str, version: Option<String>| Op::DeleteObjects {
+            bucket: "b".into(),
+            items: vec![(key.into(), version)],
+            bypass: false,
+        };
+        store.submit(del("b", None)).await.unwrap();
+        assert_eq!(usage(&store), (1, 1));
+        // Versioned: every version counts, delete markers don't, permanent deletes subtract.
+        store
+            .submit(Op::SetBucketConfig { bucket: "b".into(), kind: "versioning", value: Some(b"Enabled".to_vec()) })
+            .await
+            .unwrap();
+        let v1 = put(&store, "a", "22").await.version.unwrap();
+        assert_eq!(usage(&store), (2, 3));
+        store.submit(del("a", None)).await.unwrap(); // marker
+        assert_eq!(usage(&store), (2, 3));
+        store.submit(del("a", Some(v1))).await.unwrap();
+        store.submit(del("a", Some("null".into()))).await.unwrap();
+        assert_eq!(usage(&store), (0, 0));
+        // Quotas are enforced by the writer.
+        let quota = Quota { max_objects: 2, max_bytes: 10 };
+        store.submit(Op::SetBucketConfig { bucket: "b".into(), kind: "quota", value: Some(quota.encode()) }).await.unwrap();
+        put(&store, "x", "123456").await;
+        let (meta, inline) = small("123456");
+        let err =
+            store.submit(Op::PutObject { bucket: "b".into(), key: "y".into(), meta, inline, cond: None }).await.err().unwrap();
+        assert_eq!(err.code, "QuotaExceeded");
+        put(&store, "y", "1234").await;
+        let (meta, inline) = small("z");
+        assert!(store.submit(Op::PutObject { bucket: "b".into(), key: "z".into(), meta, inline, cond: None }).await.is_err());
+        assert_eq!(usage(&store), (2, 10));
+        // Usage survives a restart, and is rebuilt if its bookkeeping is missing.
+        drop(store);
+        {
+            // The writer thread releases the database shortly after the store is dropped.
+            let db = (0..100)
+                .find_map(|_| {
+                    Database::create(dir.join("meta.redb")).ok().or_else(|| {
+                        std::thread::sleep(Duration::from_millis(20));
+                        None
+                    })
+                })
+                .expect("database reopens");
+            let txn = db.begin_write().unwrap();
+            txn.open_table(STATE).unwrap().remove("usage_version").unwrap();
+            txn.open_table(USAGE).unwrap().retain(|_, _| false).unwrap();
+            txn.commit().unwrap();
+        }
+        let store = (0..100)
+            .find_map(|_| {
+                Store::open(StoreConfig { root: dir.clone(), fsync: false, inline_threshold: 1024, cache_bytes: 1 << 20 })
+                    .ok()
+                    .or_else(|| {
+                        std::thread::sleep(Duration::from_millis(20));
+                        None
+                    })
+            })
+            .expect("store reopens");
+        assert_eq!(store.bucket_usage("b").unwrap(), (2, 10));
         drop(store);
         let _ = std::fs::remove_dir_all(dir);
     }

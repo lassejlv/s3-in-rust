@@ -1,0 +1,292 @@
+//! Compact binary encodings for metadata stored in redb.
+//!
+//! The leading fields of `ObjectMeta` (size, mtime, etag) are fixed in position so listings can
+//! decode just a summary without touching headers or the segment table.
+
+use crate::error::{S3Error, S3Result};
+
+const VERSION: u8 = 1;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChecksumAlgo {
+    Crc32 = 1,
+    Crc32c = 2,
+    Crc64Nvme = 3,
+    Sha1 = 4,
+    Sha256 = 5,
+}
+
+impl ChecksumAlgo {
+    pub fn from_u8(v: u8) -> Option<Self> {
+        Some(match v {
+            1 => Self::Crc32,
+            2 => Self::Crc32c,
+            3 => Self::Crc64Nvme,
+            4 => Self::Sha1,
+            5 => Self::Sha256,
+            _ => return None,
+        })
+    }
+
+    pub fn from_name(s: &str) -> Option<Self> {
+        Some(match s.to_ascii_lowercase().as_str() {
+            "crc32" => Self::Crc32,
+            "crc32c" => Self::Crc32c,
+            "crc64nvme" => Self::Crc64Nvme,
+            "sha1" => Self::Sha1,
+            "sha256" => Self::Sha256,
+            _ => return None,
+        })
+    }
+
+    pub fn header(self) -> &'static str {
+        match self {
+            Self::Crc32 => "x-amz-checksum-crc32",
+            Self::Crc32c => "x-amz-checksum-crc32c",
+            Self::Crc64Nvme => "x-amz-checksum-crc64nvme",
+            Self::Sha1 => "x-amz-checksum-sha1",
+            Self::Sha256 => "x-amz-checksum-sha256",
+        }
+    }
+
+    pub const ALL: [ChecksumAlgo; 5] = [Self::Crc32, Self::Crc32c, Self::Crc64Nvme, Self::Sha1, Self::Sha256];
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Storage {
+    /// Object bytes live in the `inline` table under this id.
+    Inline(u128),
+    /// Object bytes are the concatenation of these data files (id, length).
+    Segments(Vec<(u128, u64)>),
+}
+
+#[derive(Debug, Clone)]
+pub struct ObjectMeta {
+    pub size: u64,
+    pub mtime_ms: u64,
+    pub etag: String,
+    /// Response headers to replay: content-type, cache-control, x-amz-meta-*, ...
+    pub headers: Vec<(String, String)>,
+    pub checksum: Option<(ChecksumAlgo, String)>,
+    pub storage: Storage,
+}
+
+pub struct ObjectSummary {
+    pub size: u64,
+    pub mtime_ms: u64,
+    pub etag: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct UploadMeta {
+    pub bucket: String,
+    pub key: String,
+    pub initiated_ms: u64,
+    pub headers: Vec<(String, String)>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PartMeta {
+    pub size: u64,
+    pub md5: [u8; 16],
+    pub mtime_ms: u64,
+    pub file: u128,
+}
+
+struct W(Vec<u8>);
+
+impl W {
+    fn u8(&mut self, v: u8) {
+        self.0.push(v);
+    }
+    fn u32(&mut self, v: u32) {
+        self.0.extend_from_slice(&v.to_le_bytes());
+    }
+    fn u64(&mut self, v: u64) {
+        self.0.extend_from_slice(&v.to_le_bytes());
+    }
+    fn u128(&mut self, v: u128) {
+        self.0.extend_from_slice(&v.to_le_bytes());
+    }
+    fn str(&mut self, s: &str) {
+        self.u32(s.len() as u32);
+        self.0.extend_from_slice(s.as_bytes());
+    }
+    fn headers(&mut self, h: &[(String, String)]) {
+        self.u32(h.len() as u32);
+        for (k, v) in h {
+            self.str(k);
+            self.str(v);
+        }
+    }
+}
+
+struct R<'a>(&'a [u8]);
+
+fn corrupt() -> S3Error {
+    S3Error::internal("corrupt metadata record")
+}
+
+impl<'a> R<'a> {
+    fn take(&mut self, n: usize) -> S3Result<&'a [u8]> {
+        if self.0.len() < n {
+            return Err(corrupt());
+        }
+        let (a, b) = self.0.split_at(n);
+        self.0 = b;
+        Ok(a)
+    }
+    fn u8(&mut self) -> S3Result<u8> {
+        Ok(self.take(1)?[0])
+    }
+    fn u32(&mut self) -> S3Result<u32> {
+        Ok(u32::from_le_bytes(self.take(4)?.try_into().unwrap()))
+    }
+    fn u64(&mut self) -> S3Result<u64> {
+        Ok(u64::from_le_bytes(self.take(8)?.try_into().unwrap()))
+    }
+    fn u128(&mut self) -> S3Result<u128> {
+        Ok(u128::from_le_bytes(self.take(16)?.try_into().unwrap()))
+    }
+    fn str(&mut self) -> S3Result<String> {
+        let n = self.u32()? as usize;
+        String::from_utf8(self.take(n)?.to_vec()).map_err(|_| corrupt())
+    }
+    fn headers(&mut self) -> S3Result<Vec<(String, String)>> {
+        let n = self.u32()? as usize;
+        let mut h = Vec::with_capacity(n.min(64));
+        for _ in 0..n {
+            h.push((self.str()?, self.str()?));
+        }
+        Ok(h)
+    }
+}
+
+impl ObjectMeta {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut w = W(Vec::with_capacity(128));
+        w.u8(VERSION);
+        w.u64(self.size);
+        w.u64(self.mtime_ms);
+        w.str(&self.etag);
+        w.headers(&self.headers);
+        match &self.checksum {
+            None => w.u8(0),
+            Some((a, v)) => {
+                w.u8(*a as u8);
+                w.str(v);
+            }
+        }
+        match &self.storage {
+            Storage::Inline(id) => {
+                w.u8(0);
+                w.u128(*id);
+            }
+            Storage::Segments(segs) => {
+                w.u8(1);
+                w.u32(segs.len() as u32);
+                for (id, len) in segs {
+                    w.u128(*id);
+                    w.u64(*len);
+                }
+            }
+        }
+        w.0
+    }
+
+    pub fn decode(b: &[u8]) -> S3Result<Self> {
+        let mut r = R(b);
+        if r.u8()? != VERSION {
+            return Err(corrupt());
+        }
+        let size = r.u64()?;
+        let mtime_ms = r.u64()?;
+        let etag = r.str()?;
+        let headers = r.headers()?;
+        let checksum = match r.u8()? {
+            0 => None,
+            a => Some((ChecksumAlgo::from_u8(a).ok_or_else(corrupt)?, r.str()?)),
+        };
+        let storage = match r.u8()? {
+            0 => Storage::Inline(r.u128()?),
+            1 => {
+                let n = r.u32()? as usize;
+                let mut segs = Vec::with_capacity(n);
+                for _ in 0..n {
+                    segs.push((r.u128()?, r.u64()?));
+                }
+                Storage::Segments(segs)
+            }
+            _ => return Err(corrupt()),
+        };
+        Ok(ObjectMeta { size, mtime_ms, etag, headers, checksum, storage })
+    }
+
+    pub fn decode_summary(b: &[u8]) -> S3Result<ObjectSummary> {
+        let mut r = R(b);
+        if r.u8()? != VERSION {
+            return Err(corrupt());
+        }
+        Ok(ObjectSummary { size: r.u64()?, mtime_ms: r.u64()?, etag: r.str()? })
+    }
+}
+
+impl UploadMeta {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut w = W(Vec::with_capacity(64));
+        w.u8(VERSION);
+        w.str(&self.bucket);
+        w.str(&self.key);
+        w.u64(self.initiated_ms);
+        w.headers(&self.headers);
+        w.0
+    }
+
+    pub fn decode(b: &[u8]) -> S3Result<Self> {
+        let mut r = R(b);
+        if r.u8()? != VERSION {
+            return Err(corrupt());
+        }
+        Ok(UploadMeta { bucket: r.str()?, key: r.str()?, initiated_ms: r.u64()?, headers: r.headers()? })
+    }
+}
+
+impl PartMeta {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut w = W(Vec::with_capacity(48));
+        w.u64(self.size);
+        w.0.extend_from_slice(&self.md5);
+        w.u64(self.mtime_ms);
+        w.u128(self.file);
+        w.0
+    }
+
+    pub fn decode(b: &[u8]) -> S3Result<Self> {
+        let mut r = R(b);
+        Ok(PartMeta { size: r.u64()?, md5: r.take(16)?.try_into().unwrap(), mtime_ms: r.u64()?, file: r.u128()? })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn object_roundtrip() {
+        let m = ObjectMeta {
+            size: 42,
+            mtime_ms: 7,
+            etag: "\"abc\"".into(),
+            headers: vec![("content-type".into(), "text/plain".into())],
+            checksum: Some((ChecksumAlgo::Crc32c, "AAAA".into())),
+            storage: Storage::Segments(vec![(1, 2), (3, 4)]),
+        };
+        let d = ObjectMeta::decode(&m.encode()).unwrap();
+        assert_eq!(d.size, 42);
+        assert_eq!(d.etag, "\"abc\"");
+        assert_eq!(d.storage, m.storage);
+        assert_eq!(d.checksum, m.checksum);
+        let s = ObjectMeta::decode_summary(&m.encode()).unwrap();
+        assert_eq!((s.size, s.mtime_ms), (42, 7));
+    }
+}

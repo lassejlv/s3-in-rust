@@ -1,0 +1,31 @@
+[package]
+name = "s3rs"
+version = "0.1.0"
+description = "Fast, lightweight S3-compatible object storage in pure Rust"
+edition = "2024"
+
+[dependencies]
+bytes = "1.12.1"
+crc32c = "0.6.8"
+crc32fast = "1.5.2"
+crc64fast-nvme = "1.2.1"
+getrandom = "0.4.3"
+hmac = "0.13.0"
+http-body = "1.1.0"
+http-body-util = "0.1.5"
+httpdate = "1.0.3"
+hyper = { version = "1.12.0", features = ["server", "http1", "http2"] }
+hyper-util = { version = "0.1.21", features = ["tokio", "server", "http1", "http2", "server-auto"] }
+md-5 = "0.11.0"
+percent-encoding = "2.3.2"
+redb = "4.4.0"
+sha1 = "0.11.0"
+sha2 = "0.11.1"
+tokio = { version = "1.53.3", features = ["rt-multi-thread", "net", "sync", "macros", "signal", "time", "fs", "io-util"] }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true

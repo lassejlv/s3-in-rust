@@ -7,6 +7,7 @@ mod chunked;
 mod console;
 mod crypt;
 mod error;
+mod iam;
 mod io;
 mod lifecycle;
 mod lock;
@@ -57,6 +58,9 @@ OPTIONS (each also settable through the environment variable shown):
         --encryption-key-file <P> Read the master key from a file
         --encrypt-by-default     Encrypt every new object with the master key
                                                                  [S3RS_ENCRYPT_BY_DEFAULT=1]
+        --behind-proxy           Trust X-Forwarded-For / X-Forwarded-Proto from a reverse proxy
+                                 (client IP and HTTPS for policy conditions and redirects)
+                                                                 [S3RS_BEHIND_PROXY=1]
         --no-console             Do not serve the web console at /_console/
                                                                  [S3RS_NO_CONSOLE=1]
         --metrics-token <T>      Require `Authorization: Bearer <T>` for /_metrics
@@ -79,6 +83,7 @@ OPTIONS (each also settable through the environment variable shown):
     -h, --help                   Show this help
 ";
 
+#[derive(Clone)]
 struct Config {
     listen: SocketAddr,
     data_dir: PathBuf,
@@ -89,6 +94,7 @@ struct Config {
     cors_origins: Vec<String>,
     metrics_token: Option<String>,
     console: bool,
+    behind_proxy: bool,
     encryption_key: Option<[u8; 32]>,
     encrypt_by_default: bool,
     region: String,
@@ -128,6 +134,7 @@ fn parse_args() -> Result<Config, String> {
         cors_origins: env("S3RS_CORS_ORIGINS").map(|v| split_list(&v)).unwrap_or_default(),
         metrics_token: env("S3RS_METRICS_TOKEN"),
         console: !env_flag("S3RS_NO_CONSOLE")?,
+        behind_proxy: env_flag("S3RS_BEHIND_PROXY")?,
         encryption_key: env("S3RS_ENCRYPTION_KEY")
             .map(|k| parse_key(&k))
             .transpose()
@@ -170,6 +177,7 @@ fn parse_args() -> Result<Config, String> {
             "--cors-origins" => c.cors_origins = split_list(&val()?),
             "--metrics-token" => c.metrics_token = Some(val()?),
             "--no-console" => c.console = false,
+            "--behind-proxy" => c.behind_proxy = true,
             "--encryption-key" => c.encryption_key = Some(parse_key(&val()?).map_err(|e| format!("--encryption-key: {e}"))?),
             "--encryption-key-file" => {
                 let path = val()?;
@@ -212,7 +220,8 @@ fn split_list(s: &str) -> Vec<String> {
 }
 
 /// Parse a credentials file, one key per line (`#` starts a comment):
-/// `access_key:secret_key[:ro|rw[:bucket-pattern,bucket-pattern...]]`.
+/// `access_key:secret_key[:ro|rw|policy=<file.json>[:bucket-pattern,bucket-pattern...]]`.
+/// Policy file paths are relative to the credentials file.
 fn load_credentials(path: &std::path::Path, into: &mut Vec<auth::Credential>) -> Result<(), String> {
     let text = std::fs::read_to_string(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
     for (n, line) in text.lines().enumerate() {
@@ -225,10 +234,20 @@ fn load_credentials(path: &std::path::Path, into: &mut Vec<auth::Credential>) ->
             return Err(format!("{}:{}: expected access_key:secret_key[:ro]", path.display(), n + 1));
         };
         let (ak, sk) = (ak.trim(), sk.trim());
-        let read_only = match f.next().map(str::trim) {
-            None | Some("rw") => false,
-            Some("ro") => true,
-            Some(other) => return Err(format!("{}:{}: unknown permission `{other}` (use ro or rw)", path.display(), n + 1)),
+        let (read_only, policy) = match f.next().map(str::trim) {
+            None | Some("rw") => (false, None),
+            Some("ro") => (true, None),
+            Some(p) if p.starts_with("policy=") => {
+                let file = path.parent().unwrap_or(std::path::Path::new(".")).join(&p["policy=".len()..]);
+                let doc = std::fs::read_to_string(&file)
+                    .map_err(|e| format!("{}:{}: cannot read policy {}: {e}", path.display(), n + 1, file.display()))?;
+                let policy = iam::Policy::parse(&doc, iam::Kind::Identity, None)
+                    .map_err(|e| format!("{}:{}: invalid policy {}: {}", path.display(), n + 1, file.display(), e.message))?;
+                (false, Some(Arc::new(policy)))
+            }
+            Some(other) => {
+                return Err(format!("{}:{}: unknown permission `{other}` (use ro, rw or policy=<file>)", path.display(), n + 1));
+            }
         };
         if ak.is_empty() || sk.is_empty() {
             return Err(format!("{}:{}: empty access key or secret", path.display(), n + 1));
@@ -237,9 +256,29 @@ fn load_credentials(path: &std::path::Path, into: &mut Vec<auth::Credential>) ->
         if into.iter().any(|c| c.access_key == ak) {
             return Err(format!("{}:{}: duplicate access key `{ak}`", path.display(), n + 1));
         }
-        into.push(auth::Credential { access_key: ak.to_string(), secret: sk.to_string(), read_only, buckets });
+        into.push(auth::Credential { access_key: ak.to_string(), secret: sk.to_string(), read_only, buckets, policy });
     }
     Ok(())
+}
+
+/// All access keys: the main one (flags / environment) plus the credentials file.
+fn collect_credentials(cfg: &Config) -> Result<Vec<auth::Credential>, String> {
+    let mut creds = Vec::new();
+    match (&cfg.access_key, &cfg.secret_key) {
+        (Some(a), Some(s)) => creds.push(auth::Credential {
+            access_key: a.clone(),
+            secret: s.clone(),
+            read_only: false,
+            buckets: None,
+            policy: None,
+        }),
+        (None, None) => {}
+        _ => return Err("both an access key and a secret key are required".into()),
+    }
+    if let Some(path) = &cfg.credentials_file {
+        load_credentials(path, &mut creds)?;
+    }
+    Ok(creds)
 }
 
 fn main() {
@@ -250,23 +289,13 @@ fn main() {
             std::process::exit(2);
         }
     };
-    let mut creds = Vec::new();
-    match (&cfg.access_key, &cfg.secret_key) {
-        (Some(a), Some(s)) => {
-            creds.push(auth::Credential { access_key: a.clone(), secret: s.clone(), read_only: false, buckets: None });
-        }
-        (None, None) => {}
-        _ => {
-            eprintln!("error: both an access key and a secret key are required");
+    let creds = match collect_credentials(&cfg) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("error: {e}");
             std::process::exit(2);
         }
-    }
-    if let Some(path) = &cfg.credentials_file
-        && let Err(e) = load_credentials(path, &mut creds)
-    {
-        eprintln!("error: {e}");
-        std::process::exit(2);
-    }
+    };
     let auth = if !creds.is_empty() {
         Some(auth::Auth::new(creds))
     } else if cfg.anonymous {
@@ -335,6 +364,7 @@ async fn serve(cfg: Config, store: Arc<store::Store>, auth: Option<auth::Auth>) 
         encrypt_by_default: cfg.encrypt_by_default,
         website_domain: cfg.website_domain.clone(),
         console: cfg.console,
+        behind_proxy: cfg.behind_proxy,
     };
     let server = Arc::new(s3::Server::new(store.clone(), auth, opts));
     if cfg.lifecycle_interval > 0 {
@@ -375,6 +405,28 @@ async fn serve(cfg: Config, store: Arc<store::Store>, auth: Option<auth::Auth>) 
     let builder = Arc::new(builder);
     let graceful = hyper_util::server::graceful::GracefulShutdown::new();
 
+    #[cfg(unix)]
+    if server.auth.is_some() {
+        let server = server.clone();
+        let cfg = cfg.clone();
+        tokio::spawn(async move {
+            let Ok(mut hup) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()) else { return };
+            while hup.recv().await.is_some() {
+                match collect_credentials(&cfg) {
+                    Ok(creds) if !creds.is_empty() => {
+                        let n = creds.len();
+                        if let Some(a) = &server.auth {
+                            a.replace(creds);
+                        }
+                        eprintln!("reloaded {n} access key(s)");
+                    }
+                    Ok(_) => eprintln!("reload skipped: no access keys configured"),
+                    Err(e) => eprintln!("reload failed, keeping the current keys: {e}"),
+                }
+            }
+        });
+    }
+
     let shutdown = shutdown_signal();
     tokio::pin!(shutdown);
     loop {
@@ -383,8 +435,8 @@ async fn serve(cfg: Config, store: Arc<store::Store>, auth: Option<auth::Auth>) 
             r = listener.accept() => (r, false),
             r = accept_opt(&website_listener) => (r, true),
         };
-        let stream = match accepted {
-            Ok((s, _)) => s,
+        let (stream, peer) = match accepted {
+            Ok(c) => c,
             Err(e) => {
                 // Typically EMFILE; back off instead of spinning.
                 eprintln!("accept error: {e}");
@@ -399,7 +451,13 @@ async fn serve(cfg: Config, store: Arc<store::Store>, auth: Option<auth::Auth>) 
         tokio::spawn(async move {
             let svc = service_fn(move |req| {
                 let server = server.clone();
-                async move { Ok::<_, Infallible>(if website { server.handle_website(req).await } else { server.handle(req).await }) }
+                async move {
+                    Ok::<_, Infallible>(if website {
+                        server.handle_website(req, peer).await
+                    } else {
+                        server.handle(req, peer).await
+                    })
+                }
             });
             let conn = builder.serve_connection(TokioIo::new(stream), svc).into_owned();
             let _ = watcher.watch(conn).await;

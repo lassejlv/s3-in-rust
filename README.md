@@ -80,6 +80,7 @@ Each flag can also be set with the environment variable shown (switches take `1`
 | `--cors-origins` | `S3RS_CORS_ORIGINS` | | Comma-separated origins (e.g. `*`) allowed for buckets that have no CORS configuration of their own |
 | `--metrics-token` | `S3RS_METRICS_TOKEN` | | Requires `Authorization: Bearer <token>` on `/_metrics` |
 | `--no-console` | `S3RS_NO_CONSOLE` | off | Turns off the web console at `/_console/` |
+| `--behind-proxy` | `S3RS_BEHIND_PROXY` | off | Trusts `X-Forwarded-For` / `X-Forwarded-Proto` for policy conditions |
 | `--lifecycle-interval` | `S3RS_LIFECYCLE_INTERVAL` | `3600` | Seconds between lifecycle sweeps. `0` turns lifecycle off. |
 | `--encryption-key` | `S3RS_ENCRYPTION_KEY` | | Master key for SSE-S3, as 64 hex characters or base64 (e.g. `openssl rand -hex 32`) |
 | `--encryption-key-file` | | | Reads the master key from a file |
@@ -105,38 +106,88 @@ crashes, the next start scans the store before serving and removes orphaned data
 
 ## Access control
 
-Authenticated keys have full access unless the credentials file restricts them:
+Keys without a policy have full access, unless the credentials file limits them:
 
 ```text
-# access_key:secret_key[:ro|rw[:bucket-patterns]]
+# access_key:secret_key[:ro|rw|policy=<file.json>[:bucket-patterns]]
 admin:s3cr3t
 reporting:r3p0rt:ro                    # read-only, all buckets
 team-a:t34m4:rw:team-a-*,shared-assets # read-write, only matching buckets
+alice:al1c3:policy=policies/home.json  # only what the IAM-style policy allows
 ```
 
 A key restricted to some buckets only sees those buckets in ListBuckets. It cannot create other
-buckets, cannot copy from other buckets, and cannot sign form uploads to other buckets.
+buckets, cannot copy from other buckets, and cannot sign form uploads to other buckets. Send the
+server `SIGHUP` to reload the credentials file and policies without a restart. If the new file is
+invalid, the current keys stay in place.
 
-ACLs and bucket policies control what **anonymous** requests may do:
+**Per-key policies** use IAM's JSON format. Paths are relative to the credentials file. For example,
+this policy gives every key using it a private home prefix:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {"Effect": "Allow", "Action": "s3:ListBucket", "Resource": "arn:aws:s3:::home",
+     "Condition": {"StringLike": {"s3:prefix": ["${aws:username}/*"]}}},
+    {"Effect": "Allow", "Action": ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"],
+     "Resource": "arn:aws:s3:::home/${aws:username}/*"},
+    {"Effect": "Deny", "Action": "s3:DeleteObject", "Resource": "arn:aws:s3:::home/${aws:username}/keep/*"}
+  ]
+}
+```
+
+**Bucket policies** apply to every caller. Use `"Principal": "*"` for everyone (including anonymous
+requests) or `{"AWS": ["alice", "arn:aws:iam::123456789012:user/alice"]}` for named keys. To
+make public data, use an ACL or a policy:
 
 ```bash
 # Public read: anyone can GET objects and list the bucket
 aws --endpoint-url $E s3api put-bucket-acl --bucket site --acl public-read      # or create-bucket --acl public-read
 
-# Finer control with a bucket policy: public prefix, a denied subfolder, an anonymous upload drop-box
+# Finer control with a bucket policy: public prefix, a denied subfolder, an upload drop-box for one network
 aws --endpoint-url $E s3api put-bucket-policy --bucket site --policy '{
   "Version": "2012-10-17",
   "Statement": [
     {"Effect": "Allow", "Principal": "*", "Action": "s3:GetObject", "Resource": "arn:aws:s3:::site/public/*"},
     {"Effect": "Deny",  "Principal": "*", "Action": "s3:*",         "Resource": "arn:aws:s3:::site/public/private/*"},
-    {"Effect": "Allow", "Principal": "*", "Action": "s3:PutObject", "Resource": "arn:aws:s3:::site/uploads/*"}
+    {"Effect": "Allow", "Principal": "*", "Action": "s3:PutObject", "Resource": "arn:aws:s3:::site/uploads/*",
+     "Condition": {"IpAddress": {"aws:SourceIp": "10.0.0.0/8"}}}
   ]}'
 ```
 
-Policy evaluation supports `Allow` and `Deny`, wildcard actions such as `s3:Get*`, and wildcard
-resources. An explicit `Deny` wins. The server can't evaluate statements that use `Condition`,
-`NotAction`, `NotResource` or `NotPrincipal`, so it treats them conservatively: such an `Allow`
-grants nothing, and such a `Deny` always applies. Policies only affect anonymous access.
+Evaluation follows AWS:
+1. An explicit `Deny` in the key's policy or the bucket policy always wins, even for full-access keys.
+2. Otherwise a key with a policy needs an `Allow` from its own policy or from the bucket policy.
+3. Keys without a policy are allowed, within their `ro` and bucket limits.
+4. Anonymous callers need an ACL grant or an `Allow` in the bucket policy.
+
+Every request is checked against its IAM action, such as `s3:GetObject`, `s3:GetObjectVersion`,
+`s3:PutBucketPolicy` or `s3:ListBucketVersions`. Some operations need more than one action:
+- CopyObject also needs read access to the source.
+- DeleteObjects checks each key separately and reports refused keys as `AccessDenied` errors.
+- Uploads that set tags, retention or a legal hold also need `s3:PutObjectTagging`,
+  `s3:PutObjectRetention` or `s3:PutObjectLegalHold`.
+- Bypassing GOVERNANCE retention needs `s3:BypassGovernanceRetention`.
+
+Supported policy elements:
+- `Effect`, `Principal` / `NotPrincipal` (bucket policies), `Action` / `NotAction`,
+  `Resource` / `NotResource`, and `Condition`.
+- Condition operators: `String*` (including `Like` and `IgnoreCase`), `Numeric*`, `Date*`, `Bool`,
+  `IpAddress` / `NotIpAddress` and `Null`, plus `...IfExists` and `ForAnyValue:` / `ForAllValues:`.
+- Condition keys: `aws:SourceIp`, `aws:SecureTransport`, `aws:username`, `aws:userid`,
+  `aws:PrincipalType`, `aws:UserAgent`, `aws:Referer`, `aws:CurrentTime`, `aws:EpochTime`,
+  `s3:prefix`, `s3:delimiter`, `s3:max-keys`, `s3:VersionId`, `s3:authType`, `s3:x-amz-acl`,
+  `s3:x-amz-server-side-encryption`, `s3:x-amz-copy-source`, `s3:x-amz-metadata-directive`,
+  `s3:object-lock-*` and `s3:RequestObjectTagKeys`.
+- Policy variables such as `${aws:username}` work in resources and condition values.
+- Unknown operators are rejected with `MalformedPolicy`, so a policy never silently means less
+  than it says.
+
+Behind a reverse proxy (Railway, Fly, nginx), pass `--behind-proxy` so `aws:SourceIp` and
+`aws:SecureTransport` use the client's address and scheme from the proxy's `X-Forwarded-For`
+(the last entry, which the proxy adds itself) and `X-Forwarded-Proto` headers. Without it, those
+headers are ignored.
 
 The `public-read` ACL lets anonymous callers GET objects and list the bucket. `public-read-write`
 also lets them upload and delete. Per-object ACLs are accepted but ignored.
@@ -295,7 +346,7 @@ direct uploads from web apps.
 | Auth | SigV4 headers, SigV4 presigned URLs, SigV4 streaming (`STREAMING-AWS4-HMAC-SHA256-PAYLOAD[-TRAILER]`, `STREAMING-UNSIGNED-PAYLOAD-TRAILER`), SigV2 headers and presigned URLs |
 | Transport | HTTP/1.1 keep-alive, HTTP/2 (h2c), path-style and virtual-hosted-style addressing |
 
-Not implemented: per-user IAM policies, SSE-KMS, storage class transitions and SigV4A. These
+Not implemented: SSE-KMS, storage class transitions and SigV4A. These
 requests return `NotImplemented` or the matching "not found" configuration error.
 
 ## Architecture
@@ -372,8 +423,8 @@ every push.
 
 ## Limitations and notes
 
-- Per-key permissions are limited to read-only or read-write, optionally for a set of buckets.
-  There are no per-user IAM policies.
+- Keys are configured in a file (reloaded on `SIGHUP`), not through an IAM API: there are no
+  users, groups or roles to create at runtime, and no STS temporary credentials.
 - Each object can be at most 5 GiB on a single PUT. A multipart upload can have up to 10,000 parts of
   5 GiB each, the same limits as S3.
 - Only one `s3rs` process can use a data directory at a time.

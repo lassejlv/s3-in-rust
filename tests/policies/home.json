@@ -1,0 +1,25 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ListOwnPrefix",
+      "Effect": "Allow",
+      "Action": "s3:ListBucket",
+      "Resource": "arn:aws:s3:::policy-home",
+      "Condition": { "StringLike": { "s3:prefix": ["${aws:username}/*"] } }
+    },
+    {
+      "Sid": "ReadWriteOwnPrefix",
+      "Effect": "Allow",
+      "Action": ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"],
+      "Resource": "arn:aws:s3:::policy-home/${aws:username}/*"
+    },
+    { "Effect": "Allow", "Action": "s3:ListAllMyBuckets", "Resource": "*" },
+    {
+      "Sid": "NeverDeleteKeep",
+      "Effect": "Deny",
+      "Action": "s3:DeleteObject",
+      "Resource": "arn:aws:s3:::policy-home/${aws:username}/keep/*"
+    }
+  ]
+}

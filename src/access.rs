@@ -1,9 +1,5 @@
-//! Anonymous access control (canned ACLs and a practical subset of bucket policies), CORS rules,
-//! and tag parsing.
-//!
-//! Authenticated users always have full access (or read-only access, per credential). Bucket
-//! ACLs and policies only decide what *anonymous* requests may do, which is what they are almost
-//! always used for in practice: public-read buckets, public download prefixes, upload drop-boxes.
+//! Per-bucket access settings (canned ACLs, bucket policies), CORS rules, a small JSON parser
+//! and tag parsing. Policy evaluation itself lives in `iam`.
 
 use crate::error::{S3Error, S3Result, err};
 use crate::util::uri_decode;
@@ -28,15 +24,6 @@ impl Json {
     pub fn get(&self, key: &str) -> Option<&Json> {
         match self {
             Json::Obj(m) => m.iter().find(|(k, _)| k == key).map(|(_, v)| v),
-            _ => None,
-        }
-    }
-
-    /// A string or an array of strings, as policies allow for most fields.
-    fn strings(&self) -> Option<Vec<String>> {
-        match self {
-            Json::Str(s) => Some(vec![s.clone()]),
-            Json::Arr(a) => a.iter().map(|v| if let Json::Str(s) = v { Some(s.clone()) } else { None }).collect(),
             _ => None,
         }
     }
@@ -223,100 +210,6 @@ pub fn glob(pattern: &str, s: &str, case_insensitive: bool) -> bool {
     pi == p.len()
 }
 
-// ------------------------------------------------------------------ bucket policies
-
-#[derive(Debug)]
-struct Statement {
-    allow: bool,
-    /// Principal is everyone (`"*"` or `{"AWS": "*"}`).
-    anyone: bool,
-    actions: Vec<String>,
-    resources: Vec<String>,
-    /// Uses features we cannot evaluate (Condition, NotAction, NotResource, NotPrincipal).
-    /// Such Allow statements grant nothing; such Deny statements deny conservatively.
-    opaque: bool,
-}
-
-#[derive(Debug)]
-pub struct Policy {
-    statements: Vec<Statement>,
-}
-
-fn malformed_policy(msg: &str) -> S3Error {
-    S3Error::new("MalformedPolicy", StatusCode::BAD_REQUEST, msg)
-}
-
-impl Policy {
-    pub fn parse(doc: &str, bucket: &str) -> S3Result<Policy> {
-        let json = parse_json(doc).ok_or_else(|| malformed_policy("Policies must be valid JSON"))?;
-        let stmts = match json.get("Statement") {
-            Some(Json::Arr(a)) => a.iter().collect::<Vec<_>>(),
-            Some(o @ Json::Obj(_)) => vec![o],
-            _ => return Err(malformed_policy("Missing required field Statement")),
-        };
-        let arn = format!("arn:aws:s3:::{bucket}");
-        let mut statements = Vec::new();
-        for st in stmts {
-            let allow = match st.get("Effect") {
-                Some(Json::Str(e)) if e == "Allow" => true,
-                Some(Json::Str(e)) if e == "Deny" => false,
-                _ => return Err(malformed_policy("Invalid effect")),
-            };
-            let opaque = ["Condition", "NotAction", "NotResource", "NotPrincipal"].iter().any(|k| st.get(k).is_some());
-            let anyone = match st.get("Principal") {
-                Some(Json::Str(s)) => s == "*",
-                Some(p @ Json::Obj(_)) => p.get("AWS").and_then(Json::strings).is_some_and(|v| v.iter().any(|s| s == "*")),
-                None if st.get("NotPrincipal").is_some() => true,
-                _ => return Err(malformed_policy("Missing required field Principal")),
-            };
-            let actions = match st.get("Action").map(Json::strings) {
-                Some(Some(a)) => a,
-                Some(None) => return Err(malformed_policy("Invalid Action")),
-                None if opaque => vec!["*".into()],
-                None => return Err(malformed_policy("Missing required field Action")),
-            };
-            let resources = match st.get("Resource").map(Json::strings) {
-                Some(Some(r)) => r,
-                Some(None) => return Err(malformed_policy("Invalid Resource")),
-                None if opaque => vec![format!("{arn}*")],
-                None => return Err(malformed_policy("Missing required field Resource")),
-            };
-            for r in &resources {
-                if !(r == &arn
-                    || r.starts_with(&format!("{arn}/"))
-                    || (r.ends_with('*') && arn.starts_with(r.trim_end_matches('*'))))
-                {
-                    return Err(malformed_policy("Policy has invalid resource"));
-                }
-            }
-            statements.push(Statement { allow, anyone, actions, resources, opaque });
-        }
-        Ok(Policy { statements })
-    }
-
-    /// Whether this policy lets an anonymous caller perform `action` on `resource`.
-    pub fn allows_anonymous(&self, action: &str, resource: &str) -> bool {
-        let mut allowed = false;
-        for st in &self.statements {
-            let hits = st.actions.iter().any(|a| glob(a, action, true)) && st.resources.iter().any(|r| glob(r, resource, false));
-            if !hits {
-                continue;
-            }
-            if !st.allow && (st.anyone || st.opaque) {
-                return false;
-            }
-            if st.allow && st.anyone && !st.opaque {
-                allowed = true;
-            }
-        }
-        allowed
-    }
-
-    pub fn is_public(&self) -> bool {
-        self.statements.iter().any(|s| s.allow && s.anyone && !s.opaque)
-    }
-}
-
 // ------------------------------------------------------------------ CORS
 
 #[derive(Debug, Clone)]
@@ -470,7 +363,7 @@ pub struct BucketAccess {
     pub versioning: crate::store::Versioning,
     /// Bucket default encryption (PutBucketEncryption with AES256).
     pub default_sse: bool,
-    pub policy: Option<Policy>,
+    pub policy: Option<crate::iam::Policy>,
     pub cors: Option<Vec<CorsRule>>,
     /// Object Lock configuration (present = Object Lock enabled).
     pub lock: Option<crate::lock::BucketLock>,
@@ -478,8 +371,9 @@ pub struct BucketAccess {
 }
 
 impl BucketAccess {
-    pub fn allows_anonymous(&self, action: &str, resource: &str) -> bool {
-        let by_acl = match self.acl {
+    /// What the canned ACL grants to anonymous callers.
+    fn acl_grants(&self, action: &str) -> bool {
+        match self.acl {
             CannedAcl::Private => false,
             CannedAcl::PublicRead => matches!(action, "s3:GetObject" | "s3:ListBucket" | "s3:GetBucketLocation"),
             CannedAcl::PublicReadWrite => matches!(
@@ -493,19 +387,21 @@ impl BucketAccess {
                     | "s3:ListMultipartUploadParts"
                     | "s3:ListBucketMultipartUploads"
             ),
-        };
-        match &self.policy {
-            // An explicit Deny in the policy overrides the ACL.
-            Some(p) => {
-                let denied = p.statements.iter().any(|st| {
-                    !st.allow
-                        && (st.anyone || st.opaque)
-                        && st.actions.iter().any(|a| glob(a, action, true))
-                        && st.resources.iter().any(|r| glob(r, resource, false))
-                });
-                !denied && (by_acl || p.allows_anonymous(action, resource))
-            }
-            None => by_acl,
+        }
+    }
+
+    /// The bucket policy's verdict on a request (`NotApplicable` without a policy).
+    pub fn policy_decision(&self, action: &str, resource: &str, ctx: &crate::iam::Ctx) -> crate::iam::Decision {
+        self.policy.as_ref().map_or(crate::iam::Decision::NotApplicable, |p| p.evaluate(action, resource, ctx))
+    }
+
+    /// May an anonymous caller do this? The policy decides first (an explicit Deny overrides the
+    /// ACL), then the ACL.
+    pub fn allows_anonymous(&self, action: &str, resource: &str, ctx: &crate::iam::Ctx) -> bool {
+        match self.policy_decision(action, resource, ctx) {
+            crate::iam::Decision::Deny => false,
+            crate::iam::Decision::Allow => true,
+            crate::iam::Decision::NotApplicable => self.acl_grants(action),
         }
     }
 }
@@ -544,34 +440,6 @@ mod tests {
     }
 
     #[test]
-    fn policy_public_prefix_with_deny() {
-        let doc = r#"{
-          "Version": "2012-10-17",
-          "Statement": [
-            {"Effect": "Allow", "Principal": "*", "Action": ["s3:GetObject"], "Resource": "arn:aws:s3:::web/*"},
-            {"Effect": "Deny", "Principal": {"AWS": ["*"]}, "Action": "s3:*", "Resource": "arn:aws:s3:::web/secret/*"},
-            {"Effect": "Allow", "Principal": "*", "Action": "s3:ListBucket", "Resource": "arn:aws:s3:::web",
-             "Condition": {"IpAddress": {"aws:SourceIp": "10.0.0.0/8"}}}
-          ]
-        }"#;
-        let p = Policy::parse(doc, "web").unwrap();
-        assert!(p.allows_anonymous("s3:GetObject", "arn:aws:s3:::web/index.html"));
-        assert!(!p.allows_anonymous("s3:GetObject", "arn:aws:s3:::web/secret/key"));
-        assert!(!p.allows_anonymous("s3:PutObject", "arn:aws:s3:::web/index.html"));
-        // Conditional allow is not evaluated, so it grants nothing.
-        assert!(!p.allows_anonymous("s3:ListBucket", "arn:aws:s3:::web"));
-        assert!(p.is_public());
-    }
-
-    #[test]
-    fn policy_rejects_foreign_resource() {
-        let doc =
-            r#"{"Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::other/*"}]}"#;
-        assert!(Policy::parse(doc, "web").is_err());
-        assert!(Policy::parse("not json", "web").is_err());
-    }
-
-    #[test]
     fn cors_matching() {
         let doc = xml::parse(
             "<CORSConfiguration><CORSRule><AllowedOrigin>https://*.example.com</AllowedOrigin>\
@@ -599,17 +467,23 @@ mod tests {
 
     #[test]
     fn acl_and_policy_combine() {
+        use crate::iam::{Ctx, Kind, Policy};
+        let h = hyper::HeaderMap::new();
+        let ctx = Ctx {
+            username: None,
+            source_ip: "1.2.3.4".parse().unwrap(),
+            secure: false,
+            headers: &h,
+            query: &[],
+            auth_type: "REST-HEADER",
+            now: 0,
+        };
         let mut a = BucketAccess { acl: CannedAcl::PublicRead, ..Default::default() };
-        assert!(a.allows_anonymous("s3:GetObject", "arn:aws:s3:::b/x"));
-        assert!(!a.allows_anonymous("s3:PutObject", "arn:aws:s3:::b/x"));
-        a.policy = Some(
-            Policy::parse(
-                r#"{"Statement":{"Effect":"Deny","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::b/x"}}"#,
-                "b",
-            )
-            .unwrap(),
-        );
-        assert!(!a.allows_anonymous("s3:GetObject", "arn:aws:s3:::b/x"));
-        assert!(a.allows_anonymous("s3:GetObject", "arn:aws:s3:::b/y"));
+        assert!(a.allows_anonymous("s3:GetObject", "arn:aws:s3:::b/x", &ctx));
+        assert!(!a.allows_anonymous("s3:PutObject", "arn:aws:s3:::b/x", &ctx));
+        let deny = r#"{"Statement":{"Effect":"Deny","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::b/x"}}"#;
+        a.policy = Some(Policy::parse(deny, Kind::Bucket, Some("b")).unwrap());
+        assert!(!a.allows_anonymous("s3:GetObject", "arn:aws:s3:::b/x", &ctx));
+        assert!(a.allows_anonymous("s3:GetObject", "arn:aws:s3:::b/y", &ctx));
     }
 }

@@ -7,6 +7,7 @@ Usage:
 
 import hashlib
 import io
+import json
 import os
 import sys
 import time
@@ -1089,6 +1090,73 @@ def t_console():
     h = s3.get_object(Bucket=B, Key="page.html")["ResponseMetadata"]["HTTPHeaders"]
     assert h["content-security-policy"].startswith("sandbox") and h["x-content-type-options"] == "nosniff", h
     s3.delete_object(Bucket=B, Key="page.html")
+
+
+def t_user_policies():
+    ak, sk = os.environ.get("S3RS_POLICY_ACCESS_KEY"), os.environ.get("S3RS_POLICY_SECRET_KEY")
+    if not ak:
+        print("        (skipped: set S3RS_POLICY_ACCESS_KEY/SECRET_KEY for a key with tests/policies/home.json)")
+        return
+    u = boto3.client("s3", endpoint_url=ENDPOINT, aws_access_key_id=ak, aws_secret_access_key=sk, region_name="us-east-1",
+                     config=Config(s3={"addressing_style": "path"}, retries={"max_attempts": 1}))
+    home, shared = "policy-home", "policy-shared"
+    for b in (home, shared):
+        s3.create_bucket(Bucket=b)
+    s3.put_object(Bucket=home, Key="bob/secret.txt", Body=b"bob")
+    try:
+        # ${aws:username} confines the key to its own prefix.
+        u.put_object(Bucket=home, Key=f"{ak}/a.txt", Body=b"mine")
+        assert u.get_object(Bucket=home, Key=f"{ak}/a.txt")["Body"].read() == b"mine"
+        expect_error("AccessDenied", lambda: u.put_object(Bucket=home, Key="bob/x", Body=b"x"))
+        expect_error("AccessDenied", lambda: u.get_object(Bucket=home, Key="bob/secret.txt"))
+        assert [o["Key"] for o in u.list_objects_v2(Bucket=home, Prefix=f"{ak}/")["Contents"]] == [f"{ak}/a.txt"]
+        expect_error("AccessDenied", lambda: u.list_objects_v2(Bucket=home))
+        expect_error("AccessDenied", lambda: u.list_objects_v2(Bucket=home, Prefix="bob/"))
+        # Explicit Deny beats the Allow on the same prefix.
+        u.put_object(Bucket=home, Key=f"{ak}/keep/x", Body=b"k")
+        expect_error("AccessDenied", lambda: u.delete_object(Bucket=home, Key=f"{ak}/keep/x"))
+        # Actions the policy does not mention are denied; ListAllMyBuckets is allowed.
+        expect_error("AccessDenied", lambda: u.create_bucket(Bucket="policy-new-bucket"))
+        expect_error("AccessDenied", lambda: u.get_bucket_versioning(Bucket=home))
+        assert any(b["Name"] == home for b in u.list_buckets()["Buckets"])
+        # The copy source needs read access too.
+        expect_error("AccessDenied", lambda: u.copy_object(Bucket=home, Key=f"{ak}/stolen", CopySource={"Bucket": home, "Key": "bob/secret.txt"}))
+        # DeleteObjects authorizes each key on its own.
+        r = u.delete_objects(Bucket=home, Delete={"Objects": [{"Key": f"{ak}/a.txt"}, {"Key": "bob/secret.txt"}, {"Key": f"{ak}/keep/x"}]})
+        assert [d["Key"] for d in r.get("Deleted", [])] == [f"{ak}/a.txt"], r
+        assert sorted(e["Key"] for e in r["Errors"]) == sorted(["bob/secret.txt", f"{ak}/keep/x"]), r
+        assert s3.get_object(Bucket=home, Key="bob/secret.txt")["Body"].read() == b"bob"
+
+        # A bucket policy can grant a named key access its own policy does not give.
+        s3.put_object(Bucket=shared, Key="doc.txt", Body=b"shared")
+        expect_error("AccessDenied", lambda: u.get_object(Bucket=shared, Key="doc.txt"))
+        grant = {"Statement": [{"Effect": "Allow", "Principal": {"AWS": [f"arn:aws:iam::000000000000:user/{ak}"]},
+                                "Action": "s3:GetObject", "Resource": f"arn:aws:s3:::{shared}/*"}]}
+        s3.put_bucket_policy(Bucket=shared, Policy=json.dumps(grant))
+        assert u.get_object(Bucket=shared, Key="doc.txt")["Body"].read() == b"shared"
+        expect_error("AccessDenied", lambda: u.put_object(Bucket=shared, Key="doc.txt", Body=b"no"))
+        # A bucket-policy Deny binds even full-access keys.
+        deny = {"Statement": [{"Effect": "Deny", "Principal": "*", "Action": "s3:DeleteObject", "Resource": f"arn:aws:s3:::{shared}/doc.txt"}]}
+        s3.put_bucket_policy(Bucket=shared, Policy=json.dumps(deny))
+        expect_error("AccessDenied", lambda: s3.delete_object(Bucket=shared, Key="doc.txt"))
+        # Conditions: anonymous reads only from an allowed network.
+        def anon_policy(cidr):
+            return json.dumps({"Statement": [{"Effect": "Allow", "Principal": "*", "Action": "s3:GetObject",
+                                              "Resource": f"arn:aws:s3:::{shared}/*", "Condition": {"IpAddress": {"aws:SourceIp": cidr}}}]})
+        s3.put_bucket_policy(Bucket=shared, Policy=anon_policy(["127.0.0.0/8", "::1/128"]))
+        assert http("GET", f"/{shared}/doc.txt")[0] == 200
+        s3.put_bucket_policy(Bucket=shared, Policy=anon_policy("10.0.0.0/8"))
+        assert http("GET", f"/{shared}/doc.txt")[0] == 403
+        assert s3.get_bucket_policy_status(Bucket=shared)["PolicyStatus"]["IsPublic"] is False
+        expect_error("MalformedPolicy", lambda: s3.put_bucket_policy(Bucket=shared, Policy=json.dumps(
+            {"Statement": [{"Effect": "Allow", "Principal": "*", "Action": "s3:GetObject", "Resource": f"arn:aws:s3:::{shared}/*",
+                            "Condition": {"NoSuchOperator": {"aws:SourceIp": "1.2.3.4"}}}]})))
+    finally:
+        for b in (home, shared):
+            s3.delete_bucket_policy(Bucket=b)
+            for o in s3.list_objects_v2(Bucket=b).get("Contents", []):
+                s3.delete_object(Bucket=b, Key=o["Key"])
+            s3.delete_bucket(Bucket=b)
 
 
 def t_overwrite():

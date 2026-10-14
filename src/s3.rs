@@ -1,10 +1,11 @@
 //! Request routing and S3 operation handlers.
 
-use crate::access::{self, BucketAccess, CannedAcl, CorsRule, Policy};
+use crate::access::{self, BucketAccess, CannedAcl, CorsRule};
 use crate::auth::{self, Auth, Payload, Principal};
 use crate::body::Body;
 use crate::crypt::{self, KeyKind, WrapKey};
 use crate::error::{S3Error, S3Result, err};
+use crate::iam;
 use crate::io::{self, BodyStream, Data, Expect};
 use crate::lock;
 use crate::store::meta::{ChecksumAlgo, ObjectMeta, PartMeta, Storage, UploadMeta};
@@ -17,6 +18,7 @@ use hyper::header::{HeaderMap, HeaderName, HeaderValue};
 use hyper::http::request::Parts;
 use hyper::{Method, Request, Response, StatusCode};
 use std::collections::HashMap;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
@@ -43,6 +45,8 @@ pub struct Options {
     pub website_domain: Option<String>,
     /// Serve the web console at `/_console/`.
     pub console: bool,
+    /// Trust X-Forwarded-For / X-Forwarded-Proto (client IP and HTTPS for policies).
+    pub behind_proxy: bool,
 }
 
 pub struct Server {
@@ -63,6 +67,7 @@ pub struct Server {
     encrypt_by_default: bool,
     website_domain: Option<String>,
     console: bool,
+    behind_proxy: bool,
     req_counter: AtomicU64,
     rid_base: u64,
 }
@@ -73,9 +78,94 @@ struct Req {
     payload: Payload,
     body: BodyStream,
     principal: Principal,
+    client: Client,
+    /// `REST-HEADER` or `REST-QUERY-STRING` (the `s3:authType` policy key).
+    auth_type: &'static str,
+}
+
+/// Where a request came from.
+#[derive(Clone, Copy)]
+struct Client {
+    ip: IpAddr,
+    secure: bool,
 }
 
 impl Req {
+    /// The IAM action a request needs (`None`: checked per object by the handler, as for
+    /// DeleteObjects). Bucket-level when `has_key` is false.
+    fn action(&self, has_key: bool) -> Option<&'static str> {
+        let m = &self.parts.method;
+        let versioned = self.q("versionId").is_some_and(|v| !v.is_empty());
+        let pick = |plain: &'static str, version: &'static str| if versioned { version } else { plain };
+        if has_key {
+            return Some(match *m {
+                Method::GET | Method::HEAD if self.has("uploadId") => "s3:ListMultipartUploadParts",
+                Method::GET | Method::HEAD if self.has("acl") => pick("s3:GetObjectAcl", "s3:GetObjectVersionAcl"),
+                Method::GET | Method::HEAD if self.has("tagging") => pick("s3:GetObjectTagging", "s3:GetObjectVersionTagging"),
+                Method::GET | Method::HEAD if self.has("retention") => "s3:GetObjectRetention",
+                Method::GET | Method::HEAD if self.has("legal-hold") => "s3:GetObjectLegalHold",
+                Method::GET | Method::HEAD if self.has("attributes") => {
+                    pick("s3:GetObjectAttributes", "s3:GetObjectVersionAttributes")
+                }
+                Method::GET | Method::HEAD => pick("s3:GetObject", "s3:GetObjectVersion"),
+                Method::PUT if self.has("acl") => pick("s3:PutObjectAcl", "s3:PutObjectVersionAcl"),
+                Method::PUT if self.has("tagging") => pick("s3:PutObjectTagging", "s3:PutObjectVersionTagging"),
+                Method::PUT if self.has("retention") => "s3:PutObjectRetention",
+                Method::PUT if self.has("legal-hold") => "s3:PutObjectLegalHold",
+                Method::POST if self.has("restore") => "s3:RestoreObject",
+                Method::POST if self.has("select") => "s3:GetObject",
+                Method::DELETE if self.has("uploadId") => "s3:AbortMultipartUpload",
+                Method::DELETE if self.has("tagging") => pick("s3:DeleteObjectTagging", "s3:DeleteObjectVersionTagging"),
+                Method::DELETE => pick("s3:DeleteObject", "s3:DeleteObjectVersion"),
+                // PUT (including copies and parts) and multipart create / complete.
+                _ => "s3:PutObject",
+            });
+        }
+        const BUCKET_SUBS: &[(&str, &str, &str)] = &[
+            // (subresource, GET action, PUT / DELETE action)
+            ("acl", "s3:GetBucketAcl", "s3:PutBucketAcl"),
+            ("policy", "s3:GetBucketPolicy", "s3:PutBucketPolicy"),
+            ("policyStatus", "s3:GetBucketPolicyStatus", "s3:PutBucketPolicy"),
+            ("cors", "s3:GetBucketCORS", "s3:PutBucketCORS"),
+            ("tagging", "s3:GetBucketTagging", "s3:PutBucketTagging"),
+            ("lifecycle", "s3:GetLifecycleConfiguration", "s3:PutLifecycleConfiguration"),
+            ("encryption", "s3:GetEncryptionConfiguration", "s3:PutEncryptionConfiguration"),
+            ("versioning", "s3:GetBucketVersioning", "s3:PutBucketVersioning"),
+            ("object-lock", "s3:GetBucketObjectLockConfiguration", "s3:PutBucketObjectLockConfiguration"),
+            ("website", "s3:GetBucketWebsite", "s3:PutBucketWebsite"),
+            ("logging", "s3:GetBucketLogging", "s3:PutBucketLogging"),
+            ("notification", "s3:GetBucketNotification", "s3:PutBucketNotification"),
+            ("replication", "s3:GetReplicationConfiguration", "s3:PutReplicationConfiguration"),
+            ("accelerate", "s3:GetAccelerateConfiguration", "s3:PutAccelerateConfiguration"),
+            ("requestPayment", "s3:GetBucketRequestPayment", "s3:PutBucketRequestPayment"),
+            ("ownershipControls", "s3:GetBucketOwnershipControls", "s3:PutBucketOwnershipControls"),
+            ("publicAccessBlock", "s3:GetBucketPublicAccessBlock", "s3:PutBucketPublicAccessBlock"),
+            ("analytics", "s3:GetAnalyticsConfiguration", "s3:PutAnalyticsConfiguration"),
+            ("metrics", "s3:GetMetricsConfiguration", "s3:PutMetricsConfiguration"),
+            ("inventory", "s3:GetInventoryConfiguration", "s3:PutInventoryConfiguration"),
+            ("intelligent-tiering", "s3:GetIntelligentTieringConfiguration", "s3:PutIntelligentTieringConfiguration"),
+            ("location", "s3:GetBucketLocation", "s3:GetBucketLocation"),
+            ("uploads", "s3:ListBucketMultipartUploads", "s3:ListBucketMultipartUploads"),
+            ("versions", "s3:ListBucketVersions", "s3:ListBucketVersions"),
+        ];
+        if *m == Method::POST && self.has("delete") {
+            return None;
+        }
+        if let Some((sub, get, put)) = BUCKET_SUBS.iter().find(|(sub, _, _)| self.has(sub)) {
+            return Some(match *m {
+                Method::GET | Method::HEAD => get,
+                Method::DELETE if *sub == "policy" => "s3:DeleteBucketPolicy",
+                Method::DELETE if *sub == "website" => "s3:DeleteBucketWebsite",
+                _ => put,
+            });
+        }
+        Some(match *m {
+            Method::PUT => "s3:CreateBucket",
+            Method::DELETE => "s3:DeleteBucket",
+            _ => "s3:ListBucket",
+        })
+    }
+
     fn q(&self, name: &str) -> Option<&str> {
         self.query.iter().find(|(k, _)| k == name).map(|(_, v)| v.as_str())
     }
@@ -344,6 +434,7 @@ impl Server {
             encrypt_by_default: opts.encrypt_by_default,
             website_domain: opts.website_domain,
             console: opts.console,
+            behind_proxy: opts.behind_proxy,
             req_counter: AtomicU64::new(1),
             rid_base: util::new_id() as u64,
         }
@@ -359,8 +450,10 @@ impl Server {
             Some(v) => CannedAcl::parse(&String::from_utf8_lossy(&v)).unwrap_or_default(),
             None => CannedAcl::Private,
         };
-        let policy =
-            self.store.bucket_config(bucket, "policy")?.and_then(|v| Policy::parse(&String::from_utf8_lossy(&v), bucket).ok());
+        let policy = self
+            .store
+            .bucket_config(bucket, "policy")?
+            .and_then(|v| iam::Policy::parse(&String::from_utf8_lossy(&v), iam::Kind::Bucket, Some(bucket)).ok());
         let cors = self
             .store
             .bucket_config(bucket, "cors")?
@@ -468,54 +561,102 @@ impl Server {
         Ok(resp)
     }
 
-    /// Decide whether an anonymous request is allowed by the bucket's ACL / policy.
-    fn authorize_anonymous(&self, r: &Req, bucket: Option<&str>, key: Option<&str>) -> S3Result<()> {
-        let Some(bucket) = bucket else { return Err(err::AccessDenied()) };
-        let m = &r.parts.method;
-        let sub = ["acl", "tagging", "retention", "legal-hold"].iter().any(|s| r.has(s));
-        let action = match (key, m) {
-            (Some(_), &Method::GET) if r.has("uploadId") => "s3:ListMultipartUploadParts",
-            (Some(_), &Method::GET | &Method::HEAD) if !sub => "s3:GetObject",
-            (Some(_), &Method::PUT) if r.header("x-amz-copy-source").is_none() && !sub && !has_lock_headers(&r.parts.headers) => {
-                "s3:PutObject"
-            }
-            (Some(_), &Method::POST) if (r.has("uploads") && !has_lock_headers(&r.parts.headers)) || r.has("uploadId") => {
-                "s3:PutObject"
-            }
-            (Some(_), &Method::DELETE) if r.has("uploadId") => "s3:AbortMultipartUpload",
-            (Some(_), &Method::DELETE) if !sub => "s3:DeleteObject",
-            (None, &Method::GET) if r.has("location") => "s3:GetBucketLocation",
-            (None, &Method::GET) if r.has("uploads") => "s3:ListBucketMultipartUploads",
-            (None, &Method::GET | &Method::HEAD)
-                if !r.query.iter().any(|(k, _)| {
-                    !matches!(
-                        k.as_str(),
-                        "list-type"
-                            | "prefix"
-                            | "delimiter"
-                            | "max-keys"
-                            | "marker"
-                            | "continuation-token"
-                            | "start-after"
-                            | "encoding-type"
-                            | "fetch-owner"
-                    )
-                }) =>
-            {
-                "s3:ListBucket"
-            }
-            _ => return Err(err::AccessDenied()),
-        };
-        let resource = match key {
-            Some(k) => format!("arn:aws:s3:::{bucket}/{k}"),
-            None => format!("arn:aws:s3:::{bucket}"),
-        };
-        // Unknown buckets look the same as forbidden ones to anonymous callers.
-        let access = self.bucket_access(bucket).map_err(|_| err::AccessDenied())?;
-        if access.allows_anonymous(action, &resource) { Ok(()) } else { Err(err::AccessDenied()) }
+    /// The client's address and whether it connected over HTTPS (as reported by a trusted
+    /// reverse proxy with `--behind-proxy`).
+    fn client(&self, headers: &HeaderMap, peer: SocketAddr) -> Client {
+        if !self.behind_proxy {
+            return Client { ip: peer.ip(), secure: false };
+        }
+        // The proxy appends the address it saw, so the last entry is the one it vouches for.
+        let ip = header(headers, "x-forwarded-for")
+            .and_then(|v| v.rsplit(',').next())
+            .and_then(|v| v.trim().parse::<IpAddr>().ok())
+            .unwrap_or(peer.ip());
+        let secure = header(headers, "x-forwarded-proto")
+            .and_then(|v| v.split(',').next())
+            .is_some_and(|p| p.trim().eq_ignore_ascii_case("https"));
+        Client { ip, secure }
     }
 
-    pub async fn handle(self: Arc<Self>, req: Request<Incoming>) -> Response<Body> {
+    /// Policy context for a request.
+    fn ctx<'a>(
+        &self,
+        principal: &'a Principal,
+        headers: &'a HeaderMap,
+        query: &'a [(String, String)],
+        client: Client,
+        auth_type: &'static str,
+    ) -> iam::Ctx<'a> {
+        iam::Ctx {
+            username: match principal {
+                Principal::User(c) => Some(c.access_key.as_str()),
+                _ => None,
+            },
+            source_ip: client.ip,
+            secure: client.secure,
+            headers,
+            query,
+            auth_type,
+            now: now_ms() / 1000,
+        }
+    }
+
+    fn req_ctx<'a>(&self, r: &'a Req) -> iam::Ctx<'a> {
+        self.ctx(&r.principal, &r.parts.headers, &r.query, r.client, r.auth_type)
+    }
+
+    /// May `who` perform `action` on the bucket / object? Combines, like AWS: the key's own
+    /// limits (read-only, bucket patterns), explicit Denies in the bucket policy, and Allows
+    /// from the key's policy or the bucket policy. Keys without a policy may do anything their
+    /// limits allow; anonymous callers need an ACL grant or a bucket-policy Allow.
+    fn authorize(&self, who: &Principal, action: &str, bucket: Option<&str>, key: Option<&str>, ctx: &iam::Ctx) -> S3Result<()> {
+        // Built only when a policy has to look at it (the common no-policy path stays cheap).
+        let resource = || match (bucket, key) {
+            (Some(b), Some(k)) => format!("arn:aws:s3:::{b}/{k}"),
+            (Some(b), None) => format!("arn:aws:s3:::{b}"),
+            _ => "arn:aws:s3:::*".to_string(),
+        };
+        match who {
+            Principal::Everyone => Ok(()),
+            Principal::Anonymous => {
+                let Some(b) = bucket else { return Err(err::AccessDenied()) };
+                // Unknown buckets look the same as forbidden ones to anonymous callers.
+                let access = self.bucket_access(b).map_err(|_| err::AccessDenied())?;
+                if access.allows_anonymous(action, &resource(), ctx) { Ok(()) } else { Err(err::AccessDenied()) }
+            }
+            Principal::User(c) => {
+                if c.read_only && !(action.starts_with("s3:Get") || action.starts_with("s3:List")) {
+                    return Err(err::AccessDenied().with_message("This access key is read-only"));
+                }
+                if let Some(b) = bucket
+                    && !c.can_access(b)
+                {
+                    return Err(err::AccessDenied().with_message("This access key may not use this bucket"));
+                }
+                let access = bucket.and_then(|b| self.bucket_access(b).ok());
+                let bucket_policy = access.as_ref().is_some_and(|a| a.policy.is_some());
+                if !bucket_policy && c.policy.is_none() {
+                    return Ok(());
+                }
+                let resource = resource();
+                let by_bucket = match &access {
+                    Some(a) => a.policy_decision(action, &resource, ctx),
+                    None => iam::Decision::NotApplicable,
+                };
+                if by_bucket == iam::Decision::Deny {
+                    return Err(err::AccessDenied());
+                }
+                match c.policy.as_ref().map(|p| p.evaluate(action, &resource, ctx)) {
+                    None | Some(iam::Decision::Allow) => Ok(()),
+                    Some(iam::Decision::Deny) => Err(err::AccessDenied()),
+                    Some(iam::Decision::NotApplicable) if by_bucket == iam::Decision::Allow => Ok(()),
+                    Some(iam::Decision::NotApplicable) => Err(err::AccessDenied()),
+                }
+            }
+        }
+    }
+
+    pub async fn handle(self: Arc<Self>, req: Request<Incoming>, peer: SocketAddr) -> Response<Body> {
         let started = Instant::now();
         let rid = format!("{:016X}", self.rid_base.wrapping_add(self.req_counter.fetch_add(1, Ordering::Relaxed)));
         let method = req.method().clone();
@@ -524,7 +665,7 @@ impl Server {
         let origin = header(req.headers(), "origin").map(str::to_string);
         let cors_bucket = origin.as_ref().and_then(|_| self.resolve(req.uri(), req.headers()).ok()).and_then(|(b, _, _)| b);
         let _inflight = self.metrics.start();
-        let mut resp = match self.route(req).await {
+        let mut resp = match self.route(req, peer).await {
             Ok(r) => r,
             Err(e) => {
                 if e.status == StatusCode::INTERNAL_SERVER_ERROR {
@@ -583,14 +724,14 @@ impl Server {
     }
 
     /// Entry point for the static website endpoint (`--website-listen`).
-    pub async fn handle_website(self: Arc<Self>, req: Request<Incoming>) -> Response<Body> {
+    pub async fn handle_website(self: Arc<Self>, req: Request<Incoming>, peer: SocketAddr) -> Response<Body> {
         let started = Instant::now();
         let rid = format!("{:016X}", self.rid_base.wrapping_add(self.req_counter.fetch_add(1, Ordering::Relaxed)));
         let method = req.method().clone();
         let path = req.uri().path().to_string();
         let _inflight = self.metrics.start();
         let (parts, _body) = req.into_parts();
-        let resp = self.website(&parts, &rid).await;
+        let resp = self.website(&parts, &rid, peer).await;
         let elapsed = started.elapsed();
         self.metrics.finish(&method, resp.status.as_u16(), elapsed);
         if self.verbose {
@@ -607,8 +748,10 @@ impl Server {
         out
     }
 
-    async fn website(&self, parts: &Parts, rid: &str) -> Resp {
+    async fn website(&self, parts: &Parts, rid: &str, peer: SocketAddr) -> Resp {
         let head = parts.method == Method::HEAD;
+        let anon = Principal::Anonymous;
+        let ctx = self.ctx(&anon, &parts.headers, &[], self.client(&parts.headers, peer), "REST-HEADER");
         let page = |e: S3Error| website_error(&e, head, rid);
         if !matches!(parts.method, Method::GET | Method::HEAD) {
             return page(err::MethodNotAllowed());
@@ -650,7 +793,7 @@ impl Server {
         }
         let index = cfg.index.as_deref().unwrap_or("index.html");
         let target = if key.is_empty() || key.ends_with('/') { format!("{key}{index}") } else { key.clone() };
-        let e = match self.website_object(parts, bucket, &target, head, &access).await {
+        let e = match self.website_object(parts, bucket, &target, head, &access, &ctx).await {
             Ok(r) => return r,
             Err(e) => e,
         };
@@ -658,7 +801,7 @@ impl Server {
         if e.status == StatusCode::NOT_FOUND
             && !key.is_empty()
             && !key.ends_with('/')
-            && access.allows_anonymous("s3:GetObject", &format!("arn:aws:s3:::{bucket}/{key}/{index}"))
+            && access.allows_anonymous("s3:GetObject", &format!("arn:aws:s3:::{bucket}/{key}/{index}"), &ctx)
             && self.store.get_object(bucket, &format!("{key}/{index}")).is_ok()
         {
             // Absolute, so a key starting with "/" cannot become a protocol-relative URL.
@@ -673,7 +816,7 @@ impl Server {
             // Served without the request's conditional / range headers, with the original status.
             let mut plain = Request::new(()).into_parts().0;
             plain.method = parts.method.clone();
-            if let Ok(mut r) = self.website_object(&plain, bucket, doc, head, &access).await
+            if let Ok(mut r) = self.website_object(&plain, bucket, doc, head, &access, &ctx).await
                 && r.status == StatusCode::OK
             {
                 r.status = e.status;
@@ -684,8 +827,16 @@ impl Server {
     }
 
     /// Serve one object to an anonymous website visitor (it must be publicly readable).
-    async fn website_object(&self, parts: &Parts, bucket: &str, key: &str, head: bool, access: &BucketAccess) -> S3Result<Resp> {
-        if check_key(key).is_err() || !access.allows_anonymous("s3:GetObject", &format!("arn:aws:s3:::{bucket}/{key}")) {
+    async fn website_object(
+        &self,
+        parts: &Parts,
+        bucket: &str,
+        key: &str,
+        head: bool,
+        access: &BucketAccess,
+        ctx: &iam::Ctx<'_>,
+    ) -> S3Result<Resp> {
+        if check_key(key).is_err() || !access.allows_anonymous("s3:GetObject", &format!("arn:aws:s3:::{bucket}/{key}"), ctx) {
             return Err(err::AccessDenied());
         }
         let (meta, _) = self.store.get_object(bucket, key)?;
@@ -703,6 +854,8 @@ impl Server {
             payload: Payload::Unsigned,
             body: BodyStream::empty(),
             principal: Principal::Anonymous,
+            client: Client { ip: ctx.source_ip, secure: ctx.secure },
+            auth_type: "REST-HEADER",
         };
         let mut r = self.get_object(&req, bucket, key, head).await?;
         // Objects that need a customer key cannot be served to anonymous visitors anyway; and
@@ -736,7 +889,7 @@ impl Server {
         })
     }
 
-    async fn route(&self, req: Request<Incoming>) -> S3Result<Resp> {
+    async fn route(&self, req: Request<Incoming>, peer: SocketAddr) -> S3Result<Resp> {
         let (parts, body) = req.into_parts();
         let raw_query = parts.uri.query().unwrap_or("");
         let (bucket, key, vhost) = self.resolve(&parts.uri, &parts.headers)?;
@@ -784,7 +937,7 @@ impl Server {
             && let Some(b) = &bucket
             && let Some(boundary) = header(&parts.headers, "content-type").and_then(crate::post::boundary)
         {
-            return self.post_object(&parts, body, b, &boundary).await;
+            return self.post_object(&parts, body, b, &boundary, peer).await;
         }
         let (mut payload, principal) = match &self.auth {
             None => (auth::payload_mode(&parts)?, Principal::Everyone),
@@ -795,21 +948,33 @@ impl Server {
         };
         let query = parse_query(raw_query);
         let body = BodyStream::new(body, &mut payload);
-        let mut r = Req { parts, query, payload, body, principal: principal.clone() };
+        let auth_type = if r_has_auth_header(&parts) { "REST-HEADER" } else { "REST-QUERY-STRING" };
+        let client = self.client(&parts.headers, peer);
+        let mut r = Req { parts, query, payload, body, principal, client, auth_type };
         let m = r.parts.method.clone();
-        match &principal {
-            Principal::Everyone => {}
-            Principal::User(c) => {
-                if c.read_only && !matches!(m, Method::GET | Method::HEAD) {
-                    return Err(err::AccessDenied().with_message("This access key is read-only"));
+        {
+            let ctx = self.req_ctx(&r);
+            let (b, k) = (bucket.as_deref(), key.as_deref());
+            if bucket.is_none() {
+                self.authorize(&r.principal, "s3:ListAllMyBuckets", None, None, &ctx)?;
+            } else if let Some(action) = r.action(key.is_some()) {
+                self.authorize(&r.principal, action, b, k, &ctx)?;
+            }
+            // Uploads that set retention, a legal hold or tags also need those permissions.
+            let creates =
+                key.is_some() && ((m == Method::PUT && action_is_plain_put(&r)) || (m == Method::POST && r.has("uploads")));
+            if creates {
+                let h = &r.parts.headers;
+                if h.contains_key(lock::MODE) || h.contains_key(lock::UNTIL) {
+                    self.authorize(&r.principal, "s3:PutObjectRetention", b, k, &ctx)?;
                 }
-                if let Some(b) = &bucket
-                    && !c.can_access(b)
-                {
-                    return Err(err::AccessDenied().with_message("This access key may not use this bucket"));
+                if h.contains_key(lock::HOLD) {
+                    self.authorize(&r.principal, "s3:PutObjectLegalHold", b, k, &ctx)?;
+                }
+                if h.contains_key("x-amz-tagging") {
+                    self.authorize(&r.principal, "s3:PutObjectTagging", b, k, &ctx)?;
                 }
             }
-            Principal::Anonymous => self.authorize_anonymous(&r, bucket.as_deref(), key.as_deref())?,
         }
 
         let Some(bucket) = bucket else {
@@ -885,7 +1050,7 @@ impl Server {
                         Ok(resp)
                     }
                     "policyStatus" => {
-                        let public = self.bucket_access(bucket)?.policy.as_ref().is_some_and(Policy::is_public);
+                        let public = self.bucket_access(bucket)?.policy.as_ref().is_some_and(iam::Policy::is_public);
                         let mut x = Xml::new("PolicyStatus");
                         x.elem("IsPublic", public.to_string());
                         Ok(Resp::xml(x.finish("PolicyStatus")))
@@ -950,7 +1115,7 @@ impl Server {
             }
             Method::PUT if sub == Some("policy") => {
                 let body = self.read_body(r, 20 * 1024).await?;
-                Policy::parse(&String::from_utf8_lossy(&body), bucket)?;
+                iam::Policy::parse(&String::from_utf8_lossy(&body), iam::Kind::Bucket, Some(bucket))?;
                 self.set_bucket_config(bucket, "policy", Some(body.to_vec())).await?;
                 Ok(Resp::new(StatusCode::NO_CONTENT))
             }
@@ -1168,7 +1333,7 @@ impl Server {
                     version: version.clone(),
                     retention,
                     legal_hold,
-                    bypass: bypass_governance(r),
+                    bypass: self.bypass_governance(r, bucket, key),
                 };
                 let out = self.store.submit(op).await?;
                 let mut resp = Resp::ok();
@@ -1198,7 +1363,7 @@ impl Server {
                     .submit(Op::DeleteObjects {
                         bucket: bucket.into(),
                         items: vec![(key.into(), version.clone())],
-                        bypass: bypass_governance(r),
+                        bypass: self.bypass_governance(r, bucket, key),
                     })
                     .await?
                 else {
@@ -1476,6 +1641,14 @@ impl Server {
         self.master_key.clone().ok_or_else(|| {
             err::InvalidArgument().with_message("Server-side encryption is not configured on this server (see --encryption-key).")
         })
+    }
+
+    /// Honour `x-amz-bypass-governance-retention` only for callers allowed
+    /// `s3:BypassGovernanceRetention` (never anonymous ones).
+    fn bypass_governance(&self, r: &Req, bucket: &str, key: &str) -> bool {
+        wants_bypass(r)
+            && !matches!(r.principal, Principal::Anonymous)
+            && self.authorize(&r.principal, "s3:BypassGovernanceRetention", Some(bucket), Some(key), &self.req_ctx(r)).is_ok()
     }
 
     fn require_lock(&self, bucket: &str) -> S3Result<lock::BucketLock> {
@@ -1760,9 +1933,9 @@ impl Server {
         match path.split_once('/') {
             Some((b, k)) if !b.is_empty() && !k.is_empty() => {
                 check_key(k)?;
-                if !r.principal.can_access(b) {
-                    return Err(err::AccessDenied().with_message("This access key may not use the copy source bucket"));
-                }
+                let action = if version.is_some() { "s3:GetObjectVersion" } else { "s3:GetObject" };
+                self.authorize(&r.principal, action, Some(b), Some(k), &self.req_ctx(r))
+                    .map_err(|e| e.with_message("Access to the copy source was denied"))?;
                 Ok((b.to_string(), k.to_string(), version))
             }
             _ => {
@@ -2008,7 +2181,8 @@ impl Server {
     }
 
     /// Browser-based upload: `POST /bucket` with a multipart form (and usually a signed policy).
-    async fn post_object(&self, parts: &Parts, body: Incoming, bucket: &str, boundary: &str) -> S3Result<Resp> {
+    async fn post_object(&self, parts: &Parts, body: Incoming, bucket: &str, boundary: &str, peer: SocketAddr) -> S3Result<Resp> {
+        let client = self.client(&parts.headers, peer);
         let mut payload = Payload::Unsigned;
         let stream = BodyStream::new(body, &mut payload);
         let (form, file) = crate::post::parse_form(stream, boundary).await?;
@@ -2026,12 +2200,8 @@ impl Server {
             Some(policy) => {
                 if let Some(a) = &self.auth {
                     let p = a.verify_post_policy(f, policy)?;
-                    if p.read_only() {
-                        return Err(err::AccessDenied().with_message("This access key is read-only"));
-                    }
-                    if !p.can_access(bucket) {
-                        return Err(err::AccessDenied().with_message("This access key may not use this bucket"));
-                    }
+                    let ctx = self.ctx(&p, &parts.headers, &[], client, "POST");
+                    self.authorize(&p, "s3:PutObject", Some(bucket), Some(&key), &ctx)?;
                 }
                 crate::post::PostPolicy::parse(policy)?.check(f, bucket)?
             }
@@ -2039,7 +2209,9 @@ impl Server {
                 // Unsigned form: allowed only when the bucket accepts anonymous uploads.
                 if self.auth.is_some() {
                     let access = self.bucket_access(bucket).map_err(|_| err::AccessDenied())?;
-                    if !access.allows_anonymous("s3:PutObject", &format!("arn:aws:s3:::{bucket}/{key}")) {
+                    let anon = Principal::Anonymous;
+                    let ctx = self.ctx(&anon, &parts.headers, &[], client, "POST");
+                    if !access.allows_anonymous("s3:PutObject", &format!("arn:aws:s3:::{bucket}/{key}"), &ctx) {
                         return Err(err::AccessDenied());
                     }
                 }
@@ -2213,10 +2385,19 @@ impl Server {
             return Err(err::MalformedXML().with_message("The request must contain no more than 1000 keys"));
         }
         let (valid, invalid): (Vec<_>, Vec<_>) = objects.into_iter().partition(|(k, _)| !k.is_empty() && check_key(k).is_ok());
-        let OpOut::Deleted(results) = self
-            .store
-            .submit(Op::DeleteObjects { bucket: bucket.into(), items: valid.clone(), bypass: bypass_governance(r) })
-            .await?
+        // Each key is authorized on its own, as on S3; refused keys are reported as errors.
+        let ctx = self.req_ctx(r);
+        let (valid, denied): (Vec<_>, Vec<_>) = valid.into_iter().partition(|(k, v)| {
+            let action = if v.is_some() { "s3:DeleteObjectVersion" } else { "s3:DeleteObject" };
+            self.authorize(&r.principal, action, Some(bucket), Some(k), &ctx).is_ok()
+        });
+        let bypass = wants_bypass(r)
+            && !matches!(r.principal, Principal::Anonymous)
+            && valid
+                .iter()
+                .all(|(k, _)| self.authorize(&r.principal, "s3:BypassGovernanceRetention", Some(bucket), Some(k), &ctx).is_ok());
+        let OpOut::Deleted(results) =
+            self.store.submit(Op::DeleteObjects { bucket: bucket.into(), items: valid.clone(), bypass }).await?
         else {
             return Err(S3Error::internal("unexpected writer reply"));
         };
@@ -2242,6 +2423,10 @@ impl Server {
                     x.elem("Code", e.code).elem("Message", &e.message).close("Error");
                 }
             }
+        }
+        for (k, v) in denied {
+            x.open("Error").elem("Key", &k).opt("VersionId", v.as_deref());
+            x.elem("Code", "AccessDenied").elem("Message", "Access Denied").close("Error");
         }
         for (k, _) in invalid {
             x.open("Error").elem("Key", &k).elem("Code", "InvalidArgument").elem("Message", "Invalid key").close("Error");
@@ -2289,13 +2474,22 @@ fn inheritable(h: &[(String, String)]) -> Vec<(String, String)> {
     h.iter().filter(|(k, _)| !k.starts_with(SSE) && !lock::is_lock_header(k)).cloned().collect()
 }
 
+fn r_has_auth_header(parts: &Parts) -> bool {
+    parts.headers.contains_key(hyper::header::AUTHORIZATION)
+}
+
+/// A plain object PUT or copy (not a subresource or a multipart part).
+fn action_is_plain_put(r: &Req) -> bool {
+    !["acl", "tagging", "retention", "legal-hold", "partNumber", "uploadId"].iter().any(|s| r.has(s))
+}
+
 fn has_lock_headers(h: &HeaderMap) -> bool {
     [lock::MODE, lock::UNTIL, lock::HOLD].iter().any(|n| h.contains_key(*n))
 }
 
-/// `x-amz-bypass-governance-retention: true`, honoured for authenticated callers only.
-fn bypass_governance(r: &Req) -> bool {
-    r.header(lock::BYPASS).is_some_and(|v| v.trim().eq_ignore_ascii_case("true")) && !matches!(r.principal, Principal::Anonymous)
+/// Whether the request sent `x-amz-bypass-governance-retention: true`.
+fn wants_bypass(r: &Req) -> bool {
+    r.header(lock::BYPASS).is_some_and(|v| v.trim().eq_ignore_ascii_case("true"))
 }
 
 /// Echo the encryption headers of a write back to the client.

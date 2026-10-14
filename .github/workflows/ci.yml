@@ -40,12 +40,14 @@ jobs:
       - run: cargo build --release
       - name: Start s3rs
         run: |
-          printf 'rokey:rosecret:ro\nscoped:scopedsecret:rw:scoped-*,shared-scope\n' > /tmp/creds
+          cp tests/policies/home.json /tmp/home.json
+          printf 'rokey:rosecret:ro\nscoped:scopedsecret:rw:scoped-*,shared-scope\nalice:alicesecret:policy=home.json\n' > /tmp/creds
           # Fast lifecycle sweeps (1s) with 2-second "days" so expiration can be tested.
           S3RS_LIFECYCLE_DAY_SECS=2 ./target/release/s3rs -d /tmp/s3rs-data -l 127.0.0.1:9000 \
             --access-key testkey --secret-key testsecret --credentials-file /tmp/creds \
             --lifecycle-interval 1 --encryption-key "$(openssl rand -hex 32)" \
             --website-listen 127.0.0.1:9001 --website-domain web.localhost > /tmp/s3rs.log 2>&1 &
+          echo $! > /tmp/s3rs.pid
           for i in $(seq 50); do curl -sf http://127.0.0.1:9000/_health && break; sleep 0.1; done
       - name: boto3 suite
         env:
@@ -53,6 +55,8 @@ jobs:
           S3RS_RO_SECRET_KEY: rosecret
           S3RS_SCOPED_ACCESS_KEY: scoped
           S3RS_SCOPED_SECRET_KEY: scopedsecret
+          S3RS_POLICY_ACCESS_KEY: alice
+          S3RS_POLICY_SECRET_KEY: alicesecret
           S3RS_FAST_LIFECYCLE: "1"
           S3RS_ENCRYPTION: "1"
           S3RS_DATA_DIR: /tmp/s3rs-data
@@ -81,6 +85,17 @@ jobs:
           aws $E s3 website s3://cli-site --index-document index.html
           curl -sf -H 'Host: cli-site.web.localhost' http://127.0.0.1:9001/ | grep -q 'hello site'
           aws $E s3 rb --force s3://cli-site
+      - name: reload credentials on SIGHUP
+        env:
+          AWS_ACCESS_KEY_ID: newkey
+          AWS_SECRET_ACCESS_KEY: newsecret
+          AWS_DEFAULT_REGION: us-east-1
+        run: |
+          ! aws --endpoint-url http://127.0.0.1:9000 s3 ls 2>/dev/null
+          echo 'newkey:newsecret:ro' >> /tmp/creds
+          kill -HUP "$(cat /tmp/s3rs.pid)"
+          for i in $(seq 50); do grep -q 'reloaded 5 access key' /tmp/s3rs.log && break; sleep 0.1; done
+          aws --endpoint-url http://127.0.0.1:9000 s3 ls
       - name: minio-go suite
         working-directory: tests/minio-go
         run: go run .

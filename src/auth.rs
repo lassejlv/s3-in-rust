@@ -6,7 +6,7 @@ use hmac::{KeyInit, Mac};
 use hyper::http::request::Parts;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
 type HmacSha256 = hmac::Hmac<Sha256>;
 
@@ -79,14 +79,17 @@ impl ChunkSigner {
     }
 }
 
-/// One access key: its secret, whether it may only read, and which buckets it may use.
-#[derive(Debug, PartialEq, Eq)]
+/// One access key: its secret, whether it may only read, which buckets it may use, and an
+/// optional IAM-style policy that decides what it may do.
+#[derive(Debug)]
 pub struct Credential {
     pub access_key: String,
     pub secret: String,
     pub read_only: bool,
     /// Bucket name patterns (`*` wildcards) this key is limited to; `None` = all buckets.
     pub buckets: Option<Vec<String>>,
+    /// With a policy, the key may do only what the policy (or a bucket policy) allows.
+    pub policy: Option<Arc<crate::iam::Policy>>,
 }
 
 impl Credential {
@@ -96,7 +99,7 @@ impl Credential {
 }
 
 /// Who made a request.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub enum Principal {
     Anonymous,
     User(Arc<Credential>),
@@ -112,14 +115,11 @@ impl Principal {
             _ => true,
         }
     }
-
-    pub fn read_only(&self) -> bool {
-        matches!(self, Principal::User(c) if c.read_only)
-    }
 }
 
 pub struct Auth {
-    creds: HashMap<String, Arc<Credential>>,
+    /// Replaced as a whole on reload; requests keep the credential they authenticated with.
+    creds: RwLock<Arc<HashMap<String, Arc<Credential>>>>,
     key_cache: Mutex<HashMap<String, [u8; 32]>>,
 }
 
@@ -172,23 +172,32 @@ pub fn payload_mode(parts: &Parts) -> S3Result<Payload> {
 
 impl Auth {
     pub fn new(creds: Vec<Credential>) -> Self {
-        let creds = creds.into_iter().map(|c| (c.access_key.clone(), Arc::new(c))).collect();
-        Auth { creds, key_cache: Mutex::new(HashMap::new()) }
+        let auth = Auth { creds: RwLock::new(Arc::new(HashMap::new())), key_cache: Mutex::new(HashMap::new()) };
+        auth.replace(creds);
+        auth
     }
 
-    fn credential(&self, access_key: &str) -> S3Result<&Credential> {
-        self.creds.get(access_key).map(|c| c.as_ref()).ok_or_else(err::InvalidAccessKeyId)
+    /// Swap in a new set of credentials (e.g. after the credentials file changed).
+    pub fn replace(&self, creds: Vec<Credential>) {
+        let map = creds.into_iter().map(|c| (c.access_key.clone(), Arc::new(c))).collect();
+        *self.creds.write().unwrap() = Arc::new(map);
+        self.key_cache.lock().unwrap().clear();
+    }
+
+    fn credential(&self, access_key: &str) -> S3Result<Arc<Credential>> {
+        self.creds.read().unwrap().get(access_key).cloned().ok_or_else(err::InvalidAccessKeyId)
     }
 
     fn principal(&self, access_key: &str) -> Principal {
-        match self.creds.get(access_key) {
-            Some(c) => Principal::User(c.clone()),
-            None => Principal::Anonymous,
+        match self.credential(access_key) {
+            Ok(c) => Principal::User(c),
+            Err(_) => Principal::Anonymous,
         }
     }
 
     fn signing_key(&self, access_key: &str, date: &str, region: &str, service: &str) -> S3Result<[u8; 32]> {
-        let secret = &self.credential(access_key)?.secret;
+        let cred = self.credential(access_key)?;
+        let secret = &cred.secret;
         let cache_key = format!("{access_key}/{date}/{region}/{service}");
         if let Some(k) = self.key_cache.lock().unwrap().get(&cache_key) {
             return Ok(*k);
@@ -257,7 +266,8 @@ impl Auth {
             return Ok(self.principal(ak));
         }
         if let (Some(ak), Some(sig)) = (fields.get("awsaccesskeyid"), fields.get("signature")) {
-            let secret = self.credential(ak)?.secret.as_bytes();
+            let cred = self.credential(ak)?;
+            let secret = cred.secret.as_bytes();
             let mut m = <hmac::Hmac<sha1::Sha1> as KeyInit>::new_from_slice(secret).expect("hmac key");
             m.update(policy_b64.as_bytes());
             if !ct_eq(util::base64(&m.finalize().into_bytes()).as_bytes(), sig.trim().as_bytes()) {
@@ -278,7 +288,8 @@ impl Auth {
         signature: &str,
         expires: Option<u64>,
     ) -> S3Result<()> {
-        let secret = self.credential(access_key)?.secret.as_bytes();
+        let cred = self.credential(access_key)?;
+        let secret = cred.secret.as_bytes();
         let h = |n: &str| parts.headers.get(n).and_then(|v| v.to_str().ok()).unwrap_or("").trim();
         let date = match expires {
             Some(e) => e.to_string(),
@@ -622,6 +633,7 @@ mod tests {
             secret: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".into(),
             read_only: false,
             buckets: None,
+            policy: None,
         }])
     }
 
@@ -632,6 +644,7 @@ mod tests {
             secret: "s".into(),
             read_only: false,
             buckets: Some(vec!["team-a-*".into(), "shared".into()]),
+            policy: None,
         };
         assert!(c.can_access("team-a-logs") && c.can_access("shared"));
         assert!(!c.can_access("team-b") && !c.can_access("shared2"));

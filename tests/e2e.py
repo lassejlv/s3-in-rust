@@ -708,6 +708,107 @@ def t_lifecycle_versions():
     _wipe_versioned(lb)
 
 
+def t_encryption():
+    if not os.environ.get("S3RS_ENCRYPTION"):
+        print("        (skipped: set S3RS_ENCRYPTION=1 with a server started with --encryption-key)")
+        return
+    import base64
+    eb = B + "-enc"
+    s3.create_bucket(Bucket=eb)
+    data_dir = os.environ.get("S3RS_DATA_DIR")
+
+    def on_disk_contains(needle):
+        if not data_dir:
+            return False
+        for root, _, files in os.walk(data_dir):
+            for f in files:
+                with open(os.path.join(root, f), "rb") as fh:
+                    if needle in fh.read():
+                        return True
+        return False
+
+    # SSE-S3: large (file) and small (inline) objects, ranges across chunk boundaries.
+    big = os.urandom(300_000) + b"PLAINTEXT-MARKER-BIG" + os.urandom(100)
+    r = s3.put_object(Bucket=eb, Key="sse/big", Body=big, ServerSideEncryption="AES256")
+    assert r["ServerSideEncryption"] == "AES256"
+    g = s3.get_object(Bucket=eb, Key="sse/big")
+    assert g["Body"].read() == big and g["ServerSideEncryption"] == "AES256"
+    for a, b in [(0, 0), (65535, 65537), (131000, 200000), (len(big) - 5, len(big) - 1)]:
+        assert s3.get_object(Bucket=eb, Key="sse/big", Range=f"bytes={a}-{b}")["Body"].read() == big[a:b + 1]
+    small = b"tiny secret PLAINTEXT-MARKER-SMALL"
+    s3.put_object(Bucket=eb, Key="sse/small", Body=small, ServerSideEncryption="AES256")
+    assert s3.get_object(Bucket=eb, Key="sse/small")["Body"].read() == small
+    s3.put_object(Bucket=eb, Key="plain/control", Body=b"PLAINTEXT-MARKER-PLAIN")
+    if data_dir:
+        assert on_disk_contains(b"PLAINTEXT-MARKER-PLAIN"), "control marker should be visible on disk"
+        assert not on_disk_contains(b"PLAINTEXT-MARKER-BIG") and not on_disk_contains(b"PLAINTEXT-MARKER-SMALL")
+    expect_error("NotImplemented", lambda: s3.put_object(Bucket=eb, Key="kms", Body=b"x", ServerSideEncryption="aws:kms"))
+
+    # Bucket default encryption.
+    expect_error("ServerSideEncryptionConfigurationNotFoundError", lambda: s3.get_bucket_encryption(Bucket=eb))
+    s3.put_bucket_encryption(Bucket=eb, ServerSideEncryptionConfiguration={
+        "Rules": [{"ApplyServerSideEncryptionByDefault": {"SSEAlgorithm": "AES256"}}]})
+    rule = s3.get_bucket_encryption(Bucket=eb)["ServerSideEncryptionConfiguration"]["Rules"][0]
+    assert rule["ApplyServerSideEncryptionByDefault"]["SSEAlgorithm"] == "AES256"
+    assert s3.put_object(Bucket=eb, Key="default/x", Body=b"d")["ServerSideEncryption"] == "AES256"
+    assert s3.head_object(Bucket=eb, Key="default/x")["ServerSideEncryption"] == "AES256"
+    s3.delete_bucket_encryption(Bucket=eb)
+    assert "ServerSideEncryption" not in s3.put_object(Bucket=eb, Key="default/y", Body=b"d")
+
+    # SSE-C.
+    key = os.urandom(32)
+    other = os.urandom(32)
+    ck = {"SSECustomerAlgorithm": "AES256", "SSECustomerKey": key}
+    data = os.urandom(150_000)
+    r = s3.put_object(Bucket=eb, Key="ssec/obj", Body=data, **ck)
+    assert r["SSECustomerAlgorithm"] == "AES256"
+    expect_error("InvalidRequest", lambda: s3.get_object(Bucket=eb, Key="ssec/obj"))
+    expect_error("AccessDenied", lambda: s3.get_object(Bucket=eb, Key="ssec/obj", SSECustomerAlgorithm="AES256", SSECustomerKey=other))
+    expect_error("400", lambda: s3.head_object(Bucket=eb, Key="ssec/obj"))
+    g = s3.get_object(Bucket=eb, Key="ssec/obj", **ck)
+    assert g["Body"].read() == data and g["SSECustomerKeyMD5"]
+    assert s3.get_object(Bucket=eb, Key="ssec/obj", Range="bytes=70000-70009", **ck)["Body"].read() == data[70000:70010]
+    assert s3.head_object(Bucket=eb, Key="ssec/obj", **ck)["ContentLength"] == len(data)
+
+    # Multipart with SSE-C (parts must carry the key) and part copy from an SSE-C source.
+    uid = s3.create_multipart_upload(Bucket=eb, Key="ssec/mp", **ck)["UploadId"]
+    p1 = os.urandom(5 * MB)
+    e1 = s3.upload_part(Bucket=eb, Key="ssec/mp", UploadId=uid, PartNumber=1, Body=p1, **ck)["ETag"]
+    expect_error("InvalidRequest", lambda: s3.upload_part(Bucket=eb, Key="ssec/mp", UploadId=uid, PartNumber=2, Body=b"x"))
+    e2 = s3.upload_part_copy(Bucket=eb, Key="ssec/mp", UploadId=uid, PartNumber=2, CopySource={"Bucket": eb, "Key": "sse/big"},
+                             CopySourceRange="bytes=0-999", **ck)["CopyPartResult"]["ETag"]
+    s3.complete_multipart_upload(Bucket=eb, Key="ssec/mp", UploadId=uid,
+                                 MultipartUpload={"Parts": [{"PartNumber": 1, "ETag": e1}, {"PartNumber": 2, "ETag": e2}]})
+    whole = p1 + big[:1000]
+    assert s3.get_object(Bucket=eb, Key="ssec/mp", **ck)["Body"].read() == whole
+    assert s3.get_object(Bucket=eb, Key="ssec/mp", Range=f"bytes={5 * MB - 3}-{5 * MB + 2}", **ck)["Body"].read() == whole[5 * MB - 3:5 * MB + 3]
+
+    # Copies between encryption modes.
+    s3.copy_object(Bucket=eb, Key="copy/plain", CopySource={"Bucket": eb, "Key": "ssec/obj"},
+                   CopySourceSSECustomerAlgorithm="AES256", CopySourceSSECustomerKey=key)
+    g = s3.get_object(Bucket=eb, Key="copy/plain")
+    assert g["Body"].read() == data and "ServerSideEncryption" not in g
+    s3.copy_object(Bucket=eb, Key="copy/sse", CopySource={"Bucket": eb, "Key": "copy/plain"}, ServerSideEncryption="AES256")
+    assert s3.get_object(Bucket=eb, Key="copy/sse")["Body"].read() == data
+    s3.copy_object(Bucket=eb, Key="copy/ssec2", CopySource={"Bucket": eb, "Key": "copy/sse"},
+                   SSECustomerAlgorithm="AES256", SSECustomerKey=other)
+    assert s3.get_object(Bucket=eb, Key="copy/ssec2", SSECustomerAlgorithm="AES256", SSECustomerKey=other)["Body"].read() == data
+    s3.copy_object(Bucket=eb, Key="copy/sse-small", CopySource={"Bucket": eb, "Key": "sse/small"}, ServerSideEncryption="AES256")
+    assert s3.get_object(Bucket=eb, Key="copy/sse-small")["Body"].read() == small
+
+    # Form upload with SSE.
+    post = s3.generate_presigned_post(eb, "form/enc", Fields={"x-amz-server-side-encryption": "AES256"},
+                                      Conditions=[{"x-amz-server-side-encryption": "AES256"}], ExpiresIn=60)
+    assert _form_post(post["url"], post["fields"], b"form secret")[0] == 204
+    g = s3.get_object(Bucket=eb, Key="form/enc")
+    assert g["Body"].read() == b"form secret" and g["ServerSideEncryption"] == "AES256"
+
+    for page in s3.get_paginator("list_objects_v2").paginate(Bucket=eb):
+        for o in page.get("Contents", []):
+            s3.delete_object(Bucket=eb, Key=o["Key"])
+    s3.delete_bucket(Bucket=eb)
+
+
 def t_overwrite():
     s3.put_object(Bucket=B, Key="ow", Body=b"x" * 300_000)
     s3.put_object(Bucket=B, Key="ow", Body=b"small")

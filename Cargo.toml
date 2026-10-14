@@ -5,6 +5,7 @@ description = "Fast, lightweight S3-compatible object storage in pure Rust"
 edition = "2024"
 
 [dependencies]
+aes-gcm = "0.11.1"
 bytes = "1.12.1"
 crc32c = "0.6.8"
 crc32fast = "1.5.2"

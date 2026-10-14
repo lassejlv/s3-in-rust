@@ -468,6 +468,8 @@ impl CannedAcl {
 pub struct BucketAccess {
     pub acl: CannedAcl,
     pub versioning: crate::store::Versioning,
+    /// Bucket default encryption (PutBucketEncryption with AES256).
+    pub default_sse: bool,
     pub policy: Option<Policy>,
     pub cors: Option<Vec<CorsRule>>,
 }

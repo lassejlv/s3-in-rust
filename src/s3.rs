@@ -3,6 +3,7 @@
 use crate::access::{self, BucketAccess, CannedAcl, CorsRule, Policy};
 use crate::auth::{self, Auth, Payload, Principal};
 use crate::body::Body;
+use crate::crypt::{self, KeyKind, WrapKey};
 use crate::error::{S3Error, S3Result, err};
 use crate::io::{self, BodyStream, Data, Expect};
 use crate::store::meta::{ChecksumAlgo, ObjectMeta, PartMeta, Storage, UploadMeta};
@@ -33,6 +34,10 @@ pub struct Options {
     pub cors_origins: Vec<String>,
     /// If set, `/_metrics` requires `Authorization: Bearer <token>`.
     pub metrics_token: Option<String>,
+    /// Master key for SSE-S3 (server-side encryption with server-managed keys).
+    pub master_key: Option<[u8; 32]>,
+    /// Encrypt every new object with the master key unless the request says otherwise.
+    pub encrypt_by_default: bool,
 }
 
 pub struct Server {
@@ -49,6 +54,8 @@ pub struct Server {
     /// happened while it was reading, so a stale (e.g. revoked public) entry is never cached.
     access_gen: AtomicU64,
     metrics_token: Option<String>,
+    master_key: Option<WrapKey>,
+    encrypt_by_default: bool,
     req_counter: AtomicU64,
     rid_base: u64,
 }
@@ -314,6 +321,8 @@ impl Server {
             access_cache: RwLock::new(HashMap::new()),
             access_gen: AtomicU64::new(0),
             metrics_token: opts.metrics_token,
+            master_key: opts.master_key.map(|k| WrapKey::new(KeyKind::Master, k)),
+            encrypt_by_default: opts.encrypt_by_default,
             req_counter: AtomicU64::new(1),
             rid_base: util::new_id() as u64,
         }
@@ -337,7 +346,8 @@ impl Server {
             .and_then(|v| xml::parse(&String::from_utf8_lossy(&v)))
             .and_then(|d| access::parse_cors(&d).ok());
         let versioning = store::Versioning::parse(self.store.bucket_config(bucket, "versioning")?.as_deref());
-        let a = Arc::new(BucketAccess { acl, policy, cors, versioning });
+        let default_sse = self.store.bucket_config(bucket, "encryption")?.is_some();
+        let a = Arc::new(BucketAccess { acl, policy, cors, versioning, default_sse });
         let mut cache = self.access_cache.write().unwrap();
         if self.access_gen.load(Ordering::SeqCst) == generation {
             if cache.len() > 10_000 {
@@ -486,7 +496,7 @@ impl Server {
         let mut resp = match self.route(req).await {
             Ok(r) => r,
             Err(e) => {
-                if e.status.is_server_error() {
+                if e.status == StatusCode::INTERNAL_SERVER_ERROR {
                     eprintln!("error: {method} {path}: {e}");
                 }
                 let mut r = Resp::new(e.status);
@@ -689,7 +699,13 @@ impl Server {
                         let doc = self.store.bucket_config(bucket, "lifecycle")?.ok_or_else(err::NoSuchLifecycleConfiguration)?;
                         Ok(Resp::xml(String::from_utf8_lossy(&doc).into_owned()))
                     }
-                    "encryption" => Err(err::ServerSideEncryptionConfigurationNotFoundError()),
+                    "encryption" => {
+                        let doc = self
+                            .store
+                            .bucket_config(bucket, "encryption")?
+                            .ok_or_else(err::ServerSideEncryptionConfigurationNotFoundError)?;
+                        Ok(Resp::xml(String::from_utf8_lossy(&doc).into_owned()))
+                    }
                     "logging" => Ok(Resp::xml(Xml::new("BucketLoggingStatus").finish("BucketLoggingStatus"))),
                     "notification" => Ok(Resp::xml(Xml::new("NotificationConfiguration").finish("NotificationConfiguration"))),
                     "accelerate" => Ok(Resp::xml(Xml::new("AccelerateConfiguration").finish("AccelerateConfiguration"))),
@@ -737,6 +753,28 @@ impl Server {
                 self.set_bucket_config(bucket, "tagging", Some(access::tagging_xml(&tags).into_bytes())).await?;
                 Ok(Resp::new(StatusCode::NO_CONTENT))
             }
+            Method::PUT if sub == Some("encryption") => {
+                let doc = self.read_xml(r).await?;
+                let alg = (doc.name == "ServerSideEncryptionConfiguration")
+                    .then(|| doc.child("Rule")?.child("ApplyServerSideEncryptionByDefault")?.child_text("SSEAlgorithm"))
+                    .flatten()
+                    .map(str::trim)
+                    .ok_or_else(err::MalformedXML)?;
+                match alg {
+                    "AES256" => {}
+                    a if a.starts_with("aws:kms") => {
+                        return Err(err::NotImplemented().with_message("SSE-KMS is not supported; use AES256"));
+                    }
+                    _ => return Err(err::MalformedXML()),
+                }
+                self.master()?;
+                let mut x = Xml::new("ServerSideEncryptionConfiguration");
+                x.open("Rule").open("ApplyServerSideEncryptionByDefault").elem("SSEAlgorithm", "AES256");
+                x.close("ApplyServerSideEncryptionByDefault").elem("BucketKeyEnabled", "false").close("Rule");
+                self.set_bucket_config(bucket, "encryption", Some(x.finish("ServerSideEncryptionConfiguration").into_bytes()))
+                    .await?;
+                Ok(Resp::ok())
+            }
             Method::PUT if sub == Some("lifecycle") => {
                 let body = self.read_body(r, MAX_XML_BODY).await?;
                 let doc = xml::parse(&String::from_utf8_lossy(&body)).ok_or_else(err::MalformedXML)?;
@@ -782,7 +820,7 @@ impl Server {
                 resp.set("location", &format!("/{bucket}"));
                 Ok(resp)
             }
-            Method::DELETE if matches!(sub, Some("policy" | "cors" | "tagging" | "lifecycle")) => {
+            Method::DELETE if matches!(sub, Some("policy" | "cors" | "tagging" | "lifecycle" | "encryption")) => {
                 let kind = sub.unwrap();
                 let kind: &'static str = store::CONFIG_KINDS.iter().find(|k| **k == kind).unwrap();
                 self.set_bucket_config(bucket, kind, None).await?;
@@ -1136,6 +1174,73 @@ impl Server {
 
     // -------------------------------------------------------------- objects
 
+    fn master(&self) -> S3Result<WrapKey> {
+        self.master_key.clone().ok_or_else(|| {
+            err::InvalidArgument().with_message("Server-side encryption is not configured on this server (see --encryption-key).")
+        })
+    }
+
+    /// Encryption for a new object (or multipart upload): the wrapping key and the headers to
+    /// store with the object (which are also returned on reads, as S3 does).
+    fn write_encryption(&self, h: &HeaderMap, bucket: &str, sse_field: Option<&str>) -> S3Result<Encryption> {
+        let sse = sse_field.or_else(|| header(h, "x-amz-server-side-encryption"));
+        if let Some(alg) = header(h, "x-amz-server-side-encryption-customer-algorithm") {
+            if alg != "AES256" {
+                return Err(err::InvalidArgument().with_message("The encryption algorithm specified is not supported."));
+            }
+            if sse.is_some() {
+                return Err(err::InvalidArgument().with_message(
+                    "Server Side Encryption with Customer provided key is incompatible with the encryption method specified",
+                ));
+            }
+            let key = crypt::parse_customer_key(
+                header(h, "x-amz-server-side-encryption-customer-key").unwrap_or(""),
+                Some(header(h, "x-amz-server-side-encryption-customer-key-md5").unwrap_or("")),
+            )?;
+            let stored = vec![(SSE_C_ALG.to_string(), "AES256".to_string()), (SSE_C_MD5.to_string(), crypt::key_md5_b64(&key))];
+            return Ok(Some((WrapKey::new(KeyKind::Customer, key), stored)));
+        }
+        let requested = match sse {
+            Some("AES256") => true,
+            Some(other) if other.starts_with("aws:kms") => {
+                return Err(err::NotImplemented().with_message("SSE-KMS is not supported; use AES256 or SSE-C"));
+            }
+            Some(_) => return Err(err::InvalidArgument().with_message("The encryption method specified is not supported")),
+            None => self.encrypt_by_default || self.bucket_access(bucket)?.default_sse,
+        };
+        if !requested {
+            return Ok(None);
+        }
+        Ok(Some((self.master()?, vec![(SSE.to_string(), "AES256".to_string())])))
+    }
+
+    /// The key needed to read data stored with `stored` headers. SSE-C requires the request to
+    /// carry the same customer key (`prefix` is "x-amz-", or "x-amz-copy-source-" for copy sources).
+    fn read_key(&self, stored: &[(String, String)], h: &HeaderMap, prefix: &str) -> S3Result<Option<WrapKey>> {
+        let get = |name: &str| stored.iter().find(|(k, _)| k == name).map(|(_, v)| v.as_str());
+        if let Some(md5) = get(SSE_C_MD5) {
+            let hdr = |n: &str| header(h, &format!("{prefix}server-side-encryption-customer-{n}"));
+            let (Some(_), Some(k)) = (hdr("algorithm"), hdr("key")) else {
+                return Err(err::InvalidRequest().with_message(
+                    "The object was stored using a form of Server Side Encryption. The correct parameters must be provided to retrieve the object.",
+                ));
+            };
+            let key = crypt::parse_customer_key(k, hdr("key-md5"))?;
+            if crypt::key_md5_b64(&key) != md5 {
+                return Err(err::AccessDenied().with_message("The provided customer key does not match the object's key."));
+            }
+            return Ok(Some(WrapKey::new(KeyKind::Customer, key)));
+        }
+        if get(SSE).is_some() {
+            return Ok(Some(
+                self.master_key
+                    .clone()
+                    .ok_or_else(|| S3Error::internal("object is encrypted but no --encryption-key is configured"))?,
+            ));
+        }
+        Ok(None)
+    }
+
     /// The current object, or a specific version when `version` is given.
     fn lookup(&self, bucket: &str, key: &str, version: Option<&str>) -> S3Result<(ObjectMeta, Option<Bytes>)> {
         match version {
@@ -1174,7 +1279,7 @@ impl Server {
                 })
                 .map(|a| (*a, None));
         }
-        Ok(Expect { len, max_len, sha256, md5, checksum, allow_inline })
+        Ok(Expect { len, max_len, sha256, md5, checksum, allow_inline, encrypt: None })
     }
 
     async fn put_object(&self, r: &mut Req, bucket: &str, key: &str) -> S3Result<Resp> {
@@ -1182,16 +1287,20 @@ impl Server {
         // inline in the metadata database (which would otherwise only ever grow).
         let versioned = self.bucket_access(bucket)?.versioning == store::Versioning::Enabled;
         let tags = request_tags(r)?;
-        let expect = self.expect(r, MAX_OBJECT_SIZE, !versioned)?;
+        let enc = self.write_encryption(&r.parts.headers, bucket, None)?;
+        let mut expect = self.expect(r, MAX_OBJECT_SIZE, !versioned)?;
+        expect.encrypt = enc.as_ref().map(|(k, _)| k.clone());
         let body = std::mem::replace(&mut r.body, BodyStream::empty());
         let ing = io::ingest(&self.store, body, expect).await?;
+        let mut headers = stored_headers(&r.parts.headers);
+        headers.extend(enc.map(|(_, h)| h).unwrap_or_default());
         self.metrics.add_bytes_in(ing.size);
         let (storage, inline, files) = ing.storage();
         let meta = ObjectMeta {
             size: ing.size,
             mtime_ms: now_ms(),
             etag: ing.etag(),
-            headers: stored_headers(&r.parts.headers),
+            headers: headers.clone(),
             checksum: ing.checksum.clone(),
             storage,
             tags,
@@ -1204,6 +1313,7 @@ impl Server {
             self.store.submit_owning(Op::PutObject { bucket: bucket.into(), key: key.into(), meta, inline, cond }, files).await?;
         let mut resp = Resp::ok();
         resp.set("etag", &ing.etag());
+        set_sse_headers(&mut resp, &headers);
         if let OpOut::Object(m) = &out {
             set_version_header(&mut resp, m);
         }
@@ -1286,10 +1396,11 @@ impl Server {
                 }
             };
             resp.set("content-length", &len.to_string());
+            let key = self.read_key(&meta.headers, h, "x-amz-")?;
             if head {
                 return Ok(resp);
             }
-            match io::read_body(&self.store, &meta, inline, start, len).await {
+            match io::read_body(&self.store, &meta, inline, start, len, key).await {
                 Ok(body) => {
                     self.metrics.add_bytes_out(len);
                     resp.body = body;
@@ -1332,24 +1443,42 @@ impl Server {
         let dest_versioned = self.bucket_access(bucket)?.versioning == store::Versioning::Enabled;
         let replace = r.header("x-amz-metadata-directive").is_some_and(|d| d.eq_ignore_ascii_case("REPLACE"));
         let replace_tags = r.header("x-amz-tagging-directive").is_some_and(|d| d.eq_ignore_ascii_case("REPLACE"));
+        let dst_enc = self.write_encryption(&r.parts.headers, bucket, None)?;
+        let dst_key = dst_enc.as_ref().map(|(k, _)| k.clone());
         let _ = r.body.read_all(MAX_XML_BODY).await?;
         for attempt in 0..3 {
             let (src, inline) = self.lookup(&sb, &sk, sv.as_deref())?;
             check_copy_conditions(&r.parts.headers, &src)?;
+            let src_key = self.read_key(&src.headers, &r.parts.headers, "x-amz-copy-source-")?;
+            // Stored bytes can be shared only when they are readable with the destination's key.
+            let same_key = match (&src_key, &dst_key) {
+                (None, None) => true,
+                (Some(a), Some(b)) => a.same(b),
+                _ => false,
+            };
             if sb == bucket && sk == key && !replace && sv.is_none() {
                 return Err(err::InvalidRequest().with_message(
                     "This copy request is illegal because it is trying to copy an object to itself without changing the object's metadata, storage class, website redirect location or encryption attributes.",
                 ));
             }
             let (storage, files) = match &src.storage {
-                // Versioned buckets keep small objects in files (see put_object).
-                Storage::Inline(_) if dest_versioned => {
+                // Re-encrypting, or versioned buckets (which keep small objects in files): write
+                // a new data file from the plaintext.
+                Storage::Inline(_) | Storage::Segments(_)
+                    if !same_key || (dest_versioned && matches!(src.storage, Storage::Inline(_))) =>
+                {
                     let (st, src2, data, size) = (self.store.clone(), src.clone(), inline.clone(), src.size);
-                    let (id, _) =
-                        tokio::task::spawn_blocking(move || io::copy_range_blocking(&st, &src2, data.as_ref(), 0, size))
-                            .await
-                            .map_err(S3Error::internal)??;
-                    (Storage::Segments(vec![(id, size)]), vec![id])
+                    let (sk2, dk2) = (src_key.clone(), dst_key.clone());
+                    let res = tokio::task::spawn_blocking(move || {
+                        io::copy_range_blocking(&st, &src2, data.as_ref(), 0, size, sk2.as_ref(), dk2.as_ref())
+                    })
+                    .await
+                    .map_err(S3Error::internal)?;
+                    match res {
+                        Ok((id, _)) => (Storage::Segments(vec![(id, size)]), vec![id]),
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound && attempt < 2 => continue,
+                        Err(e) => return Err(e.into()),
+                    }
                 }
                 Storage::Inline(_) => (Storage::Inline(util::new_id()), vec![]),
                 Storage::Segments(segs) => {
@@ -1367,7 +1496,8 @@ impl Server {
                     }
                 }
             };
-            let headers = if replace { stored_headers(&r.parts.headers) } else { src.headers.clone() };
+            let mut headers = if replace { stored_headers(&r.parts.headers) } else { without_sse(&src.headers) };
+            headers.extend(dst_enc.as_ref().map(|(_, h)| h.clone()).unwrap_or_default());
             let tags = if replace_tags { request_tags(r)? } else { src.tags.clone() };
             let meta = ObjectMeta {
                 size: src.size,
@@ -1400,6 +1530,7 @@ impl Server {
                 x.elem(tag, v);
             }
             let mut resp = Resp::xml(x.finish("CopyObjectResult"));
+            set_sse_headers(&mut resp, dst_enc.as_ref().map(|(_, h)| h.as_slice()).unwrap_or(&[]));
             if let Some(v) = src.version.as_deref().or(sv.as_deref()) {
                 resp.set("x-amz-copy-source-version-id", v);
             }
@@ -1415,17 +1546,17 @@ impl Server {
         let _ = r.body.read_all(MAX_XML_BODY).await?;
         let id = util::new_id();
         let tags = request_tags(r)?;
-        let meta = UploadMeta {
-            bucket: bucket.into(),
-            key: key.into(),
-            initiated_ms: now_ms(),
-            headers: stored_headers(&r.parts.headers),
-            tags,
-        };
+        // The upload's encryption applies to every part and to the completed object.
+        let enc = self.write_encryption(&r.parts.headers, bucket, None)?;
+        let mut headers = stored_headers(&r.parts.headers);
+        headers.extend(enc.map(|(_, h)| h).unwrap_or_default());
+        let meta = UploadMeta { bucket: bucket.into(), key: key.into(), initiated_ms: now_ms(), headers: headers.clone(), tags };
         self.store.submit(Op::CreateUpload { id, meta }).await?;
         let mut x = Xml::new("InitiateMultipartUploadResult");
         x.elem("Bucket", bucket).elem("Key", key).elem("UploadId", util::id_hex(id));
-        Ok(Resp::xml(x.finish("InitiateMultipartUploadResult")))
+        let mut resp = Resp::xml(x.finish("InitiateMultipartUploadResult"));
+        set_sse_headers(&mut resp, &headers);
+        Ok(resp)
     }
 
     async fn upload_part(&self, r: &mut Req, bucket: &str, key: &str) -> S3Result<Resp> {
@@ -1434,12 +1565,15 @@ impl Server {
             r.q("partNumber").and_then(|p| p.parse().ok()).filter(|p| (1..=MAX_PARTS).contains(p)).ok_or_else(|| {
                 err::InvalidArgument().with_message("Part number must be an integer between 1 and 10000, inclusive")
             })?;
-        self.store.get_upload(upload)?.filter(|u| u.bucket == bucket && u.key == key).ok_or_else(err::NoSuchUpload)?;
+        let u = self.store.get_upload(upload)?.filter(|u| u.bucket == bucket && u.key == key).ok_or_else(err::NoSuchUpload)?;
+        // Parts are encrypted like the upload: master key, or the same customer key every time.
+        let part_key = self.read_key(&u.headers, &r.parts.headers, "x-amz-")?;
 
         if r.header("x-amz-copy-source").is_some() {
-            return self.upload_part_copy(r, bucket, key, upload, part).await;
+            return self.upload_part_copy(r, bucket, key, upload, part, part_key, &u.headers).await;
         }
-        let expect = self.expect(r, MAX_PART_SIZE, false)?;
+        let mut expect = self.expect(r, MAX_PART_SIZE, false)?;
+        expect.encrypt = part_key;
         let body = std::mem::replace(&mut r.body, BodyStream::empty());
         let ing = io::ingest(&self.store, body, expect).await?;
         self.metrics.add_bytes_in(ing.size);
@@ -1448,13 +1582,24 @@ impl Server {
         self.store.submit_owning(Op::PutPart { upload, bucket: bucket.into(), key: key.into(), part, meta }, vec![file]).await?;
         let mut resp = Resp::ok();
         resp.set("etag", &format!("\"{}\"", util::hex(&ing.md5)));
+        set_sse_headers(&mut resp, &u.headers);
         if let Some((a, v)) = &ing.checksum {
             resp.set(a.header(), v);
         }
         Ok(resp)
     }
 
-    async fn upload_part_copy(&self, r: &mut Req, bucket: &str, key: &str, upload: u128, part: u32) -> S3Result<Resp> {
+    #[allow(clippy::too_many_arguments)]
+    async fn upload_part_copy(
+        &self,
+        r: &mut Req,
+        bucket: &str,
+        key: &str,
+        upload: u128,
+        part: u32,
+        part_key: Option<WrapKey>,
+        upload_headers: &[(String, String)],
+    ) -> S3Result<Resp> {
         let (sb, sk, sv) = self.copy_source(r)?;
         let _ = r.body.read_all(MAX_XML_BODY).await?;
         for attempt in 0..3 {
@@ -1477,11 +1622,13 @@ impl Server {
             if len > MAX_PART_SIZE {
                 return Err(err::EntityTooLarge());
             }
-            let st = self.store.clone();
-            let src2 = src.clone();
-            let res = tokio::task::spawn_blocking(move || io::copy_range_blocking(&st, &src2, inline.as_ref(), start, len))
-                .await
-                .map_err(S3Error::internal)?;
+            let src_key = self.read_key(&src.headers, &r.parts.headers, "x-amz-copy-source-")?;
+            let (st, src2, dk) = (self.store.clone(), src.clone(), part_key.clone());
+            let res = tokio::task::spawn_blocking(move || {
+                io::copy_range_blocking(&st, &src2, inline.as_ref(), start, len, src_key.as_ref(), dk.as_ref())
+            })
+            .await
+            .map_err(S3Error::internal)?;
             let (file, md5) = match res {
                 Ok(v) => v,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound && attempt < 2 => continue,
@@ -1494,7 +1641,9 @@ impl Server {
                 .await?;
             let mut x = Xml::new("CopyPartResult");
             x.elem("LastModified", iso8601(mtime)).elem("ETag", format!("\"{}\"", util::hex(&md5)));
-            return Ok(Resp::xml(x.finish("CopyPartResult")));
+            let mut resp = Resp::xml(x.finish("CopyPartResult"));
+            set_sse_headers(&mut resp, upload_headers);
+            return Ok(resp);
         }
         Err(err::NoSuchKey())
     }
@@ -1553,11 +1702,22 @@ impl Server {
         {
             headers.push(("content-type".into(), ct.clone()));
         }
+        if f.keys().any(|k| k.starts_with(SSE_C_ALG.trim_end_matches("algorithm"))) {
+            return Err(err::NotImplemented().with_message("SSE-C is not supported for POST uploads"));
+        }
+        let enc = self.write_encryption(&HeaderMap::new(), bucket, f.get(SSE).map(String::as_str))?;
+        headers.retain(|(k, _)| !k.starts_with(SSE));
+        headers.extend(enc.as_ref().map(|(_, h)| h.clone()).unwrap_or_default());
         headers.sort();
 
         let (min, max) = range.unwrap_or((0, MAX_OBJECT_SIZE));
         let versioned = self.bucket_access(bucket)?.versioning == store::Versioning::Enabled;
-        let expect = Expect { max_len: max.min(MAX_OBJECT_SIZE), allow_inline: !versioned, ..Default::default() };
+        let expect = Expect {
+            max_len: max.min(MAX_OBJECT_SIZE),
+            allow_inline: !versioned,
+            encrypt: enc.map(|(k, _)| k),
+            ..Default::default()
+        };
         let ing = io::ingest(&self.store, file, expect).await?;
         let (storage, inline, files) = ing.storage();
         if ing.size < min {
@@ -1733,6 +1893,26 @@ fn request_tags(r: &Req) -> S3Result<Vec<(String, String)>> {
 fn form_key(key: &str, filename: Option<&str>) -> String {
     let base = filename.map(|f| f.rsplit(['/', '\\']).next().unwrap_or(f)).unwrap_or("");
     key.replace("${filename}", base)
+}
+
+/// Encryption chosen for a write: the wrapping key and the headers stored with the object.
+type Encryption = Option<(WrapKey, Vec<(String, String)>)>;
+
+const SSE: &str = "x-amz-server-side-encryption";
+const SSE_C_ALG: &str = "x-amz-server-side-encryption-customer-algorithm";
+const SSE_C_MD5: &str = "x-amz-server-side-encryption-customer-key-md5";
+
+fn without_sse(h: &[(String, String)]) -> Vec<(String, String)> {
+    h.iter().filter(|(k, _)| !k.starts_with(SSE)).cloned().collect()
+}
+
+/// Echo the encryption headers of a write back to the client.
+fn set_sse_headers(resp: &mut Resp, stored: &[(String, String)]) {
+    for (k, v) in stored {
+        if k.starts_with(SSE) {
+            resp.set(k, v);
+        }
+    }
 }
 
 /// `x-amz-version-id` for responses about an object version (absent for unversioned objects).

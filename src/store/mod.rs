@@ -30,7 +30,7 @@ const PARTS: TableDefinition<(u128, u32), &[u8]> = TableDefinition::new("parts")
 const CONFIG: TableDefinition<(&str, &str), &[u8]> = TableDefinition::new("bucket_config");
 
 /// Kinds of bucket configuration stored in `CONFIG`.
-pub const CONFIG_KINDS: &[&str] = &["acl", "policy", "cors", "tagging", "lifecycle", "versioning"];
+pub const CONFIG_KINDS: &[&str] = &["acl", "policy", "cors", "tagging", "lifecycle", "versioning", "encryption"];
 /// Noncurrent object versions and delete markers: `bucket \0 key \0 (u64::MAX - seq)` -> meta.
 /// Keys sort newest-first within an object. The current version of a key always lives in
 /// OBJECTS (if it is not a delete marker), so unversioned reads never touch this table.

@@ -6,6 +6,7 @@
 use crate::auth::Payload;
 use crate::body::Body;
 use crate::chunked::ChunkDecoder;
+use crate::crypt::{self, WrapKey};
 use crate::error::{S3Error, S3Result, err};
 use crate::store::Store;
 use crate::store::meta::{ChecksumAlgo, ObjectMeta, Storage};
@@ -171,6 +172,8 @@ pub struct Expect {
     pub checksum: Option<(ChecksumAlgo, Option<String>)>,
     /// Allow small bodies to be stored inline in the metadata database.
     pub allow_inline: bool,
+    /// Encrypt the stored bytes with a fresh data key wrapped by this key.
+    pub encrypt: Option<WrapKey>,
 }
 
 struct Hashers {
@@ -284,7 +287,11 @@ pub async fn ingest(store: &Arc<Store>, mut body: impl Source, e: Expect) -> S3R
                     h.update(&buf);
                     let size = buf.len() as u64;
                     let (md5, checksum) = verify(h, size, &e, &body)?;
-                    return Ok(Ingested { size, md5, checksum, data: Data::Inline(buf.freeze()) });
+                    let data = match &e.encrypt {
+                        Some(k) => Bytes::from(crypt::encrypt_all(k, &buf)),
+                        None => buf.freeze(),
+                    };
+                    return Ok(Ingested { size, md5, checksum, data: Data::Inline(data) });
                 }
                 Some(b) => {
                     buf.extend_from_slice(&b);
@@ -303,13 +310,27 @@ pub async fn ingest(store: &Arc<Store>, mut body: impl Source, e: Expect) -> S3R
     let (tx, mut rx) = mpsc::channel::<Bytes>(4);
     let mut hashers = Hashers::new(&e);
     let tmp2 = tmp.clone();
+    let mut encryptor = e.encrypt.as_ref().map(crypt::Encryptor::new);
     let writer = tokio::task::spawn_blocking(move || -> io::Result<(Hashers, u64)> {
         let mut f = File::create(&tmp2)?;
         let mut n = 0u64;
+        let mut sealed = Vec::new();
         while let Some(b) = rx.blocking_recv() {
             hashers.update(&b);
-            f.write_all(&b)?;
+            match &mut encryptor {
+                Some(enc) => {
+                    sealed.clear();
+                    enc.update(&b, &mut sealed);
+                    f.write_all(&sealed)?;
+                }
+                None => f.write_all(&b)?,
+            }
             n += b.len() as u64;
+        }
+        if let Some(enc) = encryptor {
+            sealed.clear();
+            enc.finish(&mut sealed);
+            f.write_all(&sealed)?;
         }
         if fsync {
             f.sync_data()?;
@@ -386,8 +407,8 @@ fn install(store: &Store, tmp: &std::path::Path, id: u128) -> io::Result<()> {
 
 // ------------------------------------------------------------------ object reads
 
-/// (file id, offset within file, length) pieces covering `[start, start+len)`.
-fn plan(segs: &[(u128, u64)], start: u64, len: u64) -> Vec<(u128, u64, u64)> {
+/// (file id, offset within segment, length, segment length) pieces covering `[start, start+len)`.
+fn plan(segs: &[(u128, u64)], start: u64, len: u64) -> Vec<(u128, u64, u64, u64)> {
     let mut out = Vec::new();
     let end = start + len;
     let mut pos = 0u64;
@@ -402,17 +423,9 @@ fn plan(segs: &[(u128, u64)], start: u64, len: u64) -> Vec<(u128, u64, u64)> {
         }
         let from = start.max(s);
         let to = end.min(e);
-        out.push((id, from - s, to - from));
+        out.push((id, from - s, to - from, slen));
     }
     out
-}
-
-fn open_at(store: &Store, id: u128, off: u64) -> io::Result<File> {
-    let mut f = File::open(store.data_path(id))?;
-    if off > 0 {
-        f.seek(SeekFrom::Start(off))?;
-    }
-    Ok(f)
 }
 
 fn read_exact_into(f: &mut File, n: u64, out: &mut Vec<u8>) -> io::Result<()> {
@@ -424,15 +437,68 @@ fn read_exact_into(f: &mut File, n: u64, out: &mut Vec<u8>) -> io::Result<()> {
     Ok(())
 }
 
+fn crypto_io(e: S3Error) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, e.message)
+}
+
+/// Reads plaintext from one data file (one segment), decrypting when it is encrypted.
+struct SegReader {
+    f: File,
+    cipher: Option<aes_gcm::Aes256Gcm>,
+    seg_len: u64,
+    scratch: Vec<u8>,
+}
+
+impl SegReader {
+    fn open(store: &Store, id: u128, seg_len: u64, key: Option<&WrapKey>) -> io::Result<Self> {
+        let mut f = File::open(store.data_path(id))?;
+        let cipher = match key {
+            Some(k) => {
+                let mut h = [0u8; crypt::HEADER];
+                f.read_exact(&mut h)?;
+                Some(crypt::open_header(&h, k).map_err(crypto_io)?)
+            }
+            None => None,
+        };
+        Ok(SegReader { f, cipher, seg_len, scratch: Vec::new() })
+    }
+
+    /// Append plaintext `[off, off+n)` of this segment to `out`.
+    fn read(&mut self, off: u64, n: u64, out: &mut Vec<u8>) -> io::Result<()> {
+        match &self.cipher {
+            None => {
+                self.f.seek(SeekFrom::Start(off))?;
+                read_exact_into(&mut self.f, n, out)
+            }
+            Some(c) => {
+                let (first, coff, span) = crypt::cipher_span(off, n, self.seg_len);
+                self.f.seek(SeekFrom::Start(coff))?;
+                self.scratch.clear();
+                read_exact_into(&mut self.f, span, &mut self.scratch)?;
+                crypt::decrypt_span(c, first, &mut self.scratch, off, n, self.seg_len, out).map_err(crypto_io)
+            }
+        }
+    }
+}
+
+/// Plaintext `[start, start+len)` of an inline object.
+fn inline_range(data: &Bytes, key: Option<&WrapKey>, start: u64, len: u64, total: u64) -> S3Result<Bytes> {
+    match key {
+        Some(k) => Ok(Bytes::from(crypt::decrypt_range(k, data, start, len, total)?)),
+        None => Ok(data.slice(start as usize..(start + len) as usize)),
+    }
+}
+
 /// Produce a response body for `[start, start+len)` of an object. Returns `NotFound` io errors
 /// (as `Err(None)`) when a data file vanished because the object was concurrently replaced, so
-/// the caller can re-read the metadata and retry.
+/// the caller can re-read the metadata and retry. `key` decrypts encrypted objects.
 pub async fn read_body(
     store: &Arc<Store>,
     meta: &ObjectMeta,
     inline: Option<Bytes>,
     start: u64,
     len: u64,
+    key: Option<WrapKey>,
 ) -> Result<Body, Option<S3Error>> {
     if len == 0 {
         return Ok(Body::Empty);
@@ -440,7 +506,7 @@ pub async fn read_body(
     let segs = match &meta.storage {
         Storage::Inline(_) => {
             let data = inline.ok_or_else(|| Some(S3Error::internal("inline data missing")))?;
-            return Ok(Body::full(data.slice(start as usize..(start + len) as usize)));
+            return Ok(Body::full(inline_range(&data, key.as_ref(), start, len, meta.size).map_err(Some)?));
         }
         Storage::Segments(s) => s,
     };
@@ -451,8 +517,8 @@ pub async fn read_body(
     if len <= SMALL_READ {
         let data = tokio::task::spawn_blocking(move || -> io::Result<Vec<u8>> {
             let mut out = Vec::with_capacity(len as usize);
-            for (id, off, n) in pieces {
-                read_exact_into(&mut open_at(&st, id, off)?, n, &mut out)?;
+            for (id, off, n, slen) in pieces {
+                SegReader::open(&st, id, slen, key.as_ref())?.read(off, n, &mut out)?;
             }
             Ok(out)
         })
@@ -466,9 +532,9 @@ pub async fn read_body(
     let (ready_tx, ready_rx) = oneshot::channel::<io::Result<()>>();
     tokio::task::spawn_blocking(move || {
         let mut ready = Some(ready_tx);
-        for (id, off, mut n) in pieces {
-            let mut f = match open_at(&st, id, off) {
-                Ok(f) => f,
+        for (id, mut off, mut n, slen) in pieces {
+            let mut r = match SegReader::open(&st, id, slen, key.as_ref()) {
+                Ok(r) => r,
                 Err(e) => {
                     match ready.take() {
                         Some(r) => _ = r.send(Err(e)),
@@ -483,10 +549,11 @@ pub async fn read_body(
             while n > 0 {
                 let want = n.min(READ_CHUNK as u64);
                 let mut buf = Vec::with_capacity(want as usize);
-                if let Err(e) = read_exact_into(&mut f, want, &mut buf) {
+                if let Err(e) = r.read(off, want, &mut buf) {
                     let _ = tx.blocking_send(Err(e));
                     return;
                 }
+                off += want;
                 n -= want;
                 if tx.blocking_send(Ok(Bytes::from(buf))).is_err() {
                     return; // client went away
@@ -501,40 +568,60 @@ pub async fn read_body(
     }
 }
 
-/// Copy `[start, start+len)` of an object into a new data file. Returns (file id, md5).
+/// Copy plaintext `[start, start+len)` of an object into a new data file, decrypting with
+/// `src_key` and (re-)encrypting with `dst_key` as needed. Returns (file id, md5 of plaintext).
 pub fn copy_range_blocking(
     store: &Store,
     meta: &ObjectMeta,
     inline: Option<&Bytes>,
     start: u64,
     len: u64,
+    src_key: Option<&WrapKey>,
+    dst_key: Option<&WrapKey>,
 ) -> io::Result<(u128, [u8; 16])> {
     let id = util::new_id();
     let tmp = store.tmp_path(id);
     let res = (|| {
         let mut out = File::create(&tmp)?;
         let mut md5 = Md5::new();
+        let mut enc = dst_key.map(crypt::Encryptor::new);
+        let mut sealed = Vec::new();
+        let mut emit = |plain: &[u8], out: &mut File| -> io::Result<()> {
+            md5.update(plain);
+            match &mut enc {
+                Some(e) => {
+                    sealed.clear();
+                    e.update(plain, &mut sealed);
+                    out.write_all(&sealed)
+                }
+                None => out.write_all(plain),
+            }
+        };
         match &meta.storage {
             Storage::Inline(_) => {
                 let data = inline.ok_or_else(|| io::Error::other("inline data missing"))?;
-                let d = &data[start as usize..(start + len) as usize];
-                md5.update(d);
-                out.write_all(d)?;
+                let plain = inline_range(data, src_key, start, len, meta.size).map_err(crypto_io)?;
+                emit(&plain, &mut out)?;
             }
             Storage::Segments(segs) => {
                 let mut buf = Vec::with_capacity(READ_CHUNK);
-                for (fid, off, mut n) in plan(segs, start, len) {
-                    let mut f = open_at(store, fid, off)?;
+                for (fid, mut off, mut n, slen) in plan(segs, start, len) {
+                    let mut r = SegReader::open(store, fid, slen, src_key)?;
                     while n > 0 {
                         let want = n.min(READ_CHUNK as u64);
                         buf.clear();
-                        read_exact_into(&mut f, want, &mut buf)?;
-                        md5.update(&buf);
-                        out.write_all(&buf)?;
+                        r.read(off, want, &mut buf)?;
+                        emit(&buf, &mut out)?;
+                        off += want;
                         n -= want;
                     }
                 }
             }
+        }
+        if let Some(e) = enc {
+            sealed.clear();
+            e.finish(&mut sealed);
+            out.write_all(&sealed)?;
         }
         if store.fsync {
             out.sync_data()?;
@@ -582,9 +669,9 @@ mod tests {
     #[test]
     fn plan_ranges() {
         let segs = [(1, 10), (2, 10), (3, 5)];
-        assert_eq!(plan(&segs, 0, 25), vec![(1, 0, 10), (2, 0, 10), (3, 0, 5)]);
-        assert_eq!(plan(&segs, 5, 10), vec![(1, 5, 5), (2, 0, 5)]);
-        assert_eq!(plan(&segs, 20, 2), vec![(3, 0, 2)]);
-        assert_eq!(plan(&segs, 10, 10), vec![(2, 0, 10)]);
+        assert_eq!(plan(&segs, 0, 25), vec![(1, 0, 10, 10), (2, 0, 10, 10), (3, 0, 5, 5)]);
+        assert_eq!(plan(&segs, 5, 10), vec![(1, 5, 5, 10), (2, 0, 5, 10)]);
+        assert_eq!(plan(&segs, 20, 2), vec![(3, 0, 2, 5)]);
+        assert_eq!(plan(&segs, 10, 10), vec![(2, 0, 10, 10)]);
     }
 }

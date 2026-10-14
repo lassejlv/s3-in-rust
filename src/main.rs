@@ -4,6 +4,7 @@ mod access;
 mod auth;
 mod body;
 mod chunked;
+mod crypt;
 mod error;
 mod io;
 mod lifecycle;
@@ -47,6 +48,11 @@ OPTIONS (each also settable through the environment variable shown):
         --cors-origins <LIST>    Comma-separated origins allowed by default for buckets
                                  without their own CORS configuration, e.g. `*`
                                                                  [S3RS_CORS_ORIGINS]
+        --encryption-key <K>     Master key for server-side encryption (SSE-S3): 64 hex chars
+                                 or base64 (e.g. from `openssl rand -hex 32`)
+                                                                 [S3RS_ENCRYPTION_KEY]
+        --encryption-key-file <P> Read the master key from a file
+        --encrypt-by-default     Encrypt every new object with the master key
         --metrics-token <T>      Require `Authorization: Bearer <T>` for /_metrics
                                                                  [S3RS_METRICS_TOKEN]
         --region <REGION>        Region reported to clients      [S3RS_REGION, default us-east-1]
@@ -70,6 +76,8 @@ struct Config {
     anonymous: bool,
     cors_origins: Vec<String>,
     metrics_token: Option<String>,
+    encryption_key: Option<[u8; 32]>,
+    encrypt_by_default: bool,
     region: String,
     domain: Option<String>,
     inline_threshold: usize,
@@ -95,6 +103,11 @@ fn parse_args() -> Result<Config, String> {
         anonymous: false,
         cors_origins: env("S3RS_CORS_ORIGINS").map(|v| split_list(&v)).unwrap_or_default(),
         metrics_token: env("S3RS_METRICS_TOKEN"),
+        encryption_key: env("S3RS_ENCRYPTION_KEY")
+            .map(|k| parse_key(&k))
+            .transpose()
+            .map_err(|e| format!("S3RS_ENCRYPTION_KEY: {e}"))?,
+        encrypt_by_default: false,
         region: env("S3RS_REGION").unwrap_or_else(|| "us-east-1".into()),
         domain: env("S3RS_DOMAIN"),
         inline_threshold: env("S3RS_INLINE_THRESHOLD")
@@ -126,6 +139,13 @@ fn parse_args() -> Result<Config, String> {
             "--anonymous" => c.anonymous = true,
             "--cors-origins" => c.cors_origins = split_list(&val()?),
             "--metrics-token" => c.metrics_token = Some(val()?),
+            "--encryption-key" => c.encryption_key = Some(parse_key(&val()?).map_err(|e| format!("--encryption-key: {e}"))?),
+            "--encryption-key-file" => {
+                let path = val()?;
+                let text = std::fs::read_to_string(&path).map_err(|e| format!("--encryption-key-file {path}: {e}"))?;
+                c.encryption_key = Some(parse_key(text.trim()).map_err(|e| format!("--encryption-key-file {path}: {e}"))?);
+            }
+            "--encrypt-by-default" => c.encrypt_by_default = true,
             "--region" => c.region = val()?,
             "--domain" => c.domain = Some(val()?),
             "--inline-threshold" => c.inline_threshold = val()?.parse().map_err(|e| format!("--inline-threshold: {e}"))?,
@@ -141,6 +161,15 @@ fn parse_args() -> Result<Config, String> {
         }
     }
     Ok(c)
+}
+
+/// A 256-bit key given as 64 hex characters or base64.
+fn parse_key(s: &str) -> Result<[u8; 32], String> {
+    let s = s.trim();
+    let bytes = if s.len() == 64 { util::unhex(s) } else { util::unbase64(s) };
+    bytes
+        .and_then(|b| <[u8; 32]>::try_from(b).ok())
+        .ok_or_else(|| "expected a 256-bit key as 64 hex characters or base64 (e.g. `openssl rand -hex 32`)".to_string())
 }
 
 fn split_list(s: &str) -> Vec<String> {
@@ -209,6 +238,11 @@ fn main() {
         std::process::exit(2);
     };
 
+    if cfg.encrypt_by_default && cfg.encryption_key.is_none() {
+        eprintln!("error: --encrypt-by-default requires --encryption-key");
+        std::process::exit(2);
+    }
+
     let store = match store::Store::open(store::StoreConfig {
         root: cfg.data_dir.clone(),
         fsync: cfg.fsync,
@@ -241,6 +275,8 @@ async fn serve(cfg: Config, store: Arc<store::Store>, auth: Option<auth::Auth>) 
         verbose: cfg.verbose,
         cors_origins: cfg.cors_origins.clone(),
         metrics_token: cfg.metrics_token.clone(),
+        master_key: cfg.encryption_key,
+        encrypt_by_default: cfg.encrypt_by_default,
     };
     let server = Arc::new(s3::Server::new(store.clone(), auth, opts));
     if cfg.lifecycle_interval > 0 {
@@ -252,12 +288,17 @@ async fn serve(cfg: Config, store: Arc<store::Store>, auth: Option<auth::Auth>) 
         ));
     }
     eprintln!(
-        "s3rs listening on http://{} (data: {}, region: {}, auth: {}, fsync: {})",
+        "s3rs listening on http://{} (data: {}, region: {}, auth: {}, fsync: {}, encryption: {})",
         cfg.listen,
         cfg.data_dir.display(),
         cfg.region,
         if anonymous { "DISABLED" } else { "sigv4" },
-        cfg.fsync
+        cfg.fsync,
+        match (cfg.encryption_key.is_some(), cfg.encrypt_by_default) {
+            (false, _) => "SSE-C only",
+            (true, false) => "SSE-S3 + SSE-C",
+            (true, true) => "all objects (SSE-S3 default)",
+        }
     );
 
     let mut builder = auto::Builder::new(TokioExecutor::new());

@@ -55,6 +55,9 @@ Each flag can also be set with the environment variable shown.
 | `--cors-origins` | `S3RS_CORS_ORIGINS` | | Comma-separated origins (e.g. `*`) allowed for buckets that have no CORS configuration of their own |
 | `--metrics-token` | `S3RS_METRICS_TOKEN` | | Requires `Authorization: Bearer <token>` on `/_metrics` |
 | `--lifecycle-interval` | `S3RS_LIFECYCLE_INTERVAL` | `3600` | Seconds between lifecycle sweeps. `0` turns lifecycle off. |
+| `--encryption-key` | `S3RS_ENCRYPTION_KEY` | | Master key for SSE-S3, as 64 hex characters or base64 (e.g. `openssl rand -hex 32`) |
+| `--encryption-key-file` | | | Reads the master key from a file |
+| `--encrypt-by-default` | | off | Encrypts every new object with the master key |
 | `--region` | `S3RS_REGION` | `us-east-1` | Region reported to clients |
 | `--domain` | `S3RS_DOMAIN` | | Turns on virtual-hosted-style requests (`<bucket>.<domain>`) |
 | `--inline-threshold` | `S3RS_INLINE_THRESHOLD` | `65536` | Objects up to this many bytes are stored inside the metadata DB |
@@ -119,6 +122,39 @@ compare-and-delete: an object overwritten after the sweeper looked at it is kept
 versioning-enabled bucket, expiring the current version adds a delete marker, as S3 does.
 `Transition` actions are accepted but have no effect, since there is only one storage class.
 
+## Encryption at rest
+
+s3rs supports two kinds of server-side encryption.
+
+**SSE-S3** uses a server master key, set with `--encryption-key`:
+- A client requests it per object with `x-amz-server-side-encryption: AES256`.
+- `PutBucketEncryption` makes it the default for a bucket.
+- `--encrypt-by-default` makes it the default for every bucket.
+
+**SSE-C** uses a key the client supplies with every request
+(`x-amz-server-side-encryption-customer-*`):
+- The server never stores the key, only its MD5, which it uses to check later requests.
+- Reads without the key, or with a different key, are refused.
+- SSE-C works without a master key.
+
+How it works:
+- Every encrypted data file (or inline object) has its own random 256-bit data key, encrypted
+  under the master or customer key and stored in a header in the file. Hard-linked copies,
+  multipart parts and old versions therefore need no extra bookkeeping.
+- Data is encrypted in 64 KiB AES-256-GCM chunks. The last chunk is authenticated as last, so
+  truncation, tampering and wrong keys are detected.
+- Range reads decrypt only the chunks they overlap.
+- ETags and checksums are computed on the plaintext, so clients see the same values as without
+  encryption.
+- Copies and UploadPartCopy decrypt with the source's key (`x-amz-copy-source-server-side-encryption-customer-*`
+  for SSE-C sources) and re-encrypt for the destination. When the source and destination keys
+  match, a copy just shares the stored bytes.
+- SSE-KMS is not supported.
+
+Costs on the benchmark machine: 1 MiB GETs run at about 2.4 GiB/s instead of 4.4 GiB/s, and
+small objects lose under 10%. **Keep the master key safe:** without it, SSE-S3 objects cannot be
+read. The key is not stored in the data directory.
+
 ## Versioning
 
 `PutBucketVersioning` and `GetBucketVersioning` support `Enabled` and `Suspended`, with S3's
@@ -155,8 +191,8 @@ direct uploads from web apps.
 
 | Area | Operations |
 |---|---|
-| Buckets | ListBuckets, CreateBucket (with canned ACL), DeleteBucket, HeadBucket, GetBucketLocation, Get/PutBucketVersioning, Get/PutBucketAcl, Get/Put/DeleteBucketPolicy, GetBucketPolicyStatus, Get/Put/DeleteBucketCors, Get/Put/DeleteBucketTagging |
-| Objects | PutObject, GetObject, HeadObject, DeleteObject, DeleteObjects, CopyObject (COPY/REPLACE for metadata and tags), Get/Put/DeleteObjectTagging, `x-amz-tagging` on upload, GetObjectAcl |
+| Buckets | ListBuckets, CreateBucket (with canned ACL), DeleteBucket, HeadBucket, GetBucketLocation, Get/PutBucketVersioning, Get/PutBucketAcl, Get/Put/DeleteBucketPolicy, GetBucketPolicyStatus, Get/Put/DeleteBucketCors, Get/Put/DeleteBucketTagging, Get/Put/DeleteBucketEncryption |
+| Objects | PutObject, GetObject, HeadObject, DeleteObject, DeleteObjects, CopyObject (COPY/REPLACE for metadata and tags), Get/Put/DeleteObjectTagging, `x-amz-tagging` on upload, GetObjectAcl, SSE-S3 and SSE-C on every read/write/copy path |
 | Listing | ListObjects (v1), ListObjectsV2, ListObjectVersions (versions and delete markers); prefix, delimiter, pagination, `start-after`, `encoding-type=url` |
 | Multipart | CreateMultipartUpload, UploadPart, UploadPartCopy (with ranges), CompleteMultipartUpload, AbortMultipartUpload, ListParts, ListMultipartUploads |
 | Lifecycle | Get/Put/DeleteBucketLifecycleConfiguration (expiration, abort incomplete uploads) |
@@ -167,7 +203,7 @@ direct uploads from web apps.
 | Auth | SigV4 headers, SigV4 presigned URLs, SigV4 streaming (`STREAMING-AWS4-HMAC-SHA256-PAYLOAD[-TRAILER]`, `STREAMING-UNSIGNED-PAYLOAD-TRAILER`), SigV2 headers and presigned URLs |
 | Transport | HTTP/1.1 keep-alive, HTTP/2 (h2c), path-style and virtual-hosted-style addressing |
 
-Not implemented: per-user IAM policies, server-side encryption, object lock, storage
+Not implemented: per-user IAM policies, SSE-KMS, object lock, storage
 class transitions, website hosting, and SigV4A. These requests return
 `NotImplemented` or the matching "not found" configuration error.
 

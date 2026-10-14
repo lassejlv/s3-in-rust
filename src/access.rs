@@ -472,6 +472,9 @@ pub struct BucketAccess {
     pub default_sse: bool,
     pub policy: Option<Policy>,
     pub cors: Option<Vec<CorsRule>>,
+    /// Object Lock configuration (present = Object Lock enabled).
+    pub lock: Option<crate::lock::BucketLock>,
+    pub website: Option<std::sync::Arc<crate::website::Config>>,
 }
 
 impl BucketAccess {

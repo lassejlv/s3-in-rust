@@ -83,6 +83,10 @@ errors! {
     NoSuchLifecycleConfiguration => NOT_FOUND, "The lifecycle configuration does not exist";
     NoSuchTagSet => NOT_FOUND, "The TagSet does not exist";
     ServerSideEncryptionConfigurationNotFoundError => NOT_FOUND, "The server side encryption configuration was not found";
+    NoSuchVersion => NOT_FOUND, "The specified version does not exist.";
+    NoSuchObjectLockConfiguration => NOT_FOUND, "The specified object does not have a ObjectLock configuration";
+    ObjectLockConfigurationNotFoundError => NOT_FOUND, "Object Lock configuration does not exist for this bucket";
+    NoSuchWebsiteConfiguration => NOT_FOUND, "The specified bucket does not have a website configuration";
     ConditionalRequestConflict => CONFLICT, "A conflicting conditional operation is currently in progress against this resource.";
 }
 

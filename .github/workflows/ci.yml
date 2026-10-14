@@ -44,7 +44,8 @@ jobs:
           # Fast lifecycle sweeps (1s) with 2-second "days" so expiration can be tested.
           S3RS_LIFECYCLE_DAY_SECS=2 ./target/release/s3rs -d /tmp/s3rs-data -l 127.0.0.1:9000 \
             --access-key testkey --secret-key testsecret --credentials-file /tmp/creds \
-            --lifecycle-interval 1 --encryption-key "$(openssl rand -hex 32)" > /tmp/s3rs.log 2>&1 &
+            --lifecycle-interval 1 --encryption-key "$(openssl rand -hex 32)" \
+            --website-listen 127.0.0.1:9001 --website-domain web.localhost > /tmp/s3rs.log 2>&1 &
           for i in $(seq 50); do curl -sf http://127.0.0.1:9000/_health && break; sleep 0.1; done
       - name: boto3 suite
         env:
@@ -55,6 +56,8 @@ jobs:
           S3RS_FAST_LIFECYCLE: "1"
           S3RS_ENCRYPTION: "1"
           S3RS_DATA_DIR: /tmp/s3rs-data
+          S3RS_WEBSITE_ENDPOINT: http://127.0.0.1:9001
+          S3RS_WEBSITE_DOMAIN: web.localhost
         run: python3 tests/e2e.py
       - name: aws-cli smoke test
         env:
@@ -70,6 +73,14 @@ jobs:
           diff -r /tmp/sync /tmp/sync2
           aws $E s3 rm --only-show-errors --recursive s3://cli-test/
           aws $E s3 rb s3://cli-test
+          # Static website: aws s3 website + a public-read bucket, fetched from the website endpoint.
+          aws $E s3 mb s3://cli-site
+          echo '<p>hello site</p>' > /tmp/index.html
+          aws $E s3 cp --only-show-errors --content-type text/html /tmp/index.html s3://cli-site/index.html
+          aws $E s3api put-bucket-acl --bucket cli-site --acl public-read
+          aws $E s3 website s3://cli-site --index-document index.html
+          curl -sf -H 'Host: cli-site.web.localhost' http://127.0.0.1:9001/ | grep -q 'hello site'
+          aws $E s3 rb --force s3://cli-site
       - name: minio-go suite
         working-directory: tests/minio-go
         run: go run .

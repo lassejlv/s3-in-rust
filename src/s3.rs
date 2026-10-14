@@ -6,6 +6,7 @@ use crate::body::Body;
 use crate::crypt::{self, KeyKind, WrapKey};
 use crate::error::{S3Error, S3Result, err};
 use crate::io::{self, BodyStream, Data, Expect};
+use crate::lock;
 use crate::store::meta::{ChecksumAlgo, ObjectMeta, PartMeta, Storage, UploadMeta};
 use crate::store::{self, Op, OpOut, Store, WriteCond, norm_etag};
 use crate::util::{self, base64, http_date, iso8601, now_ms, unbase64, uri_decode, uri_encode};
@@ -38,6 +39,8 @@ pub struct Options {
     pub master_key: Option<[u8; 32]>,
     /// Encrypt every new object with the master key unless the request says otherwise.
     pub encrypt_by_default: bool,
+    /// Website endpoint requests for `<bucket>.<website_domain>` serve that bucket's website.
+    pub website_domain: Option<String>,
 }
 
 pub struct Server {
@@ -56,6 +59,7 @@ pub struct Server {
     metrics_token: Option<String>,
     master_key: Option<WrapKey>,
     encrypt_by_default: bool,
+    website_domain: Option<String>,
     req_counter: AtomicU64,
     rid_base: u64,
 }
@@ -324,6 +328,7 @@ impl Server {
             metrics_token: opts.metrics_token,
             master_key: opts.master_key.map(|k| WrapKey::new(KeyKind::Master, k)),
             encrypt_by_default: opts.encrypt_by_default,
+            website_domain: opts.website_domain,
             req_counter: AtomicU64::new(1),
             rid_base: util::new_id() as u64,
         }
@@ -348,7 +353,14 @@ impl Server {
             .and_then(|d| access::parse_cors(&d).ok());
         let versioning = store::Versioning::parse(self.store.bucket_config(bucket, "versioning")?.as_deref());
         let default_sse = self.store.bucket_config(bucket, "encryption")?.is_some();
-        let a = Arc::new(BucketAccess { acl, policy, cors, versioning, default_sse });
+        let lock = self.store.bucket_config(bucket, "object-lock")?.and_then(|v| lock::BucketLock::from_stored(&v));
+        let website = self
+            .store
+            .bucket_config(bucket, "website")?
+            .and_then(|v| xml::parse(&String::from_utf8_lossy(&v)))
+            .and_then(|d| crate::website::Config::parse(&d).ok())
+            .map(Arc::new);
+        let a = Arc::new(BucketAccess { acl, policy, cors, versioning, default_sse, lock, website });
         let mut cache = self.access_cache.write().unwrap();
         if self.access_gen.load(Ordering::SeqCst) == generation {
             if cache.len() > 10_000 {
@@ -445,15 +457,16 @@ impl Server {
     fn authorize_anonymous(&self, r: &Req, bucket: Option<&str>, key: Option<&str>) -> S3Result<()> {
         let Some(bucket) = bucket else { return Err(err::AccessDenied()) };
         let m = &r.parts.method;
+        let sub = ["acl", "tagging", "retention", "legal-hold"].iter().any(|s| r.has(s));
         let action = match (key, m) {
             (Some(_), &Method::GET) if r.has("uploadId") => "s3:ListMultipartUploadParts",
-            (Some(_), &Method::GET | &Method::HEAD) if !r.has("acl") && !r.has("tagging") => "s3:GetObject",
-            (Some(_), &Method::PUT) if r.header("x-amz-copy-source").is_none() && !r.has("acl") && !r.has("tagging") => {
+            (Some(_), &Method::GET | &Method::HEAD) if !sub => "s3:GetObject",
+            (Some(_), &Method::PUT) if r.header("x-amz-copy-source").is_none() && !sub && !has_lock_headers(&r.parts.headers) => {
                 "s3:PutObject"
             }
             (Some(_), &Method::POST) if r.has("uploads") || r.has("uploadId") => "s3:PutObject",
             (Some(_), &Method::DELETE) if r.has("uploadId") => "s3:AbortMultipartUpload",
-            (Some(_), &Method::DELETE) if !r.has("tagging") => "s3:DeleteObject",
+            (Some(_), &Method::DELETE) if !sub => "s3:DeleteObject",
             (None, &Method::GET) if r.has("location") => "s3:GetBucketLocation",
             (None, &Method::GET) if r.has("uploads") => "s3:ListBucketMultipartUploads",
             (None, &Method::GET | &Method::HEAD)
@@ -530,6 +543,134 @@ impl Server {
         }
         h.insert("server", HeaderValue::from_static("s3rs"));
         out
+    }
+
+    /// Entry point for the static website endpoint (`--website-listen`).
+    pub async fn handle_website(self: Arc<Self>, req: Request<Incoming>) -> Response<Body> {
+        let started = Instant::now();
+        let rid = format!("{:016X}", self.rid_base.wrapping_add(self.req_counter.fetch_add(1, Ordering::Relaxed)));
+        let method = req.method().clone();
+        let path = req.uri().path().to_string();
+        let _inflight = self.metrics.start();
+        let (parts, _body) = req.into_parts();
+        let resp = self.website(&parts, &rid).await;
+        let elapsed = started.elapsed();
+        self.metrics.finish(&method, resp.status.as_u16(), elapsed);
+        if self.verbose {
+            eprintln!("website {method} {path} -> {} ({:.2}ms)", resp.status.as_u16(), elapsed.as_secs_f64() * 1000.0);
+        }
+        let mut out = Response::new(resp.body);
+        *out.status_mut() = resp.status;
+        *out.headers_mut() = resp.headers;
+        let h = out.headers_mut();
+        if let Ok(v) = HeaderValue::from_str(&rid) {
+            h.insert("x-amz-request-id", v);
+        }
+        h.insert("server", HeaderValue::from_static("s3rs"));
+        out
+    }
+
+    async fn website(&self, parts: &Parts, rid: &str) -> Resp {
+        let head = parts.method == Method::HEAD;
+        let page = |e: S3Error| website_error(&e, head, rid);
+        if !matches!(parts.method, Method::GET | Method::HEAD) {
+            return page(err::MethodNotAllowed());
+        }
+        let host_full = header(&parts.headers, "host").or_else(|| parts.uri.authority().map(|a| a.as_str())).unwrap_or("");
+        let host =
+            host_full.rsplit_once(':').filter(|(_, p)| p.chars().all(|c| c.is_ascii_digit())).map_or(host_full, |(h, _)| h);
+        let host = host.to_ascii_lowercase();
+        let bucket = match &self.website_domain {
+            Some(d) => host.strip_suffix(d.as_str()).and_then(|b| b.strip_suffix('.')).filter(|b| !b.is_empty()).unwrap_or(&host),
+            None => &host,
+        };
+        let Some(key) = uri_decode(parts.uri.path(), false) else {
+            return page(err::InvalidArgument().with_message("Invalid URI encoding"));
+        };
+        let key = key.strip_prefix('/').unwrap_or(&key).to_string();
+        let access = match self.bucket_access(bucket) {
+            Ok(a) => a,
+            Err(e) => return page(e),
+        };
+        let Some(cfg) = access.website.clone() else { return page(err::NoSuchWebsiteConfiguration()) };
+        // Behind a TLS-terminating proxy the original scheme arrives in X-Forwarded-Proto.
+        let proto = header(&parts.headers, "x-forwarded-proto")
+            .and_then(|p| p.split(',').next())
+            .map(str::trim)
+            .filter(|p| *p == "https" || *p == "http")
+            .unwrap_or("http");
+        let redirect = |code: u16, location: &str| {
+            let mut r = Resp::new(StatusCode::from_u16(code).unwrap_or(StatusCode::MOVED_PERMANENTLY));
+            r.set("location", location);
+            r
+        };
+        if let Some(all) = &cfg.redirect_all {
+            let pq = parts.uri.path_and_query().map(|p| p.as_str()).unwrap_or("/");
+            return redirect(301, &format!("{}://{}{pq}", all.protocol.as_deref().unwrap_or(proto), all.host));
+        }
+        if let Some(rule) = cfg.rule_for(&key, None) {
+            return redirect(rule.redirect.code, &rule.location(&key, proto, host_full));
+        }
+        let index = cfg.index.as_deref().unwrap_or("index.html");
+        let target = if key.is_empty() || key.ends_with('/') { format!("{key}{index}") } else { key.clone() };
+        let e = match self.website_object(parts, bucket, &target, head, &access).await {
+            Ok(r) => return r,
+            Err(e) => e,
+        };
+        // `/dir` where `dir/<index>` exists: redirect to the "directory".
+        if e.status == StatusCode::NOT_FOUND
+            && !key.is_empty()
+            && !key.ends_with('/')
+            && access.allows_anonymous("s3:GetObject", &format!("arn:aws:s3:::{bucket}/{key}/{index}"))
+            && self.store.get_object(bucket, &format!("{key}/{index}")).is_ok()
+        {
+            return redirect(302, &format!("/{}/", uri_encode(&key, true)));
+        }
+        if let Some(rule) = cfg.rule_for(&key, Some(e.status.as_u16())) {
+            return redirect(rule.redirect.code, &rule.location(&key, proto, host_full));
+        }
+        if let Some(doc) = &cfg.error_document
+            && matches!(e.status, StatusCode::NOT_FOUND | StatusCode::FORBIDDEN)
+        {
+            // Served without the request's conditional / range headers, with the original status.
+            let mut plain = Request::new(()).into_parts().0;
+            plain.method = parts.method.clone();
+            if let Ok(mut r) = self.website_object(&plain, bucket, doc, head, &access).await
+                && r.status == StatusCode::OK
+            {
+                r.status = e.status;
+                return r;
+            }
+        }
+        page(e)
+    }
+
+    /// Serve one object to an anonymous website visitor (it must be publicly readable).
+    async fn website_object(&self, parts: &Parts, bucket: &str, key: &str, head: bool, access: &BucketAccess) -> S3Result<Resp> {
+        if check_key(key).is_err() || !access.allows_anonymous("s3:GetObject", &format!("arn:aws:s3:::{bucket}/{key}")) {
+            return Err(err::AccessDenied());
+        }
+        let (meta, _) = self.store.get_object(bucket, key)?;
+        if let Some((_, loc)) = meta.headers.iter().find(|(k, _)| k == "x-amz-website-redirect-location") {
+            let mut r = Resp::new(StatusCode::MOVED_PERMANENTLY);
+            r.set("location", loc);
+            return Ok(r);
+        }
+        let mut p = Request::new(()).into_parts().0;
+        p.method = parts.method.clone();
+        p.headers = parts.headers.clone();
+        let req = Req {
+            parts: p,
+            query: Vec::new(),
+            payload: Payload::Unsigned,
+            body: BodyStream::empty(),
+            principal: Principal::Anonymous,
+        };
+        let mut r = self.get_object(&req, bucket, key, head).await?;
+        // Objects that need a customer key cannot be served to anonymous visitors anyway; and
+        // version ids are an API detail.
+        r.headers.remove("x-amz-version-id");
+        Ok(r)
     }
 
     /// Split the request into (bucket, key) for path-style and virtual-hosted-style addressing.
@@ -712,6 +853,17 @@ impl Server {
                             .ok_or_else(err::ServerSideEncryptionConfigurationNotFoundError)?;
                         Ok(Resp::xml(String::from_utf8_lossy(&doc).into_owned()))
                     }
+                    "object-lock" => {
+                        let doc = self
+                            .store
+                            .bucket_config(bucket, "object-lock")?
+                            .ok_or_else(err::ObjectLockConfigurationNotFoundError)?;
+                        Ok(Resp::xml(String::from_utf8_lossy(&doc).into_owned()))
+                    }
+                    "website" => {
+                        let doc = self.store.bucket_config(bucket, "website")?.ok_or_else(err::NoSuchWebsiteConfiguration)?;
+                        Ok(Resp::xml(String::from_utf8_lossy(&doc).into_owned()))
+                    }
                     "logging" => Ok(Resp::xml(Xml::new("BucketLoggingStatus").finish("BucketLoggingStatus"))),
                     "notification" => Ok(Resp::xml(Xml::new("NotificationConfiguration").finish("NotificationConfiguration"))),
                     "accelerate" => Ok(Resp::xml(Xml::new("AccelerateConfiguration").finish("AccelerateConfiguration"))),
@@ -788,6 +940,18 @@ impl Server {
                 self.set_bucket_config(bucket, "lifecycle", Some(body.to_vec())).await?;
                 Ok(Resp::ok())
             }
+            Method::PUT if sub == Some("object-lock") => {
+                let cfg = lock::BucketLock::parse_xml(&self.read_xml(r).await?)?;
+                self.set_bucket_config(bucket, "object-lock", Some(cfg.to_xml().into_bytes())).await?;
+                Ok(Resp::ok())
+            }
+            Method::PUT if sub == Some("website") => {
+                let body = self.read_body(r, MAX_XML_BODY).await?;
+                let doc = xml::parse(&String::from_utf8_lossy(&body)).ok_or_else(err::MalformedXML)?;
+                crate::website::Config::parse(&doc)?;
+                self.set_bucket_config(bucket, "website", Some(body.to_vec())).await?;
+                Ok(Resp::ok())
+            }
             Method::PUT if r.has("versioning") => {
                 let doc = self.read_xml(r).await?;
                 if doc.name != "VersioningConfiguration" {
@@ -816,9 +980,15 @@ impl Server {
                 }
                 // Body is an optional CreateBucketConfiguration; we only have one region.
                 let acl = r.header("x-amz-acl").map(CannedAcl::parse).transpose()?;
+                let with_lock = r.header("x-amz-bucket-object-lock-enabled").is_some_and(|v| v.eq_ignore_ascii_case("true"));
                 let _ = r.body.read_all(MAX_XML_BODY).await?;
                 self.store.submit(Op::CreateBucket(bucket.to_string())).await?;
                 self.invalidate_access(bucket);
+                if with_lock {
+                    self.set_bucket_config(bucket, "versioning", Some(b"Enabled".to_vec())).await?;
+                    let cfg = lock::BucketLock::default().to_xml().into_bytes();
+                    self.set_bucket_config(bucket, "object-lock", Some(cfg)).await?;
+                }
                 if let Some(acl) = acl.filter(|a| *a != CannedAcl::Private) {
                     self.set_bucket_config(bucket, "acl", Some(acl.as_str().as_bytes().to_vec())).await?;
                 }
@@ -826,7 +996,7 @@ impl Server {
                 resp.set("location", &format!("/{bucket}"));
                 Ok(resp)
             }
-            Method::DELETE if matches!(sub, Some("policy" | "cors" | "tagging" | "lifecycle" | "encryption")) => {
+            Method::DELETE if matches!(sub, Some("policy" | "cors" | "tagging" | "lifecycle" | "encryption" | "website")) => {
                 let kind = sub.unwrap();
                 let kind: &'static str = store::CONFIG_KINDS.iter().find(|k| **k == kind).unwrap();
                 self.set_bucket_config(bucket, kind, None).await?;
@@ -848,7 +1018,7 @@ impl Server {
     }
 
     async fn object_op(&self, r: &mut Req, m: Method, bucket: &str, key: &str) -> S3Result<Resp> {
-        const UNSUPPORTED: &[&str] = &["retention", "legal-hold", "torrent", "restore", "select", "attributes", "renameObject"];
+        const UNSUPPORTED: &[&str] = &["torrent", "restore", "select", "attributes", "renameObject"];
         if UNSUPPORTED.iter().any(|s| r.has(s)) {
             return Err(err::NotImplemented());
         }
@@ -871,6 +1041,26 @@ impl Server {
                 set_version_header(&mut resp, &meta);
                 Ok(resp)
             }
+            Method::GET if r.has("retention") || r.has("legal-hold") => {
+                self.require_lock(bucket)?;
+                let (meta, _) = self.lookup(bucket, key, vref)?;
+                if meta.delete_marker {
+                    return Err(err::MethodNotAllowed());
+                }
+                let state = lock::State::of(&meta.headers);
+                let doc = if r.has("retention") {
+                    let ret = state.retention.ok_or_else(err::NoSuchObjectLockConfiguration)?;
+                    let mut x = Xml::new("Retention");
+                    x.elem("Mode", ret.mode.as_str()).elem("RetainUntilDate", iso8601(ret.until * 1000));
+                    x.finish("Retention")
+                } else {
+                    let on = state.legal_hold.ok_or_else(err::NoSuchObjectLockConfiguration)?;
+                    let mut x = Xml::new("LegalHold");
+                    x.elem("Status", if on { "ON" } else { "OFF" });
+                    x.finish("LegalHold")
+                };
+                Ok(Resp::xml(doc))
+            }
             Method::GET | Method::HEAD => self.get_object(r, bucket, key, m == Method::HEAD).await,
             Method::PUT if r.has("partNumber") && r.has("uploadId") => self.upload_part(r, bucket, key).await,
             Method::PUT if r.has("acl") => {
@@ -886,6 +1076,40 @@ impl Server {
                 let mut resp = Resp::ok();
                 if let Some(v) = &version {
                     resp.set("x-amz-version-id", v);
+                }
+                Ok(resp)
+            }
+            Method::PUT if r.has("retention") || r.has("legal-hold") => {
+                let doc = self.read_xml(r).await?;
+                let (retention, legal_hold) = if r.has("retention") {
+                    if doc.name != "Retention" {
+                        return Err(err::MalformedXML());
+                    }
+                    // An empty Retention element removes the retention (GOVERNANCE + bypass only).
+                    let ret = match (doc.child_text("Mode"), doc.child_text("RetainUntilDate")) {
+                        (Some(m), Some(u)) => Some(lock::parse_retention(m, u, now_ms() / 1000)?),
+                        (None, None) => None,
+                        _ => return Err(err::MalformedXML()),
+                    };
+                    (Some(ret), None)
+                } else {
+                    if doc.name != "LegalHold" {
+                        return Err(err::MalformedXML());
+                    }
+                    (None, Some(lock::parse_legal_hold(doc.child_text("Status").ok_or_else(err::MalformedXML)?)?))
+                };
+                let op = Op::SetObjectLock {
+                    bucket: bucket.into(),
+                    key: key.into(),
+                    version: version.clone(),
+                    retention,
+                    legal_hold,
+                    bypass: bypass_governance(r),
+                };
+                let out = self.store.submit(op).await?;
+                let mut resp = Resp::ok();
+                if let OpOut::Object(m) = &out {
+                    set_version_header(&mut resp, m);
                 }
                 Ok(resp)
             }
@@ -907,7 +1131,11 @@ impl Server {
             Method::DELETE => {
                 let OpOut::Deleted(mut res) = self
                     .store
-                    .submit(Op::DeleteObjects { bucket: bucket.into(), items: vec![(key.into(), version.clone())] })
+                    .submit(Op::DeleteObjects {
+                        bucket: bucket.into(),
+                        items: vec![(key.into(), version.clone())],
+                        bypass: bypass_governance(r),
+                    })
                     .await?
                 else {
                     return Err(S3Error::internal("unexpected writer reply"));
@@ -1186,6 +1414,34 @@ impl Server {
         })
     }
 
+    fn require_lock(&self, bucket: &str) -> S3Result<lock::BucketLock> {
+        self.bucket_access(bucket)?.lock.ok_or_else(lock::missing_config)
+    }
+
+    /// Object Lock headers for a new version: the request's own retention / legal hold, else
+    /// the bucket's default retention.
+    fn new_lock_headers(&self, h: &HeaderMap, bucket: &str) -> S3Result<Vec<(String, String)>> {
+        let (mode, until, hold) = (header(h, lock::MODE), header(h, lock::UNTIL), header(h, lock::HOLD));
+        let cfg = match self.bucket_access(bucket)?.lock {
+            Some(c) => c,
+            None if has_lock_headers(h) => return Err(lock::missing_config()),
+            None => return Ok(Vec::new()),
+        };
+        let now = now_ms() / 1000;
+        let retention = match (mode, until) {
+            (Some(m), Some(u)) => Some(lock::parse_retention(m, u, now)?),
+            (None, None) => cfg.default.map(|(mode, p)| lock::Retention { mode, until: now + p.secs() }),
+            _ => {
+                return Err(err::InvalidArgument()
+                    .with_message("x-amz-object-lock-retain-until-date and x-amz-object-lock-mode must both be supplied"));
+            }
+        };
+        let legal_hold = hold.map(lock::parse_legal_hold).transpose()?;
+        let mut out = Vec::new();
+        lock::State { retention, legal_hold }.store(&mut out);
+        Ok(out)
+    }
+
     /// Encryption for a new object (or multipart upload): the wrapping key and the headers to
     /// store with the object (which are also returned on reads, as S3 does).
     fn write_encryption(&self, h: &HeaderMap, bucket: &str, sse_field: Option<&str>) -> S3Result<Encryption> {
@@ -1293,6 +1549,7 @@ impl Server {
         // inline in the metadata database (which would otherwise only ever grow).
         let versioned = self.bucket_access(bucket)?.versioning == store::Versioning::Enabled;
         let tags = request_tags(r)?;
+        let lock_headers = self.new_lock_headers(&r.parts.headers, bucket)?;
         let enc = self.write_encryption(&r.parts.headers, bucket, None)?;
         let mut expect = self.expect(r, MAX_OBJECT_SIZE, !versioned)?;
         expect.encrypt = enc.as_ref().map(|(k, _)| k.clone());
@@ -1301,6 +1558,7 @@ impl Server {
         let etag = etag_of(ing.md5, enc.as_ref().map(|(k, _)| k));
         let mut headers = stored_headers(&r.parts.headers);
         headers.extend(enc.map(|(_, h)| h).unwrap_or_default());
+        headers.extend(lock_headers);
         self.metrics.add_bytes_in(ing.size);
         let (storage, inline, files) = ing.storage();
         let meta = ObjectMeta {
@@ -1457,6 +1715,7 @@ impl Server {
         let replace_tags = r.header("x-amz-tagging-directive").is_some_and(|d| d.eq_ignore_ascii_case("REPLACE"));
         let requested_enc = self.write_encryption(&r.parts.headers, bucket, None)?;
         let explicit_enc = r.header(SSE).is_some() || r.header(SSE_C_ALG).is_some();
+        let lock_headers = self.new_lock_headers(&r.parts.headers, bucket)?;
         let _ = r.body.read_all(MAX_XML_BODY).await?;
         for attempt in 0..3 {
             let (src, inline) = self.lookup(&sb, &sk, sv.as_deref())?;
@@ -1517,8 +1776,10 @@ impl Server {
                     }
                 }
             };
-            let mut headers = if replace { stored_headers(&r.parts.headers) } else { without_sse(&src.headers) };
+            // Encryption and Object Lock settings belong to the new version, not the source.
+            let mut headers = if replace { stored_headers(&r.parts.headers) } else { inheritable(&src.headers) };
             headers.extend(dst_enc.as_ref().map(|(_, h)| h.clone()).unwrap_or_default());
+            headers.extend(lock_headers.iter().cloned());
             let tags = if replace_tags { request_tags(r)? } else { src.tags.clone() };
             let meta = ObjectMeta {
                 size: src.size,
@@ -1579,6 +1840,7 @@ impl Server {
         let enc = self.write_encryption(&r.parts.headers, bucket, None)?;
         let mut headers = stored_headers(&r.parts.headers);
         headers.extend(enc.map(|(_, h)| h).unwrap_or_default());
+        headers.extend(self.new_lock_headers(&r.parts.headers, bucket)?);
         let meta = UploadMeta { bucket: bucket.into(), key: key.into(), initiated_ms: now_ms(), headers: headers.clone(), tags };
         self.store.submit(Op::CreateUpload { id, meta }).await?;
         let mut x = Xml::new("InitiateMultipartUploadResult");
@@ -1745,6 +2007,7 @@ impl Server {
         let enc = self.write_encryption(&HeaderMap::new(), bucket, f.get(SSE).map(String::as_str))?;
         headers.retain(|(k, _)| !k.starts_with(SSE));
         headers.extend(enc.as_ref().map(|(_, h)| h.clone()).unwrap_or_default());
+        headers.extend(self.new_lock_headers(&HeaderMap::new(), bucket)?);
         headers.sort();
 
         let (min, max) = range.unwrap_or((0, MAX_OBJECT_SIZE));
@@ -1886,8 +2149,10 @@ impl Server {
             return Err(err::MalformedXML().with_message("The request must contain no more than 1000 keys"));
         }
         let (valid, invalid): (Vec<_>, Vec<_>) = objects.into_iter().partition(|(k, _)| !k.is_empty() && check_key(k).is_ok());
-        let OpOut::Deleted(results) =
-            self.store.submit(Op::DeleteObjects { bucket: bucket.into(), items: valid.clone() }).await?
+        let OpOut::Deleted(results) = self
+            .store
+            .submit(Op::DeleteObjects { bucket: bucket.into(), items: valid.clone(), bypass: bypass_governance(r) })
+            .await?
         else {
             return Err(S3Error::internal("unexpected writer reply"));
         };
@@ -1921,6 +2186,17 @@ impl Server {
     }
 }
 
+/// HTML error page for the website endpoint.
+fn website_error(e: &S3Error, head: bool, rid: &str) -> Resp {
+    let mut r = Resp::new(e.status);
+    if !head {
+        r.set("content-type", "text/html; charset=utf-8");
+        let reason = e.status.canonical_reason().unwrap_or("Error");
+        r.body = Body::full(crate::website::error_page(e.status.as_u16(), reason, e.code, &e.message, rid));
+    }
+    r
+}
+
 /// Tags from the `x-amz-tagging` request header.
 fn request_tags(r: &Req) -> S3Result<Vec<(String, String)>> {
     r.header("x-amz-tagging").map(access::parse_tagging_header).transpose().map(Option::unwrap_or_default)
@@ -1944,8 +2220,18 @@ fn etag_of(md5: [u8; 16], key: Option<&WrapKey>) -> String {
     format!("\"{}\"", util::hex(&crypt::etag_digest(key, md5)))
 }
 
-fn without_sse(h: &[(String, String)]) -> Vec<(String, String)> {
-    h.iter().filter(|(k, _)| !k.starts_with(SSE)).cloned().collect()
+/// Stored headers a copy takes over from its source (not encryption or Object Lock state).
+fn inheritable(h: &[(String, String)]) -> Vec<(String, String)> {
+    h.iter().filter(|(k, _)| !k.starts_with(SSE) && !lock::is_lock_header(k)).cloned().collect()
+}
+
+fn has_lock_headers(h: &HeaderMap) -> bool {
+    [lock::MODE, lock::UNTIL, lock::HOLD].iter().any(|n| h.contains_key(*n))
+}
+
+/// `x-amz-bypass-governance-retention: true`, honoured for authenticated callers only.
+fn bypass_governance(r: &Req) -> bool {
+    r.header(lock::BYPASS).is_some_and(|v| v.trim().eq_ignore_ascii_case("true")) && !matches!(r.principal, Principal::Anonymous)
 }
 
 /// Echo the encryption headers of a write back to the client.

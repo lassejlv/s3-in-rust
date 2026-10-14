@@ -8,11 +8,13 @@ mod crypt;
 mod error;
 mod io;
 mod lifecycle;
+mod lock;
 mod metrics;
 mod post;
 mod s3;
 mod store;
 mod util;
+mod website;
 mod xml;
 
 use hyper::service::service_fn;
@@ -59,6 +61,11 @@ OPTIONS (each also settable through the environment variable shown):
         --region <REGION>        Region reported to clients      [S3RS_REGION, default us-east-1]
         --domain <DOMAIN>        Enable virtual-hosted-style requests for <bucket>.<DOMAIN>
                                                                  [S3RS_DOMAIN]
+        --website-listen <ADDR>  Serve static websites (anonymous GET/HEAD) on this address;
+                                 the bucket is the Host name, or <bucket> for <bucket>.<DOMAIN>
+                                 when --website-domain is set    [S3RS_WEBSITE_LISTEN]
+        --website-domain <D>     Domain whose subdomains name website buckets
+                                                                 [S3RS_WEBSITE_DOMAIN]
         --inline-threshold <N>   Objects up to N bytes are stored inside the metadata DB
                                                                  [S3RS_INLINE_THRESHOLD, default 65536]
         --cache-mb <N>           Metadata cache size in MiB      [S3RS_CACHE_MB, default 256]
@@ -82,6 +89,8 @@ struct Config {
     encrypt_by_default: bool,
     region: String,
     domain: Option<String>,
+    website_listen: Option<SocketAddr>,
+    website_domain: Option<String>,
     inline_threshold: usize,
     cache_mb: usize,
     fsync: bool,
@@ -121,6 +130,11 @@ fn parse_args() -> Result<Config, String> {
         encrypt_by_default: env_flag("S3RS_ENCRYPT_BY_DEFAULT")?,
         region: env("S3RS_REGION").unwrap_or_else(|| "us-east-1".into()),
         domain: env("S3RS_DOMAIN"),
+        website_listen: env("S3RS_WEBSITE_LISTEN")
+            .map(|v| v.parse())
+            .transpose()
+            .map_err(|e| format!("S3RS_WEBSITE_LISTEN: {e}"))?,
+        website_domain: env("S3RS_WEBSITE_DOMAIN"),
         inline_threshold: env("S3RS_INLINE_THRESHOLD")
             .map_or(Ok(65536), |v| v.parse())
             .map_err(|e| format!("S3RS_INLINE_THRESHOLD: {e}"))?,
@@ -159,6 +173,10 @@ fn parse_args() -> Result<Config, String> {
             "--encrypt-by-default" => c.encrypt_by_default = true,
             "--region" => c.region = val()?,
             "--domain" => c.domain = Some(val()?),
+            "--website-listen" => {
+                c.website_listen = Some(val()?.parse().map_err(|e| format!("--website-listen: {e}"))?);
+            }
+            "--website-domain" => c.website_domain = Some(val()?),
             "--inline-threshold" => c.inline_threshold = val()?.parse().map_err(|e| format!("--inline-threshold: {e}"))?,
             "--cache-mb" => c.cache_mb = val()?.parse().map_err(|e| format!("--cache-mb: {e}"))?,
             "--no-fsync" => c.fsync = false,
@@ -276,13 +294,29 @@ fn main() {
     rt.block_on(serve(cfg, store, auth));
 }
 
-async fn serve(cfg: Config, store: Arc<store::Store>, auth: Option<auth::Auth>) {
-    let listener = match TcpListener::bind(cfg.listen).await {
+async fn bind(addr: SocketAddr) -> TcpListener {
+    match TcpListener::bind(addr).await {
         Ok(l) => l,
         Err(e) => {
-            eprintln!("error: cannot listen on {}: {e}", cfg.listen);
+            eprintln!("error: cannot listen on {addr}: {e}");
             std::process::exit(1);
         }
+    }
+}
+
+/// Accept on an optional listener (never completes when there is none).
+async fn accept_opt(l: &Option<TcpListener>) -> std::io::Result<(tokio::net::TcpStream, SocketAddr)> {
+    match l {
+        Some(l) => l.accept().await,
+        None => std::future::pending().await,
+    }
+}
+
+async fn serve(cfg: Config, store: Arc<store::Store>, auth: Option<auth::Auth>) {
+    let listener = bind(cfg.listen).await;
+    let website_listener = match cfg.website_listen {
+        Some(a) => Some(bind(a).await),
+        None => None,
     };
     let anonymous = auth.is_none();
     let opts = s3::Options {
@@ -293,6 +327,7 @@ async fn serve(cfg: Config, store: Arc<store::Store>, auth: Option<auth::Auth>) 
         metrics_token: cfg.metrics_token.clone(),
         master_key: cfg.encryption_key,
         encrypt_by_default: cfg.encrypt_by_default,
+        website_domain: cfg.website_domain.clone(),
     };
     let server = Arc::new(s3::Server::new(store.clone(), auth, opts));
     if cfg.lifecycle_interval > 0 {
@@ -316,6 +351,9 @@ async fn serve(cfg: Config, store: Arc<store::Store>, auth: Option<auth::Auth>) 
             (true, true) => "all objects (SSE-S3 default)",
         }
     );
+    if let Some(a) = cfg.website_listen {
+        eprintln!("s3rs website endpoint on http://{a}");
+    }
 
     let mut builder = auto::Builder::new(TokioExecutor::new());
     builder.http1().keep_alive(true).max_buf_size(1024 * 1024);
@@ -330,17 +368,19 @@ async fn serve(cfg: Config, store: Arc<store::Store>, auth: Option<auth::Auth>) 
     let shutdown = shutdown_signal();
     tokio::pin!(shutdown);
     loop {
-        let (stream, _) = tokio::select! {
+        let (accepted, website) = tokio::select! {
             _ = &mut shutdown => break,
-            r = listener.accept() => match r {
-                Ok(c) => c,
-                Err(e) => {
-                    // Typically EMFILE; back off instead of spinning.
-                    eprintln!("accept error: {e}");
-                    tokio::time::sleep(Duration::from_millis(50)).await;
-                    continue;
-                }
-            },
+            r = listener.accept() => (r, false),
+            r = accept_opt(&website_listener) => (r, true),
+        };
+        let stream = match accepted {
+            Ok((s, _)) => s,
+            Err(e) => {
+                // Typically EMFILE; back off instead of spinning.
+                eprintln!("accept error: {e}");
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                continue;
+            }
         };
         let _ = stream.set_nodelay(true);
         let server = server.clone();
@@ -349,13 +389,14 @@ async fn serve(cfg: Config, store: Arc<store::Store>, auth: Option<auth::Auth>) 
         tokio::spawn(async move {
             let svc = service_fn(move |req| {
                 let server = server.clone();
-                async move { Ok::<_, Infallible>(server.handle(req).await) }
+                async move { Ok::<_, Infallible>(if website { server.handle_website(req).await } else { server.handle(req).await }) }
             });
             let conn = builder.serve_connection(TokioIo::new(stream), svc).into_owned();
             let _ = watcher.watch(conn).await;
         });
     }
     drop(listener);
+    drop(website_listener);
     eprintln!("shutting down: draining in-flight requests (up to {}s)", SHUTDOWN_GRACE.as_secs());
     let drained = tokio::select! {
         _ = graceful.shutdown() => true,

@@ -857,6 +857,198 @@ def t_scoped_key():
     sc.delete_bucket(Bucket=mine)
 
 
+def t_object_lock():
+    import datetime
+
+    now = lambda: datetime.datetime.now(datetime.timezone.utc)  # noqa: E731
+    lb = B + "-lock"
+    s3.create_bucket(Bucket=lb, ObjectLockEnabledForBucket=True)
+    assert s3.get_bucket_versioning(Bucket=lb)["Status"] == "Enabled"
+    cfg = s3.get_object_lock_configuration(Bucket=lb)["ObjectLockConfiguration"]
+    assert cfg["ObjectLockEnabled"] == "Enabled" and "Rule" not in cfg, cfg
+    expect_error(
+        "InvalidBucketState",
+        lambda: s3.put_bucket_versioning(Bucket=lb, VersioningConfiguration={"Status": "Suspended"}),
+    )
+
+    # GOVERNANCE: protected unless the caller bypasses it.
+    until = now() + datetime.timedelta(hours=1)
+    g = s3.put_object(Bucket=lb, Key="gov", Body=b"g", ObjectLockMode="GOVERNANCE", ObjectLockRetainUntilDate=until)
+    h = s3.head_object(Bucket=lb, Key="gov")
+    assert h["ObjectLockMode"] == "GOVERNANCE" and abs((h["ObjectLockRetainUntilDate"] - until).total_seconds()) < 1, h
+    r = s3.get_object_retention(Bucket=lb, Key="gov", VersionId=g["VersionId"])["Retention"]
+    assert r["Mode"] == "GOVERNANCE", r
+    expect_error("AccessDenied", lambda: s3.delete_object(Bucket=lb, Key="gov", VersionId=g["VersionId"]))
+    # Shortening needs the bypass too; extending does not.
+    expect_error(
+        "AccessDenied",
+        lambda: s3.put_object_retention(
+            Bucket=lb, Key="gov", Retention={"Mode": "GOVERNANCE", "RetainUntilDate": now() + datetime.timedelta(minutes=5)}
+        ),
+    )
+    s3.put_object_retention(
+        Bucket=lb, Key="gov", Retention={"Mode": "GOVERNANCE", "RetainUntilDate": until + datetime.timedelta(hours=1)}
+    )
+    # Deleting without a version id just adds a delete marker.
+    assert s3.delete_object(Bucket=lb, Key="gov")["DeleteMarker"]
+    s3.delete_object(Bucket=lb, Key="gov", VersionId=g["VersionId"], BypassGovernanceRetention=True)
+
+    # COMPLIANCE: nobody can delete or shorten it until it expires.
+    comp_until = now() + datetime.timedelta(seconds=3)
+    c = s3.put_object(Bucket=lb, Key="comp", Body=b"c", ObjectLockMode="COMPLIANCE", ObjectLockRetainUntilDate=comp_until)
+    expect_error(
+        "AccessDenied",
+        lambda: s3.delete_object(Bucket=lb, Key="comp", VersionId=c["VersionId"], BypassGovernanceRetention=True),
+    )
+    expect_error(
+        "AccessDenied",
+        lambda: s3.put_object_retention(
+            Bucket=lb,
+            Key="comp",
+            Retention={"Mode": "GOVERNANCE", "RetainUntilDate": now() + datetime.timedelta(hours=1)},
+            BypassGovernanceRetention=True,
+        ),
+    )
+
+    # Legal hold: blocks deletion regardless of retention or bypass.
+    lh = s3.put_object(Bucket=lb, Key="hold", Body=b"h", ObjectLockLegalHoldStatus="ON")
+    assert s3.get_object_legal_hold(Bucket=lb, Key="hold")["LegalHold"]["Status"] == "ON"
+    r = s3.delete_objects(
+        Bucket=lb, Delete={"Objects": [{"Key": "hold", "VersionId": lh["VersionId"]}]}, BypassGovernanceRetention=True
+    )
+    assert [e["Code"] for e in r.get("Errors", [])] == ["AccessDenied"], r
+    s3.put_object_legal_hold(Bucket=lb, Key="hold", LegalHold={"Status": "OFF"})
+    s3.delete_object(Bucket=lb, Key="hold", VersionId=lh["VersionId"])
+
+    # Bucket default retention applies to plain PUTs, multipart uploads and copies.
+    s3.put_object_lock_configuration(
+        Bucket=lb,
+        ObjectLockConfiguration={
+            "ObjectLockEnabled": "Enabled",
+            "Rule": {"DefaultRetention": {"Mode": "GOVERNANCE", "Days": 1}},
+        },
+    )
+    rule = s3.get_object_lock_configuration(Bucket=lb)["ObjectLockConfiguration"]["Rule"]["DefaultRetention"]
+    assert rule == {"Mode": "GOVERNANCE", "Days": 1}, rule
+    d = s3.put_object(Bucket=lb, Key="def", Body=b"d")
+    h = s3.head_object(Bucket=lb, Key="def")
+    left = (h["ObjectLockRetainUntilDate"] - now()).total_seconds()
+    assert h["ObjectLockMode"] == "GOVERNANCE" and 86_000 < left <= 86_400, h
+    up = s3.create_multipart_upload(Bucket=lb, Key="mp")
+    e = s3.upload_part(Bucket=lb, Key="mp", UploadId=up["UploadId"], PartNumber=1, Body=b"m")["ETag"]
+    mp = s3.complete_multipart_upload(
+        Bucket=lb, Key="mp", UploadId=up["UploadId"], MultipartUpload={"Parts": [{"PartNumber": 1, "ETag": e}]}
+    )
+    assert s3.head_object(Bucket=lb, Key="mp")["ObjectLockMode"] == "GOVERNANCE"
+    cp = s3.copy_object(Bucket=lb, Key="cp", CopySource={"Bucket": lb, "Key": "def"})
+    assert s3.head_object(Bucket=lb, Key="cp")["ObjectLockMode"] == "GOVERNANCE"
+    for key, vid in [("def", d["VersionId"]), ("mp", mp["VersionId"]), ("cp", cp["VersionId"])]:
+        expect_error("AccessDenied", lambda: s3.delete_object(Bucket=lb, Key=key, VersionId=vid))
+
+    # Buckets without Object Lock reject lock settings.
+    expect_error(
+        "InvalidRequest",
+        lambda: s3.put_object(Bucket=B, Key="nolock", Body=b"x", ObjectLockLegalHoldStatus="ON"),
+    )
+    expect_error("ObjectLockConfigurationNotFoundError", lambda: s3.get_object_lock_configuration(Bucket=B))
+    expect_error(
+        "InvalidBucketState",
+        lambda: s3.put_object_lock_configuration(Bucket=B, ObjectLockConfiguration={"ObjectLockEnabled": "Enabled"}),
+    )
+
+    # Clean up: wait out the COMPLIANCE retention, then bypass the GOVERNANCE ones.
+    time.sleep(max(0.0, (comp_until - now()).total_seconds() + 1.1))
+    for page in s3.get_paginator("list_object_versions").paginate(Bucket=lb):
+        objs = [{"Key": v["Key"], "VersionId": v["VersionId"]} for v in page.get("Versions", []) + page.get("DeleteMarkers", [])]
+        if objs:
+            r = s3.delete_objects(Bucket=lb, Delete={"Objects": objs, "Quiet": True}, BypassGovernanceRetention=True)
+            assert not r.get("Errors"), r["Errors"]
+    s3.delete_bucket(Bucket=lb)
+
+
+WEBSITE = os.environ.get("S3RS_WEBSITE_ENDPOINT")  # e.g. http://127.0.0.1:9001
+WEBSITE_DOMAIN = os.environ.get("S3RS_WEBSITE_DOMAIN")
+
+
+def web(host, path, method="GET", headers=None):
+    """Request to the website endpoint (no redirect following): (status, headers, body)."""
+    import http.client
+    import urllib.parse
+
+    u = urllib.parse.urlparse(WEBSITE)
+    conn = http.client.HTTPConnection(u.hostname, u.port, timeout=10)
+    conn.request(method, path, headers={"Host": host, **(headers or {})})
+    r = conn.getresponse()
+    body = r.read()
+    conn.close()
+    return r.status, r.headers, body
+
+
+def t_website():
+    if not WEBSITE:
+        print("        (skipped: set S3RS_WEBSITE_ENDPOINT)")
+        return
+    wb = B + "-site"
+    host = f"{wb}.{WEBSITE_DOMAIN}" if WEBSITE_DOMAIN else wb
+    s3.create_bucket(Bucket=wb)
+    html = {"ContentType": "text/html"}
+    s3.put_object(Bucket=wb, Key="index.html", Body=b"<h1>home</h1>", **html)
+    s3.put_object(Bucket=wb, Key="about/index.html", Body=b"about", **html)
+    s3.put_object(Bucket=wb, Key="404.html", Body=b"custom not found", **html)
+    s3.put_object(Bucket=wb, Key="moved", Body=b"", WebsiteRedirectLocation="/about/")
+    s3.put_bucket_acl(Bucket=wb, ACL="public-read")
+
+    st, _, body = web(host, "/")
+    assert st == 404 and b"NoSuchWebsiteConfiguration" in body, (st, body)
+    expect_error("NoSuchWebsiteConfiguration", lambda: s3.get_bucket_website(Bucket=wb))
+    s3.put_bucket_website(
+        Bucket=wb,
+        WebsiteConfiguration={
+            "IndexDocument": {"Suffix": "index.html"},
+            "ErrorDocument": {"Key": "404.html"},
+            "RoutingRules": [{"Condition": {"KeyPrefixEquals": "old/"}, "Redirect": {"ReplaceKeyPrefixWith": "new/"}}],
+        },
+    )
+    assert s3.get_bucket_website(Bucket=wb)["IndexDocument"]["Suffix"] == "index.html"
+
+    st, h, body = web(host, "/")
+    assert (st, body, h["Content-Type"]) == (200, b"<h1>home</h1>", "text/html"), (st, body)
+    st, h, _ = web(host, "/about")
+    assert st == 302 and h["Location"] == "/about/", (st, h["Location"])
+    assert web(host, "/about/")[2] == b"about"
+    st, _, body = web(host, "/nope.html")
+    assert (st, body) == (404, b"custom not found"), (st, body)
+    st, h, _ = web(host, "/old/page.html")
+    assert st == 301 and h["Location"] == f"http://{host}/new/page.html", h["Location"]
+    st, h, _ = web(host, "/moved")
+    assert st == 301 and h["Location"] == "/about/", (st, h["Location"])
+    st, h, body = web(host, "/", method="HEAD")
+    assert st == 200 and body == b"" and h["Content-Length"] == "13", (st, h)
+    etag = h["ETag"]
+    assert web(host, "/", headers={"If-None-Match": etag})[0] == 304
+    st, _, body = web(host, "/", headers={"Range": "bytes=4-7"})
+    assert (st, body) == (206, b"home"), (st, body)
+    assert web(host, "/", method="POST")[0] == 405
+    st, h, body = web("no-such-bucket-xyz", "/")
+    assert st == 404 and b"NoSuchBucket" in body and h["Content-Type"].startswith("text/html"), (st, body)
+    if WEBSITE_DOMAIN:  # CNAME style: a bucket named like the host
+        assert web(wb, "/")[2] == b"<h1>home</h1>"
+    # Only publicly readable objects are served.
+    s3.put_bucket_acl(Bucket=wb, ACL="private")
+    assert web(host, "/")[0] == 403
+    # Redirect everything.
+    s3.put_bucket_website(
+        Bucket=wb, WebsiteConfiguration={"RedirectAllRequestsTo": {"HostName": "example.com", "Protocol": "https"}}
+    )
+    st, h, _ = web(host, "/a/b?c=1")
+    assert st == 301 and h["Location"] == "https://example.com/a/b?c=1", h["Location"]
+    s3.delete_bucket_website(Bucket=wb)
+    assert web(host, "/")[0] == 404
+    for k in ["index.html", "about/index.html", "404.html", "moved"]:
+        s3.delete_object(Bucket=wb, Key=k)
+    s3.delete_bucket(Bucket=wb)
+
+
 def t_overwrite():
     s3.put_object(Bucket=B, Key="ow", Body=b"x" * 300_000)
     s3.put_object(Bucket=B, Key="ow", Body=b"small")

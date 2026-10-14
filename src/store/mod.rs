@@ -10,6 +10,7 @@
 pub mod meta;
 
 use crate::error::{S3Error, S3Result, err};
+use crate::lock;
 use crate::util::{self, now_ms};
 use bytes::Bytes;
 use meta::{ObjectMeta, ObjectSummary, PartMeta, Storage, UploadMeta};
@@ -30,7 +31,8 @@ const PARTS: TableDefinition<(u128, u32), &[u8]> = TableDefinition::new("parts")
 const CONFIG: TableDefinition<(&str, &str), &[u8]> = TableDefinition::new("bucket_config");
 
 /// Kinds of bucket configuration stored in `CONFIG`.
-pub const CONFIG_KINDS: &[&str] = &["acl", "policy", "cors", "tagging", "lifecycle", "versioning", "encryption"];
+pub const CONFIG_KINDS: &[&str] =
+    &["acl", "policy", "cors", "tagging", "lifecycle", "versioning", "encryption", "object-lock", "website"];
 /// Noncurrent object versions and delete markers: `bucket \0 key \0 (u64::MAX - seq)` -> meta.
 /// Keys sort newest-first within an object. The current version of a key always lives in
 /// OBJECTS (if it is not a delete marker), so unversioned reads never touch this table.
@@ -157,9 +159,11 @@ pub enum Op {
         cond: Option<WriteCond>,
     },
     /// Delete keys (current version, possibly creating delete markers) or specific versions.
+    /// `bypass` lets GOVERNANCE-mode retention be overridden.
     DeleteObjects {
         bucket: String,
         items: Vec<(String, Option<String>)>,
+        bypass: bool,
     },
     CreateUpload {
         id: u128,
@@ -194,6 +198,15 @@ pub enum Op {
         key: String,
         version: Option<String>,
         tags: Vec<(String, String)>,
+    },
+    /// Change a version's Object Lock retention (`Some(None)` removes it) and/or legal hold.
+    SetObjectLock {
+        bucket: String,
+        key: String,
+        version: Option<String>,
+        retention: Option<Option<lock::Retention>>,
+        legal_hold: Option<bool>,
+        bypass: bool,
     },
     /// Lifecycle: permanently remove noncurrent entries (key, seq, rule). Each item is
     /// re-checked against the current state, so concurrent writes never cause early deletion.
@@ -618,7 +631,7 @@ impl Store {
             }
         }
         let Some(meta) = found else {
-            return Err(S3Error::new("NoSuchVersion", hyper::StatusCode::NOT_FOUND, "The specified version does not exist."));
+            return Err(err::NoSuchVersion());
         };
         if meta.delete_marker {
             return Err(err::MethodNotAllowed()
@@ -1294,13 +1307,21 @@ fn find_version(tx: &Tables, bucket: &str, key: &str, vid: &str) -> S3Result<Opt
     }
 }
 
-/// DELETE with a version id: permanently remove that version.
-fn delete_version(tx: &mut Tables, bucket: &str, key: &str, vid: &str, garbage: &mut Vec<u128>) -> S3Result<DeleteOutcome> {
+/// DELETE with a version id: permanently remove that version (unless Object Lock protects it).
+fn delete_version(
+    tx: &mut Tables,
+    bucket: &str,
+    key: &str,
+    vid: &str,
+    bypass: bool,
+    garbage: &mut Vec<u128>,
+) -> S3Result<DeleteOutcome> {
     if !valid_version_id(vid) {
         return Err(err::InvalidArgument().with_message("Invalid version id specified"));
     }
     let mut out = DeleteOutcome { version_id: Some(vid.to_string()), delete_marker: false };
     if let Some((in_objects, k, m)) = find_version(tx, bucket, key, vid)? {
+        lock::State::of(&m.headers).check_delete(now_ms() / 1000, bypass)?;
         if in_objects {
             tx.objects.remove(k.as_slice())?;
         } else {
@@ -1311,6 +1332,36 @@ fn delete_version(tx: &mut Tables, bucket: &str, key: &str, vid: &str, garbage: 
         promote(tx, bucket, key)?;
     }
     Ok(out)
+}
+
+/// Modify one version's metadata in place (the current version when `version` is None).
+fn update_version(
+    tx: &mut Tables,
+    bucket: &str,
+    key: &str,
+    version: Option<&str>,
+    change: impl FnOnce(&mut ObjectMeta) -> S3Result<()>,
+) -> S3Result<ObjectMeta> {
+    if tx.buckets.get(bucket)?.is_none() {
+        return Err(err::NoSuchBucket());
+    }
+    let found = match version {
+        Some(v) => find_version(tx, bucket, key, v)?,
+        None => get_meta(tx, &obj_key(bucket, key))?.map(|m| (true, obj_key(bucket, key), m)),
+    };
+    let Some((in_objects, k, mut meta)) = found else {
+        return Err(if version.is_some() { err::NoSuchVersion() } else { err::NoSuchKey() });
+    };
+    if meta.delete_marker {
+        return Err(err::MethodNotAllowed());
+    }
+    change(&mut meta)?;
+    if in_objects {
+        tx.objects.insert(k.as_slice(), meta.encode().as_slice())?;
+    } else {
+        tx.versions.insert(k.as_slice(), meta.encode().as_slice())?;
+    }
+    Ok(meta)
 }
 
 fn bucket_has_versions(tx: &Tables, bucket: &str) -> S3Result<bool> {
@@ -1381,14 +1432,14 @@ fn apply(tx: &mut Tables, op: Op, garbage: &mut Vec<u128>, last_seq: &mut u64) -
             }
             Ok(OpOut::Count(n))
         }
-        Op::DeleteObjects { bucket, items } => {
+        Op::DeleteObjects { bucket, items, bypass } => {
             if tx.buckets.get(bucket.as_str())?.is_none() {
                 return Err(err::NoSuchBucket());
             }
             let mut out = Vec::with_capacity(items.len());
             for (key, version) in items {
                 let r = check_key_chars(&key).and_then(|_| match version {
-                    Some(v) => delete_version(tx, &bucket, &key, &v, garbage),
+                    Some(v) => delete_version(tx, &bucket, &key, &v, bypass, garbage),
                     None => delete_current(tx, last_seq, &bucket, &key, garbage),
                 });
                 if let Err(e) = &r
@@ -1434,6 +1485,24 @@ fn apply(tx: &mut Tables, op: Op, garbage: &mut Vec<u128>, last_seq: &mut u64) -
             if tx.buckets.get(bucket.as_str())?.is_none() {
                 return Err(err::NoSuchBucket());
             }
+            // Object Lock relies on every version being kept: it needs versioning enabled, and
+            // versioning cannot be suspended once it is on.
+            let has_lock = tx.config.get((bucket.as_str(), "object-lock"))?.is_some();
+            if kind == "versioning" && has_lock && value.as_deref() != Some(b"Enabled".as_slice()) {
+                return Err(lock::invalid_bucket_state(
+                    "An Object Lock configuration is present on this bucket, so the versioning state cannot be changed.",
+                ));
+            }
+            if kind == "object-lock" {
+                if value.is_none() {
+                    return Err(lock::invalid_bucket_state("Object Lock cannot be disabled once enabled"));
+                }
+                if versioning_state(tx, &bucket)? != Versioning::Enabled {
+                    return Err(lock::invalid_bucket_state(
+                        "Versioning must be 'Enabled' on the bucket to apply a Object Lock configuration",
+                    ));
+                }
+            }
             match value {
                 Some(v) => tx.config.insert((bucket.as_str(), kind), v.as_slice())?,
                 None => tx.config.remove((bucket.as_str(), kind))?,
@@ -1441,24 +1510,29 @@ fn apply(tx: &mut Tables, op: Op, garbage: &mut Vec<u128>, last_seq: &mut u64) -
             Ok(OpOut::Done)
         }
         Op::SetObjectTags { bucket, key, version, tags } => {
-            if tx.buckets.get(bucket.as_str())?.is_none() {
-                return Err(err::NoSuchBucket());
-            }
-            let found = match &version {
-                Some(v) => find_version(tx, &bucket, &key, v)?,
-                None => get_meta(tx, &obj_key(&bucket, &key))?.map(|m| (true, obj_key(&bucket, &key), m)),
-            };
-            let Some((in_objects, k, mut meta)) = found else { return Err(err::NoSuchKey()) };
-            if meta.delete_marker {
-                return Err(err::MethodNotAllowed());
-            }
-            meta.tags = tags;
-            if in_objects {
-                tx.objects.insert(k.as_slice(), meta.encode().as_slice())?;
-            } else {
-                tx.versions.insert(k.as_slice(), meta.encode().as_slice())?;
-            }
+            update_version(tx, &bucket, &key, version.as_deref(), |meta| {
+                meta.tags = tags;
+                Ok(())
+            })?;
             Ok(OpOut::Done)
+        }
+        Op::SetObjectLock { bucket, key, version, retention, legal_hold, bypass } => {
+            if tx.config.get((bucket.as_str(), "object-lock"))?.is_none() && tx.buckets.get(bucket.as_str())?.is_some() {
+                return Err(lock::missing_config());
+            }
+            let meta = update_version(tx, &bucket, &key, version.as_deref(), |meta| {
+                let mut state = lock::State::of(&meta.headers);
+                if let Some(new) = retention {
+                    state.check_retention_change(new, now_ms() / 1000, bypass)?;
+                    state.retention = new;
+                }
+                if let Some(on) = legal_hold {
+                    state.legal_hold = Some(on);
+                }
+                state.store(&mut meta.headers);
+                Ok(())
+            })?;
+            Ok(OpOut::Object(meta))
         }
         Op::PurgeVersions { bucket, items } => {
             let mut n = 0;
@@ -1485,7 +1559,8 @@ fn apply(tx: &mut Tables, op: Op, garbage: &mut Vec<u128>, last_seq: &mut u64) -
                             && tx.versions.range::<&[u8]>(p.as_slice()..end.as_slice())?.take(2).count() == 1
                     }
                 };
-                if still_due {
+                // Lifecycle never removes a version that Object Lock protects.
+                if still_due && lock::State::of(&m.headers).check_delete(now_ms() / 1000, false).is_ok() {
                     tx.versions.remove(vk.as_slice())?;
                     release(tx, &m, garbage)?;
                     promote(tx, &bucket, &key)?;
@@ -1590,6 +1665,71 @@ mod tests {
         }
     }
 
+    async fn delete_version(store: &Store, vid: &str, bypass: bool) -> S3Result<DeleteOutcome> {
+        match store.submit(Op::DeleteObjects { bucket: "b".into(), items: vec![("k".into(), Some(vid.into()))], bypass }).await {
+            Ok(OpOut::Deleted(mut r)) => r.pop().unwrap(),
+            Ok(_) => unreachable!(),
+            Err(e) => Err(e),
+        }
+    }
+
+    #[tokio::test]
+    async fn object_lock_blocks_deletes_and_purges() {
+        let (store, dir) = temp_store();
+        store.submit(Op::CreateBucket("b".into())).await.unwrap();
+        let cfg = |kind, v: &[u8]| Op::SetBucketConfig { bucket: "b".into(), kind, value: Some(v.to_vec()) };
+        // Object Lock needs versioning enabled first, and then keeps it enabled.
+        assert!(store.submit(cfg("object-lock", b"x")).await.is_err());
+        store.submit(cfg("versioning", b"Enabled")).await.unwrap();
+        store.submit(cfg("object-lock", lock::BucketLock::default().to_xml().as_bytes())).await.unwrap();
+        assert_eq!(store.submit(cfg("versioning", b"Suspended")).await.err().unwrap().code, "InvalidBucketState");
+
+        let set_lock = |version: &str, retention, legal_hold, bypass| Op::SetObjectLock {
+            bucket: "b".into(),
+            key: "k".into(),
+            version: Some(version.to_string()),
+            retention,
+            legal_hold,
+            bypass,
+        };
+        let far = now_ms() / 1000 + 3600;
+        let gov = Some(lock::Retention { mode: lock::Mode::Governance, until: far });
+        let comp = Some(lock::Retention { mode: lock::Mode::Compliance, until: far });
+
+        let v1 = put(&store, "k", "one").await.version.unwrap();
+        store.submit(set_lock(&v1, Some(gov), None, false)).await.unwrap();
+        assert_eq!(delete_version(&store, &v1, false).await.unwrap_err().code, "AccessDenied");
+        // GOVERNANCE -> COMPLIANCE is an extension; COMPLIANCE can then never be shortened.
+        store.submit(set_lock(&v1, Some(comp), None, false)).await.unwrap();
+        assert!(store.submit(set_lock(&v1, Some(None), None, true)).await.is_err());
+        assert_eq!(delete_version(&store, &v1, true).await.unwrap_err().code, "AccessDenied");
+
+        // A newer version makes v1 noncurrent; lifecycle must not purge it while locked.
+        let v2 = put(&store, "k", "two").await.version.unwrap();
+        let seq = version_seq(&v1).unwrap();
+        let purge =
+            Op::PurgeVersions { bucket: "b".into(), items: vec![("k".into(), seq, PurgeRule::NoncurrentBefore(u64::MAX))] };
+        assert!(matches!(store.submit(purge).await.unwrap(), OpOut::Count(0)));
+        assert_eq!(store.get_object_version("b", "k", &v1).unwrap().1.unwrap(), "one");
+
+        // Legal hold blocks even with bypass; GOVERNANCE yields to bypass.
+        store.submit(set_lock(&v2, Some(gov), Some(true), false)).await.unwrap();
+        assert!(delete_version(&store, &v2, true).await.is_err());
+        store.submit(set_lock(&v2, None, Some(false), false)).await.unwrap();
+        assert!(delete_version(&store, &v2, false).await.is_err());
+        assert!(delete_version(&store, &v2, true).await.is_ok());
+        // Deleting without a version id only adds a delete marker.
+        let OpOut::Deleted(r) =
+            store.submit(Op::DeleteObjects { bucket: "b".into(), items: vec![("k".into(), None)], bypass: false }).await.unwrap()
+        else {
+            unreachable!()
+        };
+        assert!(r[0].as_ref().unwrap().delete_marker);
+        assert_eq!(store.get_object_version("b", "k", &v1).unwrap().1.unwrap(), "one");
+        drop(store);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[tokio::test]
     async fn versioning_invariants_and_noncurrent_paging() {
         let (store, dir) = temp_store();
@@ -1630,7 +1770,7 @@ mod tests {
 
         // Delete marker, then removing it restores the object.
         let OpOut::Deleted(r) =
-            store.submit(Op::DeleteObjects { bucket: "b".into(), items: vec![("k".into(), None)] }).await.unwrap()
+            store.submit(Op::DeleteObjects { bucket: "b".into(), items: vec![("k".into(), None)], bypass: false }).await.unwrap()
         else {
             unreachable!()
         };
@@ -1638,11 +1778,17 @@ mod tests {
         let e = store.get_object("b", "k").unwrap_err();
         assert_eq!(e.code, "NoSuchKey");
         assert!(e.headers.iter().any(|(h, v)| *h == "x-amz-delete-marker" && v == "true"));
-        store.submit(Op::DeleteObjects { bucket: "b".into(), items: vec![("k".into(), Some(marker))] }).await.unwrap();
+        store
+            .submit(Op::DeleteObjects { bucket: "b".into(), items: vec![("k".into(), Some(marker))], bypass: false })
+            .await
+            .unwrap();
         assert_eq!(store.get_object("b", "k").unwrap().1.unwrap(), "v4");
 
         // Deleting the current version by id promotes the previous one.
-        store.submit(Op::DeleteObjects { bucket: "b".into(), items: vec![("k".into(), Some(ids[4].clone()))] }).await.unwrap();
+        store
+            .submit(Op::DeleteObjects { bucket: "b".into(), items: vec![("k".into(), Some(ids[4].clone()))], bypass: false })
+            .await
+            .unwrap();
         let (m, d) = store.get_object("b", "k").unwrap();
         assert_eq!((m.version.as_deref(), d.unwrap().as_ref()), (Some(ids[3].as_str()), &b"v3"[..]));
 

@@ -41,8 +41,8 @@ docker run -p 9000:9000 -v $PWD/data:/data -e S3RS_ACCESS_KEY=mykey -e S3RS_SECR
 ```
 
 ## Configuration
+
 Each flag can also be set with the environment variable shown (switches take `1`/`true`/`yes`/`on`).
-Each flag can also be set with the environment variable shown.
 
 | Flag | Env | Default | |
 |---|---|---|---|
@@ -60,6 +60,8 @@ Each flag can also be set with the environment variable shown.
 | `--encrypt-by-default` | `S3RS_ENCRYPT_BY_DEFAULT` | off | Encrypts every new object with the master key |
 | `--region` | `S3RS_REGION` | `us-east-1` | Region reported to clients |
 | `--domain` | `S3RS_DOMAIN` | | Turns on virtual-hosted-style requests (`<bucket>.<domain>`) |
+| `--website-listen` | `S3RS_WEBSITE_LISTEN` | | Serves static websites on this address (see [Static websites](#static-websites)) |
+| `--website-domain` | `S3RS_WEBSITE_DOMAIN` | | On the website endpoint, `<bucket>.<domain>` serves that bucket |
 | `--inline-threshold` | `S3RS_INLINE_THRESHOLD` | `65536` | Objects up to this many bytes are stored inside the metadata DB |
 | `--cache-mb` | `S3RS_CACHE_MB` | `256` | Metadata cache size |
 | `--no-fsync` | `S3RS_NO_FSYNC` | off | Skips fsync. Faster, but a power loss can lose up to ~1s of acknowledged writes. |
@@ -192,6 +194,50 @@ old versions, and a lookup by version id is a single key read. Versioning-enable
 every version, so small objects in them are stored as files rather than inline. That keeps the
 metadata database from growing without bound.
 
+## Object Lock
+
+Object Lock makes versions write-once (WORM), as on S3:
+- Create the bucket with Object Lock (`create_bucket(..., ObjectLockEnabledForBucket=True)`), or
+  enable it later on a bucket that already has versioning enabled. Versioning then cannot be
+  suspended and Object Lock cannot be turned off.
+- **Retention** per version, set on upload (`x-amz-object-lock-mode` and
+  `x-amz-object-lock-retain-until-date`), with `PutObjectRetention`, or from the bucket's default
+  retention (`PutObjectLockConfiguration` with `Days` or `Years`).
+  - `GOVERNANCE`: the version can't be deleted or have its retention shortened, unless the
+    request sends `x-amz-bypass-governance-retention: true`.
+  - `COMPLIANCE`: nobody can delete it or shorten its retention until the date passes.
+- **Legal hold** (`ON`/`OFF`) blocks deletion regardless of retention, until it is removed.
+- Retention and legal hold apply to PUT, CopyObject (the copy gets its own settings, not the
+  source's), multipart uploads and form uploads, and are returned on GET/HEAD.
+
+Deleting a key without a version id still works: it adds a delete marker, and the protected
+versions stay. Lifecycle rules never remove a protected version, and a bucket with versions can't
+be deleted. All checks run on the single metadata writer, atomically with the change.
+
+Every authenticated read-write key may bypass GOVERNANCE retention. Anonymous requests never can.
+Locks protect data from S3 API clients. Anyone with access to the data directory can still remove
+files, so use storage-level protection if that matters.
+
+## Static websites
+
+With `--website-listen` (e.g. `0.0.0.0:8080`), s3rs runs a second, website-only endpoint like S3's
+`s3-website` endpoints:
+- Configure a bucket with `PutBucketWebsite` (`aws s3 website s3://site --index-document
+  index.html --error-document 404.html`).
+- Make it publicly readable with a `public-read` ACL or a bucket policy. Only objects that anonymous
+  users may read are served.
+- The bucket is chosen by the `Host` header. `<bucket>.<website-domain>` works when
+  `--website-domain` is set. Otherwise, name the bucket after the host (e.g. a bucket called
+  `www.example.com` serves `http://www.example.com`).
+
+Supported: index documents (`/` and `/dir/`, and `/dir` redirects to `/dir/`), error documents
+(served with the original 404/403 status), routing rules (`KeyPrefixEquals` /
+`HttpErrorCodeReturnedEquals` conditions; `ReplaceKeyPrefixWith`, `ReplaceKeyWith`, `HostName`,
+`Protocol` and `HttpRedirectCode` redirects), `RedirectAllRequestsTo`, per-object
+`x-amz-website-redirect-location`, ranges and conditional GETs. Errors are HTML pages. The endpoint
+accepts only anonymous GET and HEAD, and never lists buckets. Behind a TLS-terminating proxy,
+redirects use the scheme from `X-Forwarded-Proto`.
+
 ## Browser uploads (POST policy)
 
 `POST /<bucket>` with `multipart/form-data` accepts browser form uploads, including those made with
@@ -211,8 +257,8 @@ direct uploads from web apps.
 
 | Area | Operations |
 |---|---|
-| Buckets | ListBuckets, CreateBucket (with canned ACL), DeleteBucket, HeadBucket, GetBucketLocation, Get/PutBucketVersioning, Get/PutBucketAcl, Get/Put/DeleteBucketPolicy, GetBucketPolicyStatus, Get/Put/DeleteBucketCors, Get/Put/DeleteBucketTagging, Get/Put/DeleteBucketEncryption |
-| Objects | PutObject, GetObject, HeadObject, DeleteObject, DeleteObjects, CopyObject (COPY/REPLACE for metadata and tags), Get/Put/DeleteObjectTagging, `x-amz-tagging` on upload, GetObjectAcl, SSE-S3 and SSE-C on every read/write/copy path |
+| Buckets | ListBuckets, CreateBucket (with canned ACL), DeleteBucket, HeadBucket, GetBucketLocation, Get/PutBucketVersioning, Get/PutBucketAcl, Get/Put/DeleteBucketPolicy, GetBucketPolicyStatus, Get/Put/DeleteBucketCors, Get/Put/DeleteBucketTagging, Get/Put/DeleteBucketEncryption, Get/PutObjectLockConfiguration, Get/Put/DeleteBucketWebsite |
+| Objects | PutObject, GetObject, HeadObject, DeleteObject, DeleteObjects, CopyObject (COPY/REPLACE for metadata and tags), Get/Put/DeleteObjectTagging, `x-amz-tagging` on upload, GetObjectAcl, Get/PutObjectRetention, Get/PutObjectLegalHold, SSE-S3 and SSE-C on every read/write/copy path |
 | Listing | ListObjects (v1), ListObjectsV2, ListObjectVersions (versions and delete markers); prefix, delimiter, pagination, `start-after`, `encoding-type=url` |
 | Multipart | CreateMultipartUpload, UploadPart, UploadPartCopy (with ranges), CompleteMultipartUpload, AbortMultipartUpload, ListParts, ListMultipartUploads |
 | Lifecycle | Get/Put/DeleteBucketLifecycleConfiguration (expiration, abort incomplete uploads) |
@@ -223,9 +269,8 @@ direct uploads from web apps.
 | Auth | SigV4 headers, SigV4 presigned URLs, SigV4 streaming (`STREAMING-AWS4-HMAC-SHA256-PAYLOAD[-TRAILER]`, `STREAMING-UNSIGNED-PAYLOAD-TRAILER`), SigV2 headers and presigned URLs |
 | Transport | HTTP/1.1 keep-alive, HTTP/2 (h2c), path-style and virtual-hosted-style addressing |
 
-Not implemented: per-user IAM policies, SSE-KMS, object lock, storage
-class transitions, website hosting, and SigV4A. These requests return
-`NotImplemented` or the matching "not found" configuration error.
+Not implemented: per-user IAM policies, SSE-KMS, storage class transitions and SigV4A. These
+requests return `NotImplemented` or the matching "not found" configuration error.
 
 ## Architecture
 

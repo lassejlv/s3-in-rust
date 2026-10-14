@@ -43,6 +43,16 @@ fn text(n: &Node, name: &str) -> Option<String> {
     n.child_text(name).map(str::trim).filter(|s| !s.is_empty()).map(str::to_string)
 }
 
+/// A redirect host name: printable ASCII without path, query, fragment or userinfo characters.
+fn host_name(n: &Node) -> S3Result<Option<String>> {
+    match text(n, "HostName") {
+        Some(h) if !h.bytes().all(|b| b.is_ascii_graphic() && !b"/\\?#@".contains(&b)) => {
+            Err(err::InvalidArgument().with_message("The HostName is not valid"))
+        }
+        h => Ok(h),
+    }
+}
+
 fn protocol(n: &Node) -> S3Result<Option<String>> {
     match text(n, "Protocol") {
         None => Ok(None),
@@ -58,7 +68,7 @@ impl Config {
         }
         let mut c = Config::default();
         if let Some(all) = doc.child("RedirectAllRequestsTo") {
-            let host = text(all, "HostName").ok_or_else(err::MalformedXML)?;
+            let host = host_name(all)?.ok_or_else(err::MalformedXML)?;
             c.redirect_all = Some(RedirectAll { host, protocol: protocol(all)? });
             if doc.child("IndexDocument").is_some() || doc.child("ErrorDocument").is_some() || doc.child("RoutingRules").is_some()
             {
@@ -90,19 +100,20 @@ impl Config {
                     None => None,
                 };
                 let rd = r.child("Redirect").ok_or_else(err::MalformedXML)?;
-                let redirect =
-                    Redirect {
-                        protocol: protocol(rd)?,
-                        host: text(rd, "HostName"),
-                        replace_prefix: rd.child_text("ReplaceKeyPrefixWith").map(str::to_string),
-                        replace_key: rd.child_text("ReplaceKeyWith").map(str::to_string),
-                        code: match text(rd, "HttpRedirectCode") {
-                            None => 301,
-                            Some(c) => c.parse::<u16>().ok().filter(|c| (300..400).contains(c)).ok_or_else(|| {
+                let redirect = Redirect {
+                    protocol: protocol(rd)?,
+                    host: host_name(rd)?,
+                    replace_prefix: rd.child_text("ReplaceKeyPrefixWith").map(str::to_string),
+                    replace_key: rd.child_text("ReplaceKeyWith").map(str::to_string),
+                    code: match text(rd, "HttpRedirectCode") {
+                        None => 301,
+                        Some(c) => {
+                            c.parse::<u16>().ok().filter(|c| matches!(c, 301 | 302 | 303 | 307 | 308)).ok_or_else(|| {
                                 err::InvalidArgument().with_message("The provided HTTP redirect code is not valid")
-                            })?,
-                        },
-                    };
+                            })?
+                        }
+                    },
+                };
                 if redirect.replace_prefix.is_some() && redirect.replace_key.is_some() {
                     return Err(
                         err::InvalidArgument().with_message("You can only define ReplaceKeyPrefix or ReplaceKey but not both.")

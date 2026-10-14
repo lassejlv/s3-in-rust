@@ -142,6 +142,9 @@ pub fn parse_amz_date(s: &str) -> Option<u64> {
 
 /// Parse `2026-01-01T00:00:00Z` or `2026-01-01T00:00:00.000Z` into unix seconds.
 pub fn parse_iso8601(s: &str) -> Option<u64> {
+    if !s.is_ascii() {
+        return None;
+    }
     let b = s.as_bytes();
     if b.len() < 20 || b[4] != b'-' || b[7] != b'-' || b[10] != b'T' || b[13] != b':' || b[16] != b':' || !s.ends_with('Z') {
         return None;
@@ -301,6 +304,9 @@ mod tests {
         assert_eq!(parse_iso8601("2009-10-12T17:50:30.000Z"), Some(1_255_369_830));
         assert_eq!(parse_iso8601("2009-10-12T17:50:30Z"), Some(1_255_369_830));
         assert_eq!(parse_iso8601("2009-10-12 17:50:30Z"), None);
+        // Multi-byte characters must not panic (byte slicing).
+        assert_eq!(parse_iso8601("2030-01-01T00:00:0éZ"), None);
+        assert_eq!(parse_iso8601("2030-01-01T00:00:00.é"), None);
         assert_eq!(parse_iso8601(&iso8601(1_700_000_000_123)), Some(1_700_000_000));
     }
 

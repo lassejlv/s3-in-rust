@@ -237,19 +237,30 @@ fn write_cond(h: &HeaderMap) -> Option<WriteCond> {
     header(h, "if-match").map(|v| WriteCond::Matches(v.to_string()))
 }
 
+const WEBSITE_REDIRECT: &str = "x-amz-website-redirect-location";
+
+/// Website redirect targets must be a path on the same site or an absolute http(s) URL.
+fn valid_redirect_location(v: &str) -> bool {
+    (v.starts_with('/') && !v.starts_with("//")) || v.starts_with("http://") || v.starts_with("https://")
+}
+
 /// Headers persisted with an object and replayed on GET/HEAD.
-fn stored_headers(h: &HeaderMap) -> Vec<(String, String)> {
+fn stored_headers(h: &HeaderMap) -> S3Result<Vec<(String, String)>> {
+    if let Some(loc) = header(h, WEBSITE_REDIRECT)
+        && !valid_redirect_location(loc)
+    {
+        return Err(S3Error::new(
+            "InvalidRedirectLocation",
+            StatusCode::BAD_REQUEST,
+            "The website redirect location must have a prefix of 'http://' or 'https://' or '/'.",
+        ));
+    }
     let mut out = Vec::new();
     for (name, value) in h {
         let n = name.as_str();
         let keep = matches!(
             n,
-            "content-type"
-                | "content-disposition"
-                | "content-language"
-                | "cache-control"
-                | "expires"
-                | "x-amz-website-redirect-location"
+            "content-type" | "content-disposition" | "content-language" | "cache-control" | "expires" | WEBSITE_REDIRECT
         ) || n.starts_with("x-amz-meta-");
         let v = String::from_utf8_lossy(value.as_bytes()).into_owned();
         if keep {
@@ -261,7 +272,7 @@ fn stored_headers(h: &HeaderMap) -> Vec<(String, String)> {
             }
         }
     }
-    out
+    Ok(out)
 }
 
 fn valid_bucket_name(b: &str) -> bool {
@@ -464,7 +475,9 @@ impl Server {
             (Some(_), &Method::PUT) if r.header("x-amz-copy-source").is_none() && !sub && !has_lock_headers(&r.parts.headers) => {
                 "s3:PutObject"
             }
-            (Some(_), &Method::POST) if r.has("uploads") || r.has("uploadId") => "s3:PutObject",
+            (Some(_), &Method::POST) if (r.has("uploads") && !has_lock_headers(&r.parts.headers)) || r.has("uploadId") => {
+                "s3:PutObject"
+            }
             (Some(_), &Method::DELETE) if r.has("uploadId") => "s3:AbortMultipartUpload",
             (Some(_), &Method::DELETE) if !sub => "s3:DeleteObject",
             (None, &Method::GET) if r.has("location") => "s3:GetBucketLocation",
@@ -624,7 +637,8 @@ impl Server {
             && access.allows_anonymous("s3:GetObject", &format!("arn:aws:s3:::{bucket}/{key}/{index}"))
             && self.store.get_object(bucket, &format!("{key}/{index}")).is_ok()
         {
-            return redirect(302, &format!("/{}/", uri_encode(&key, true)));
+            // Absolute, so a key starting with "/" cannot become a protocol-relative URL.
+            return redirect(302, &format!("{proto}://{host_full}/{}/", uri_encode(&key, true)));
         }
         if let Some(rule) = cfg.rule_for(&key, Some(e.status.as_u16())) {
             return redirect(rule.redirect.code, &rule.location(&key, proto, host_full));
@@ -651,7 +665,7 @@ impl Server {
             return Err(err::AccessDenied());
         }
         let (meta, _) = self.store.get_object(bucket, key)?;
-        if let Some((_, loc)) = meta.headers.iter().find(|(k, _)| k == "x-amz-website-redirect-location") {
+        if let Some((_, loc)) = meta.headers.iter().find(|(k, v)| k == WEBSITE_REDIRECT && valid_redirect_location(v)) {
             let mut r = Resp::new(StatusCode::MOVED_PERMANENTLY);
             r.set("location", loc);
             return Ok(r);
@@ -680,6 +694,7 @@ impl Server {
         if let Some(domain) = &self.domain {
             let host = header(headers, "host").or_else(|| uri.authority().map(|a| a.as_str())).unwrap_or("");
             let host = host.rsplit_once(':').filter(|(_, p)| p.chars().all(|c| c.is_ascii_digit())).map_or(host, |(h, _)| h);
+            let host = host.to_ascii_lowercase();
             if let Some(b) = host.strip_suffix(domain.as_str()).and_then(|h| h.strip_suffix('.'))
                 && !b.is_empty()
             {
@@ -1556,7 +1571,7 @@ impl Server {
         let body = std::mem::replace(&mut r.body, BodyStream::empty());
         let ing = io::ingest(&self.store, body, expect).await?;
         let etag = etag_of(ing.md5, enc.as_ref().map(|(k, _)| k));
-        let mut headers = stored_headers(&r.parts.headers);
+        let mut headers = stored_headers(&r.parts.headers)?;
         headers.extend(enc.map(|(_, h)| h).unwrap_or_default());
         headers.extend(lock_headers);
         self.metrics.add_bytes_in(ing.size);
@@ -1777,7 +1792,7 @@ impl Server {
                 }
             };
             // Encryption and Object Lock settings belong to the new version, not the source.
-            let mut headers = if replace { stored_headers(&r.parts.headers) } else { inheritable(&src.headers) };
+            let mut headers = if replace { stored_headers(&r.parts.headers)? } else { inheritable(&src.headers) };
             headers.extend(dst_enc.as_ref().map(|(_, h)| h.clone()).unwrap_or_default());
             headers.extend(lock_headers.iter().cloned());
             let tags = if replace_tags { request_tags(r)? } else { src.tags.clone() };
@@ -1838,7 +1853,7 @@ impl Server {
         let tags = request_tags(r)?;
         // The upload's encryption applies to every part and to the completed object.
         let enc = self.write_encryption(&r.parts.headers, bucket, None)?;
-        let mut headers = stored_headers(&r.parts.headers);
+        let mut headers = stored_headers(&r.parts.headers)?;
         headers.extend(enc.map(|(_, h)| h).unwrap_or_default());
         headers.extend(self.new_lock_headers(&r.parts.headers, bucket)?);
         let meta = UploadMeta { bucket: bucket.into(), key: key.into(), initiated_ms: now_ms(), headers: headers.clone(), tags };

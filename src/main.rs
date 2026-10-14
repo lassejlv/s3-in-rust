@@ -129,12 +129,12 @@ fn parse_args() -> Result<Config, String> {
             .map_err(|e| format!("S3RS_ENCRYPTION_KEY: {e}"))?,
         encrypt_by_default: env_flag("S3RS_ENCRYPT_BY_DEFAULT")?,
         region: env("S3RS_REGION").unwrap_or_else(|| "us-east-1".into()),
-        domain: env("S3RS_DOMAIN"),
+        domain: env("S3RS_DOMAIN").map(|d| d.to_ascii_lowercase()),
         website_listen: env("S3RS_WEBSITE_LISTEN")
             .map(|v| v.parse())
             .transpose()
             .map_err(|e| format!("S3RS_WEBSITE_LISTEN: {e}"))?,
-        website_domain: env("S3RS_WEBSITE_DOMAIN"),
+        website_domain: env("S3RS_WEBSITE_DOMAIN").map(|d| d.to_ascii_lowercase()),
         inline_threshold: env("S3RS_INLINE_THRESHOLD")
             .map_or(Ok(65536), |v| v.parse())
             .map_err(|e| format!("S3RS_INLINE_THRESHOLD: {e}"))?,
@@ -172,11 +172,11 @@ fn parse_args() -> Result<Config, String> {
             }
             "--encrypt-by-default" => c.encrypt_by_default = true,
             "--region" => c.region = val()?,
-            "--domain" => c.domain = Some(val()?),
+            "--domain" => c.domain = Some(val()?.to_ascii_lowercase()),
             "--website-listen" => {
                 c.website_listen = Some(val()?.parse().map_err(|e| format!("--website-listen: {e}"))?);
             }
-            "--website-domain" => c.website_domain = Some(val()?),
+            "--website-domain" => c.website_domain = Some(val()?.to_ascii_lowercase()),
             "--inline-threshold" => c.inline_threshold = val()?.parse().map_err(|e| format!("--inline-threshold: {e}"))?,
             "--cache-mb" => c.cache_mb = val()?.parse().map_err(|e| format!("--cache-mb: {e}"))?,
             "--no-fsync" => c.fsync = false,

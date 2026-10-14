@@ -956,6 +956,22 @@ def t_object_lock():
         lambda: s3.put_object_lock_configuration(Bucket=B, ObjectLockConfiguration={"ObjectLockEnabled": "Enabled"}),
     )
 
+    # A presigned URL holder cannot add an unsigned bypass header.
+    url = s3.generate_presigned_url("delete_object", Params={"Bucket": lb, "Key": "def", "VersionId": d["VersionId"]})
+    req = urllib.request.Request(url, method="DELETE", headers={"x-amz-bypass-governance-retention": "true"})
+    try:
+        urllib.request.urlopen(req)
+        raise AssertionError("unsigned bypass header was accepted")
+    except urllib.error.HTTPError as e:
+        assert e.code == 403, e.code
+    assert s3.get_object(Bucket=lb, Key="def", VersionId=d["VersionId"])["Body"].read() == b"d"
+    # Anonymous writers (public-read-write) cannot set locks, also not through multipart uploads.
+    s3.put_bucket_acl(Bucket=lb, ACL="public-read-write")
+    lock_hdrs = {"x-amz-object-lock-mode": "COMPLIANCE", "x-amz-object-lock-retain-until-date": "2099-01-01T00:00:00Z"}
+    assert http("POST", f"/{lb}/anon?uploads", headers=lock_hdrs)[0] == 403
+    assert http("PUT", f"/{lb}/anon", headers=lock_hdrs, data=b"x")[0] == 403
+    s3.put_bucket_acl(Bucket=lb, ACL="private")
+
     # Clean up: wait out the COMPLIANCE retention, then bypass the GOVERNANCE ones.
     time.sleep(max(0.0, (comp_until - now()).total_seconds() + 1.1))
     for page in s3.get_paginator("list_object_versions").paginate(Bucket=lb):
@@ -1014,7 +1030,7 @@ def t_website():
     st, h, body = web(host, "/")
     assert (st, body, h["Content-Type"]) == (200, b"<h1>home</h1>", "text/html"), (st, body)
     st, h, _ = web(host, "/about")
-    assert st == 302 and h["Location"] == "/about/", (st, h["Location"])
+    assert st == 302 and h["Location"] == f"http://{host}/about/", (st, h["Location"])
     assert web(host, "/about/")[2] == b"about"
     st, _, body = web(host, "/nope.html")
     assert (st, body) == (404, b"custom not found"), (st, body)
@@ -1022,6 +1038,14 @@ def t_website():
     assert st == 301 and h["Location"] == f"http://{host}/new/page.html", h["Location"]
     st, h, _ = web(host, "/moved")
     assert st == 301 and h["Location"] == "/about/", (st, h["Location"])
+    expect_error(
+        "InvalidRedirectLocation", lambda: s3.put_object(Bucket=wb, Key="bad", Body=b"", WebsiteRedirectLocation="//evil.example")
+    )
+    # A key starting with "/" must not turn the directory redirect into a protocol-relative URL.
+    s3.put_object(Bucket=wb, Key="/evil.example/index.html", Body=b"x")
+    st, h, _ = web(host, "//evil.example")
+    assert st == 302 and h["Location"] == f"http://{host}//evil.example/", (st, h["Location"])
+    s3.delete_object(Bucket=wb, Key="/evil.example/index.html")
     st, h, body = web(host, "/", method="HEAD")
     assert st == 200 and body == b"" and h["Content-Length"] == "13", (st, h)
     etag = h["ETag"]

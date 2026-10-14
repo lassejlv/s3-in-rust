@@ -192,7 +192,10 @@ impl BucketLock {
         };
         let period = match (num("Days")?, num("Years")?) {
             (Some(d), None) => Period::Days(d),
-            (None, Some(y)) if y <= 100 => Period::Years(y),
+            (None, Some(y)) if y > 100 => {
+                return Err(err::InvalidArgument().with_message("Default retention period cannot exceed 100 years"));
+            }
+            (None, Some(y)) => Period::Years(y),
             _ => return Err(err::MalformedXML().with_message("Default retention needs exactly one of Days or Years")),
         };
         Ok(BucketLock { default: Some((mode, period)) })

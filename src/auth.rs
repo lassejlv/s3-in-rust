@@ -498,6 +498,17 @@ impl Auth {
         if !signed.contains(&"host") {
             return Err(err::AccessDenied().with_message("Host header must be signed"));
         }
+        // Whoever holds a presigned URL must not be able to add x-amz-* headers (for example
+        // to bypass Object Lock); Object Lock headers must always be signed.
+        for name in parts.headers.keys() {
+            let n = name.as_str();
+            let must_sign = (presigned && n.starts_with("x-amz-") && n != "x-amz-content-sha256")
+                || n.starts_with("x-amz-object-lock-")
+                || n == "x-amz-bypass-governance-retention";
+            if must_sign && !signed.contains(&n) {
+                return Err(err::AccessDenied().with_message("There were headers present in the request which were not signed"));
+            }
+        }
         let canonical_headers = canonical_headers(parts, &signed);
         let canonical_query = canonical_query(raw_query, presigned);
         let scope = format!("{}/{}/{}/aws4_request", p.date, p.region, p.service);

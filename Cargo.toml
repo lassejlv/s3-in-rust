@@ -28,5 +28,4 @@ tokio = { version = "1.53.3", features = ["rt-multi-thread", "net", "sync", "mac
 opt-level = 3
 lto = "fat"
 codegen-units = 1
-panic = "abort"
 strip = true

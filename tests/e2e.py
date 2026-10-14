@@ -661,6 +661,21 @@ def t_versioning():
         paged += [("dm", d["Key"], d["VersionId"], d["IsLatest"]) for d in page.get("DeleteMarkers", [])]
     assert sorted(paged) == sorted(full) and len(paged) == len(set(paged)), (paged, full)
 
+    # Regression: a key-marker shorter than the prefix must not crash the server.
+    r = s3.list_object_versions(Bucket=vb, Prefix="abc", Delimiter="/", KeyMarker="b/")
+    assert "Versions" not in r
+    r = s3.list_object_versions(Bucket=vb, Prefix="a", Delimiter="/", KeyMarker="\u00e9/")
+    assert http("GET", "/_health")[0] == 200
+    # Keys containing NUL are rejected (they would alias other keys' versions).
+    assert http("PUT", f"/{vb}/a%00b", data=b"x")[0] in (400, 403)
+    res = s3.delete_objects(Bucket=vb, Delete={"Objects": [{"Key": "a\x00b"}]})
+    assert res.get("Errors") and not res.get("Deleted"), res
+    # Deleting a delete marker by version id reports DeleteMarkerVersionId.
+    s3.put_object(Bucket=vb, Key="dmk", Body=b"x")
+    m = s3.delete_object(Bucket=vb, Key="dmk")["VersionId"]
+    res = s3.delete_objects(Bucket=vb, Delete={"Objects": [{"Key": "dmk", "VersionId": m}]})
+    assert res["Deleted"][0]["DeleteMarker"] is True and res["Deleted"][0]["DeleteMarkerVersionId"] == m, res
+
     # Suspended: new writes replace the single "null" version, older versions stay.
     s3.put_bucket_versioning(Bucket=vb, VersioningConfiguration={"Status": "Suspended"})
     s3.put_object(Bucket=vb, Key="k", Body=b"s1")

@@ -6,7 +6,7 @@
 
 use crate::error::{S3Result, err};
 use crate::store::meta::ObjectMeta;
-use crate::store::{Op, OpOut, Store};
+use crate::store::{Op, OpOut, PurgeRule, Store};
 use crate::util;
 use crate::xml;
 use std::sync::Arc;
@@ -205,21 +205,29 @@ pub async fn sweep(store: &Arc<Store>, day_secs: u64) -> S3Result<(u64, u64)> {
                         .await
                         .map_err(crate::error::S3Error::internal)??;
                     let n = page.items.len();
-                    let due: Vec<(String, u64)> = page
+                    // Due when since + days, rounded up to midnight, has passed; equivalently when
+                    // the version became noncurrent at or before this cutoff.
+                    let cutoff = rule.noncurrent_days.map(|d| (now / day_secs * day_secs).saturating_sub(d * day_secs));
+                    let due: Vec<(String, u64, PurgeRule)> = page
                         .items
                         .iter()
                         // Delete markers carry no tags or size, so only the prefix applies to them.
                         .filter(|it| {
                             if it.meta.delete_marker { it.key.starts_with(&rule.prefix) } else { rule.matches(&it.key, &it.meta) }
                         })
-                        .filter(|it| match it.noncurrent_since_ms {
-                            Some(since) => rule.noncurrent_days.is_some_and(|d| {
-                                let due = (since / 1000 + d * day_secs).div_ceil(day_secs) * day_secs;
-                                now >= due
-                            }),
-                            None => rule.expired_delete_marker && it.meta.delete_marker && it.only_version,
+                        .filter_map(|it| {
+                            let why = match it.noncurrent_since_ms {
+                                Some(since) => {
+                                    let cut = cutoff?;
+                                    (since / 1000 <= cut).then_some(PurgeRule::NoncurrentBefore(cut))?
+                                }
+                                None if rule.expired_delete_marker && it.meta.delete_marker && it.only_version => {
+                                    PurgeRule::LoneDeleteMarker
+                                }
+                                None => return None,
+                            };
+                            Some((it.key.clone(), it.meta.seq, why))
                         })
-                        .map(|it| (it.key.clone(), it.meta.seq))
                         .collect();
                     if !due.is_empty()
                         && let Ok(OpOut::Count(c)) = store.submit(Op::PurgeVersions { bucket: bucket.clone(), items: due }).await

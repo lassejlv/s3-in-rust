@@ -224,6 +224,8 @@ pub fn xml_escape(s: &str, out: &mut String) {
             '"' => out.push_str("&quot;"),
             '\'' => out.push_str("&apos;"),
             '\r' => out.push_str("&#13;"),
+            // NUL cannot appear in XML 1.0 at all, not even as a character reference.
+            '\0' => out.push('\u{FFFD}'),
             c if (c as u32) < 0x20 && c != '\n' && c != '\t' => {
                 out.push_str(&format!("&#{};", c as u32));
             }

@@ -54,6 +54,15 @@ impl Versioning {
     }
 }
 
+/// Why the lifecycle sweeper wants a noncurrent entry removed.
+#[derive(Debug, Clone, Copy)]
+pub enum PurgeRule {
+    /// The entry became noncurrent at or before this unix time (seconds).
+    NoncurrentBefore(u64),
+    /// The entry is a delete marker with no other versions left.
+    LoneDeleteMarker,
+}
+
 /// Result of deleting a key or a specific version.
 #[derive(Debug, Clone, Default)]
 pub struct DeleteOutcome {
@@ -72,6 +81,15 @@ fn ver_key(bucket: &str, key: &str, seq: u64) -> Vec<u8> {
     let mut k = ver_prefix(bucket, key);
     k.extend_from_slice(&(u64::MAX - seq).to_be_bytes());
     k
+}
+
+/// Object keys may not contain NUL: it separates the key from the sequence number in
+/// VERSIONS keys, so a NUL would let one key's range cover another key's versions.
+pub fn check_key_chars(key: &str) -> S3Result<()> {
+    if key.contains('\0') {
+        return Err(err::InvalidArgument().with_message("Object keys may not contain NUL characters"));
+    }
+    Ok(())
 }
 
 /// Version ids are `<seq as 16 hex><16 random hex>`, so a lookup by id needs no index.
@@ -177,10 +195,11 @@ pub enum Op {
         version: Option<String>,
         tags: Vec<(String, String)>,
     },
-    /// Lifecycle: permanently remove noncurrent entries (key, seq).
+    /// Lifecycle: permanently remove noncurrent entries (key, seq, rule). Each item is
+    /// re-checked against the current state, so concurrent writes never cause early deletion.
     PurgeVersions {
         bucket: String,
-        items: Vec<(String, u64)>,
+        items: Vec<(String, u64, PurgeRule)>,
     },
     /// Lifecycle expiration: delete each (key, mtime_ms) only if the object still has that
     /// mtime, so an object overwritten after the sweeper looked at it is left alone.
@@ -659,7 +678,7 @@ impl Store {
                 None => {
                     cursor = (km.as_bytes().to_vec(), false);
                     // Resuming after a common prefix: skip everything rolled up under it.
-                    if !delimiter.is_empty() && km.ends_with(delimiter) {
+                    if !delimiter.is_empty() && km.starts_with(prefix) && km.ends_with(delimiter) {
                         let rest = &km[prefix.len()..];
                         if rest.find(delimiter) == Some(rest.len() - delimiter.len()) {
                             match prefix_successor(km.as_bytes()) {
@@ -784,8 +803,16 @@ impl Store {
             Bound::Unbounded => Bound::Unbounded,
         };
         let mut page = NoncurrentPage::default();
-        // Previous (newer) entry of the same key: (key, mtime).
+        // Previous (newer) entry of the same key: (key, mtime). When resuming, seed it with the
+        // entry we stopped at, so a key whose versions span two pages keeps the right times.
         let mut newer: Option<(String, u64)> = None;
+        if let Some(a) = after
+            && a.len() > base_len + 9
+            && let Some(g) = versions.get(a)?
+        {
+            let key = String::from_utf8(a[base_len..a.len() - 9].to_vec()).map_err(|_| S3Error::internal("bad key"))?;
+            newer = Some((key, ObjectMeta::decode(g.value())?.mtime_ms));
+        }
         let mut items: Vec<(String, ObjectMeta, Option<u64>)> = Vec::new();
         for e in versions.range::<&[u8]>((lower, Bound::Excluded(end.as_slice())))? {
             let (k, v) = e?;
@@ -1330,6 +1357,7 @@ fn apply(tx: &mut Tables, op: Op, garbage: &mut Vec<u128>, last_seq: &mut u64) -
             Ok(OpOut::Done)
         }
         Op::PutObject { bucket, key, meta, inline, cond } => {
+            check_key_chars(&key)?;
             if tx.buckets.get(bucket.as_str())?.is_none() {
                 return Err(err::NoSuchBucket());
             }
@@ -1359,10 +1387,10 @@ fn apply(tx: &mut Tables, op: Op, garbage: &mut Vec<u128>, last_seq: &mut u64) -
             }
             let mut out = Vec::with_capacity(items.len());
             for (key, version) in items {
-                let r = match version {
+                let r = check_key_chars(&key).and_then(|_| match version {
                     Some(v) => delete_version(tx, &bucket, &key, &v, garbage),
                     None => delete_current(tx, last_seq, &bucket, &key, garbage),
-                };
+                });
                 if let Err(e) = &r
                     && e.code == "InternalError"
                 {
@@ -1373,6 +1401,7 @@ fn apply(tx: &mut Tables, op: Op, garbage: &mut Vec<u128>, last_seq: &mut u64) -
             Ok(OpOut::Deleted(out))
         }
         Op::CreateUpload { id, meta } => {
+            check_key_chars(&meta.key)?;
             if tx.buckets.get(meta.bucket.as_str())?.is_none() {
                 return Err(err::NoSuchBucket());
             }
@@ -1433,10 +1462,31 @@ fn apply(tx: &mut Tables, op: Op, garbage: &mut Vec<u128>, last_seq: &mut u64) -
         }
         Op::PurgeVersions { bucket, items } => {
             let mut n = 0;
-            for (key, seq) in items {
+            for (key, seq, rule) in items {
                 let vk = ver_key(&bucket, &key, seq);
-                let removed = tx.versions.remove(vk.as_slice())?.map(|g| ObjectMeta::decode(g.value())).transpose()?;
-                if let Some(m) = removed {
+                let Some(m) = tx.versions.get(vk.as_slice())?.map(|g| ObjectMeta::decode(g.value())).transpose()? else {
+                    continue;
+                };
+                let p = ver_prefix(&bucket, &key);
+                let still_due = match rule {
+                    // Noncurrent since the next-newer version was written.
+                    PurgeRule::NoncurrentBefore(cutoff_secs) => {
+                        let newer = match tx.versions.range::<&[u8]>(p.as_slice()..vk.as_slice())?.next_back() {
+                            Some(e) => Some(ObjectMeta::decode(e?.1.value())?.mtime_ms),
+                            None => get_meta(tx, &obj_key(&bucket, &key))?.map(|c| c.mtime_ms),
+                        };
+                        newer.is_some_and(|since| since / 1000 <= cutoff_secs)
+                    }
+                    // A delete marker that is the only thing left of its key.
+                    PurgeRule::LoneDeleteMarker => {
+                        let end = prefix_successor(&p).expect("prefix ends with 0");
+                        m.delete_marker
+                            && get_meta(tx, &obj_key(&bucket, &key))?.is_none()
+                            && tx.versions.range::<&[u8]>(p.as_slice()..end.as_slice())?.take(2).count() == 1
+                    }
+                };
+                if still_due {
+                    tx.versions.remove(vk.as_slice())?;
                     release(tx, &m, garbage)?;
                     promote(tx, &bucket, &key)?;
                     n += 1;
@@ -1508,6 +1558,101 @@ fn apply(tx: &mut Tables, op: Op, garbage: &mut Vec<u128>, last_seq: &mut u64) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn temp_store() -> (Arc<Store>, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("s3rs-test-{}", util::id_hex(util::new_id())));
+        let store =
+            Store::open(StoreConfig { root: dir.clone(), fsync: false, inline_threshold: 1024, cache_bytes: 1 << 20 }).unwrap();
+        (store, dir)
+    }
+
+    fn small(data: &str) -> (ObjectMeta, Option<Bytes>) {
+        let meta = ObjectMeta {
+            size: data.len() as u64,
+            mtime_ms: now_ms(),
+            etag: format!("\"{}\"", data),
+            headers: vec![],
+            checksum: None,
+            storage: Storage::Inline(util::new_id()),
+            tags: vec![],
+            version: None,
+            seq: 0,
+            delete_marker: false,
+        };
+        (meta, Some(Bytes::copy_from_slice(data.as_bytes())))
+    }
+
+    async fn put(store: &Store, key: &str, data: &str) -> ObjectMeta {
+        let (meta, inline) = small(data);
+        match store.submit(Op::PutObject { bucket: "b".into(), key: key.into(), meta, inline, cond: None }).await.unwrap() {
+            OpOut::Object(m) => m,
+            _ => unreachable!(),
+        }
+    }
+
+    #[tokio::test]
+    async fn versioning_invariants_and_noncurrent_paging() {
+        let (store, dir) = temp_store();
+        store.submit(Op::CreateBucket("b".into())).await.unwrap();
+        store
+            .submit(Op::SetBucketConfig { bucket: "b".into(), kind: "versioning", value: Some(b"Enabled".to_vec()) })
+            .await
+            .unwrap();
+        let mut ids = Vec::new();
+        for i in 0..5 {
+            ids.push(put(&store, "k", &format!("v{i}")).await.version.unwrap());
+            put(&store, "k-other", &format!("o{i}")).await;
+        }
+        // Latest is current; older versions readable by id.
+        assert_eq!(store.get_object("b", "k").unwrap().1.unwrap(), "v4");
+        assert_eq!(store.get_object_version("b", "k", &ids[1]).unwrap().1.unwrap(), "v1");
+
+        // Noncurrent scan: paging with limit 1 must give the same "noncurrent since" times.
+        let full = store.scan_noncurrent("b", "", None, 1000).unwrap();
+        let mut paged = Vec::new();
+        let mut after: Option<Vec<u8>> = None;
+        loop {
+            let page = store.scan_noncurrent("b", "", after.as_deref(), 1).unwrap();
+            if page.items.is_empty() {
+                break;
+            }
+            after = page.last.clone();
+            paged.extend(page.items);
+        }
+        let sig = |v: &[NoncurrentItem]| v.iter().map(|i| (i.key.clone(), i.meta.seq, i.noncurrent_since_ms)).collect::<Vec<_>>();
+        assert_eq!(full.items.len(), 8);
+        assert_eq!(sig(&full.items), sig(&paged));
+        // Each noncurrent version became noncurrent when the next-newer one was written.
+        let k: Vec<_> = full.items.iter().filter(|i| i.key == "k").collect();
+        for w in k.windows(2) {
+            assert_eq!(w[1].noncurrent_since_ms, Some(w[0].meta.mtime_ms));
+        }
+
+        // Delete marker, then removing it restores the object.
+        let OpOut::Deleted(r) =
+            store.submit(Op::DeleteObjects { bucket: "b".into(), items: vec![("k".into(), None)] }).await.unwrap()
+        else {
+            unreachable!()
+        };
+        let marker = r[0].as_ref().unwrap().version_id.clone().unwrap();
+        let e = store.get_object("b", "k").unwrap_err();
+        assert_eq!(e.code, "NoSuchKey");
+        assert!(e.headers.iter().any(|(h, v)| *h == "x-amz-delete-marker" && v == "true"));
+        store.submit(Op::DeleteObjects { bucket: "b".into(), items: vec![("k".into(), Some(marker))] }).await.unwrap();
+        assert_eq!(store.get_object("b", "k").unwrap().1.unwrap(), "v4");
+
+        // Deleting the current version by id promotes the previous one.
+        store.submit(Op::DeleteObjects { bucket: "b".into(), items: vec![("k".into(), Some(ids[4].clone()))] }).await.unwrap();
+        let (m, d) = store.get_object("b", "k").unwrap();
+        assert_eq!((m.version.as_deref(), d.unwrap().as_ref()), (Some(ids[3].as_str()), &b"v3"[..]));
+
+        // Keys with NUL are refused.
+        let (meta, inline) = small("x");
+        assert!(store.submit(Op::PutObject { bucket: "b".into(), key: "a\0b".into(), meta, inline, cond: None }).await.is_err());
+
+        drop(store);
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     #[test]
     fn successor() {

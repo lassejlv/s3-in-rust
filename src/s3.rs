@@ -266,7 +266,7 @@ fn check_key(key: &str) -> S3Result<()> {
     if key.len() > MAX_KEY_LEN {
         return Err(err::KeyTooLongError());
     }
-    Ok(())
+    store::check_key_chars(key)
 }
 
 /// `?encoding-type=url` support for list responses.
@@ -1316,7 +1316,10 @@ impl Server {
         let path = uri_decode(path, false).ok_or_else(|| err::InvalidArgument().with_message("Invalid copy source encoding"))?;
         let path = path.strip_prefix('/').unwrap_or(&path);
         match path.split_once('/') {
-            Some((b, k)) if !b.is_empty() && !k.is_empty() => Ok((b.to_string(), k.to_string(), version)),
+            Some((b, k)) if !b.is_empty() && !k.is_empty() => {
+                check_key(k)?;
+                Ok((b.to_string(), k.to_string(), version))
+            }
             _ => {
                 Err(err::InvalidArgument()
                     .with_message("Copy Source must mention the source bucket and key: sourcebucket/sourcekey"))
@@ -1326,7 +1329,7 @@ impl Server {
 
     async fn copy_object(&self, r: &mut Req, bucket: &str, key: &str) -> S3Result<Resp> {
         let (sb, sk, sv) = self.copy_source(r)?;
-        self.store.require_bucket(bucket)?;
+        let dest_versioned = self.bucket_access(bucket)?.versioning == store::Versioning::Enabled;
         let replace = r.header("x-amz-metadata-directive").is_some_and(|d| d.eq_ignore_ascii_case("REPLACE"));
         let replace_tags = r.header("x-amz-tagging-directive").is_some_and(|d| d.eq_ignore_ascii_case("REPLACE"));
         let _ = r.body.read_all(MAX_XML_BODY).await?;
@@ -1339,6 +1342,15 @@ impl Server {
                 ));
             }
             let (storage, files) = match &src.storage {
+                // Versioned buckets keep small objects in files (see put_object).
+                Storage::Inline(_) if dest_versioned => {
+                    let (st, src2, data, size) = (self.store.clone(), src.clone(), inline.clone(), src.size);
+                    let (id, _) =
+                        tokio::task::spawn_blocking(move || io::copy_range_blocking(&st, &src2, data.as_ref(), 0, size))
+                            .await
+                            .map_err(S3Error::internal)??;
+                    (Storage::Segments(vec![(id, size)]), vec![id])
+                }
                 Storage::Inline(_) => (Storage::Inline(util::new_id()), vec![]),
                 Storage::Segments(segs) => {
                     let (st, segs) = (self.store.clone(), segs.clone());
@@ -1676,7 +1688,7 @@ impl Server {
         if objects.len() > 1000 {
             return Err(err::MalformedXML().with_message("The request must contain no more than 1000 keys"));
         }
-        let (valid, invalid): (Vec<_>, Vec<_>) = objects.into_iter().partition(|(k, _)| !k.is_empty() && k.len() <= MAX_KEY_LEN);
+        let (valid, invalid): (Vec<_>, Vec<_>) = objects.into_iter().partition(|(k, _)| !k.is_empty() && check_key(k).is_ok());
         let OpOut::Deleted(results) =
             self.store.submit(Op::DeleteObjects { bucket: bucket.into(), items: valid.clone() }).await?
         else {
@@ -1693,9 +1705,7 @@ impl Server {
                     }
                     if o.delete_marker {
                         x.elem("DeleteMarker", "true");
-                        if let Some(v) = &o.version_id
-                            && requested.is_none()
-                        {
+                        if let Some(v) = &o.version_id {
                             x.elem("DeleteMarkerVersionId", v);
                         }
                     }

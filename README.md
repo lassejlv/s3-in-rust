@@ -2,7 +2,7 @@
 
 A fast, lightweight, S3-compatible object storage server written in pure Rust.
 
-- **Single static binary** (~2.6 MB), no runtime dependencies, no C code in the dependency tree.
+- **Single static binary** (~3.5 MB), no runtime dependencies, no C code in the dependency tree.
 - **Works with standard S3 clients**: AWS CLI, boto3, and other SDKs (SigV4 and SigV2 auth, presigned
   URLs, streaming/chunked uploads, multipart uploads, checksums).
 - **Fast**: about 110k small GETs/s, about 35k durable small PUTs/s, and multiple GB/s of large-object reads on a

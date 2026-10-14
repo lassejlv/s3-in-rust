@@ -8,13 +8,15 @@ pub struct S3Error {
     pub code: &'static str,
     pub status: StatusCode,
     pub message: String,
+    /// Extra response headers (e.g. `x-amz-delete-marker` on a 404 for a deleted key).
+    pub headers: Vec<(&'static str, String)>,
 }
 
 pub type S3Result<T> = Result<T, S3Error>;
 
 impl S3Error {
     pub fn new(code: &'static str, status: StatusCode, message: impl Into<String>) -> Self {
-        S3Error { code, status, message: message.into() }
+        S3Error { code, status, message: message.into(), headers: Vec::new() }
     }
 
     pub fn internal(msg: impl fmt::Display) -> Self {
@@ -87,6 +89,11 @@ errors! {
 impl S3Error {
     pub fn with_message(mut self, msg: impl Into<String>) -> Self {
         self.message = msg.into();
+        self
+    }
+
+    pub fn with_header(mut self, name: &'static str, value: impl Into<String>) -> Self {
+        self.headers.push((name, value.into()));
         self
     }
 

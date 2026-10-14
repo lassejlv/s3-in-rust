@@ -109,13 +109,32 @@ server-wide default for buckets that have no CORS configuration.
 `PutBucketLifecycleConfiguration` supports:
 - `Expiration` with `Days` or `Date`.
 - `AbortIncompleteMultipartUpload`.
+- `NoncurrentVersionExpiration` (`NoncurrentDays`) and `Expiration` with `ExpiredObjectDeleteMarker`,
+  for versioned buckets.
 - Filters by `Prefix`, `Tag`, `And`, `ObjectSizeGreaterThan` and `ObjectSizeLessThan`.
 
 A background task applies the rules every `--lifecycle-interval` seconds. As on S3, a `Days` rule
 expires an object at the first midnight (UTC) after its age reaches that many days. Expiration is a
-compare-and-delete: an object overwritten after the sweeper looked at it is kept. `Transition` and
-noncurrent-version actions are accepted but have no effect, since there is one storage class and no
-versioning.
+compare-and-delete: an object overwritten after the sweeper looked at it is kept. In a
+versioning-enabled bucket, expiring the current version adds a delete marker, as S3 does.
+`Transition` actions are accepted but have no effect, since there is only one storage class.
+
+## Versioning
+
+`PutBucketVersioning` and `GetBucketVersioning` support `Enabled` and `Suspended`, with S3's
+semantics:
+- Every write creates a new version, and plain DELETEs add delete markers.
+- `versionId` works on GET, HEAD, DELETE, CopyObject/UploadPartCopy sources, tagging, and
+  DeleteObjects.
+- Deleting a delete marker restores the object.
+- A suspended bucket keeps a single `null` version per key.
+- `ListObjectVersions` lists every version and delete marker, with key and version-id pagination.
+
+Unversioned buckets pay nothing for this. The latest version of every key stays in the same table as
+before, and old versions live in a separate one. Reading or listing current objects never touches
+old versions, and a lookup by version id is a single key read. Versioning-enabled buckets keep
+every version, so small objects in them are stored as files rather than inline. That keeps the
+metadata database from growing without bound.
 
 ## Browser uploads (POST policy)
 
@@ -136,9 +155,9 @@ direct uploads from web apps.
 
 | Area | Operations |
 |---|---|
-| Buckets | ListBuckets, CreateBucket (with canned ACL), DeleteBucket, HeadBucket, GetBucketLocation, GetBucketVersioning, Get/PutBucketAcl, Get/Put/DeleteBucketPolicy, GetBucketPolicyStatus, Get/Put/DeleteBucketCors, Get/Put/DeleteBucketTagging |
+| Buckets | ListBuckets, CreateBucket (with canned ACL), DeleteBucket, HeadBucket, GetBucketLocation, Get/PutBucketVersioning, Get/PutBucketAcl, Get/Put/DeleteBucketPolicy, GetBucketPolicyStatus, Get/Put/DeleteBucketCors, Get/Put/DeleteBucketTagging |
 | Objects | PutObject, GetObject, HeadObject, DeleteObject, DeleteObjects, CopyObject (COPY/REPLACE for metadata and tags), Get/Put/DeleteObjectTagging, `x-amz-tagging` on upload, GetObjectAcl |
-| Listing | ListObjects (v1), ListObjectsV2, ListObjectVersions (one `null` version per key); prefix, delimiter, pagination, `start-after`, `encoding-type=url` |
+| Listing | ListObjects (v1), ListObjectsV2, ListObjectVersions (versions and delete markers); prefix, delimiter, pagination, `start-after`, `encoding-type=url` |
 | Multipart | CreateMultipartUpload, UploadPart, UploadPartCopy (with ranges), CompleteMultipartUpload, AbortMultipartUpload, ListParts, ListMultipartUploads |
 | Lifecycle | Get/Put/DeleteBucketLifecycleConfiguration (expiration, abort incomplete uploads) |
 | Forms | POST Object (browser uploads with POST policies) |
@@ -148,7 +167,7 @@ direct uploads from web apps.
 | Auth | SigV4 headers, SigV4 presigned URLs, SigV4 streaming (`STREAMING-AWS4-HMAC-SHA256-PAYLOAD[-TRAILER]`, `STREAMING-UNSIGNED-PAYLOAD-TRAILER`), SigV2 headers and presigned URLs |
 | Transport | HTTP/1.1 keep-alive, HTTP/2 (h2c), path-style and virtual-hosted-style addressing |
 
-Not implemented: versioning, per-user IAM policies, server-side encryption, object lock, storage
+Not implemented: per-user IAM policies, server-side encryption, object lock, storage
 class transitions, website hosting, and SigV4A. These requests return
 `NotImplemented` or the matching "not found" configuration error.
 

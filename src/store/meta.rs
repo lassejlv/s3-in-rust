@@ -5,8 +5,9 @@
 
 use crate::error::{S3Error, S3Result};
 
-/// Record format version. v2 appended object/upload tags; v1 records are still readable.
-const VERSION: u8 = 2;
+/// Record format version. v2 appended tags; v3 appended version id, sequence number and the
+/// delete-marker flag (objects only). Older records are still readable.
+const VERSION: u8 = 3;
 
 fn check_version(v: u8) -> S3Result<u8> {
     if (1..=VERSION).contains(&v) { Ok(v) } else { Err(corrupt()) }
@@ -75,6 +76,12 @@ pub struct ObjectMeta {
     pub checksum: Option<(ChecksumAlgo, String)>,
     pub storage: Storage,
     pub tags: Vec<(String, String)>,
+    /// Version id; `None` is the "null" version (unversioned or versioning-suspended writes).
+    pub version: Option<String>,
+    /// Write sequence number; orders versions of a key (assigned by the writer).
+    pub seq: u64,
+    /// A delete marker (only ever stored among noncurrent versions).
+    pub delete_marker: bool,
 }
 
 pub struct ObjectSummary {
@@ -199,6 +206,15 @@ impl ObjectMeta {
             }
         }
         w.headers(&self.tags);
+        match &self.version {
+            Some(v) => {
+                w.u8(1);
+                w.str(v);
+            }
+            None => w.u8(0),
+        }
+        w.u64(self.seq);
+        w.u8(self.delete_marker as u8);
         w.0
     }
 
@@ -226,7 +242,13 @@ impl ObjectMeta {
             _ => return Err(corrupt()),
         };
         let tags = if version >= 2 { r.headers()? } else { Vec::new() };
-        Ok(ObjectMeta { size, mtime_ms, etag, headers, checksum, storage, tags })
+        let (version_id, seq, delete_marker) = if version >= 3 {
+            let v = if r.u8()? == 1 { Some(r.str()?) } else { None };
+            (v, r.u64()?, r.u8()? == 1)
+        } else {
+            (None, mtime_ms << 20, false)
+        };
+        Ok(ObjectMeta { size, mtime_ms, etag, headers, checksum, storage, tags, version: version_id, seq, delete_marker })
     }
 
     pub fn decode_summary(b: &[u8]) -> S3Result<ObjectSummary> {
@@ -287,6 +309,9 @@ mod tests {
             checksum: Some((ChecksumAlgo::Crc32c, "AAAA".into())),
             storage: Storage::Segments(vec![(1, 2), (3, 4)]),
             tags: vec![("k".into(), "v".into())],
+            version: Some("v1".into()),
+            seq: 42,
+            delete_marker: true,
         };
         let d = ObjectMeta::decode(&m.encode()).unwrap();
         assert_eq!(d.size, 42);
@@ -294,6 +319,7 @@ mod tests {
         assert_eq!(d.storage, m.storage);
         assert_eq!(d.checksum, m.checksum);
         assert_eq!(d.tags, m.tags);
+        assert_eq!((d.version.as_deref(), d.seq, d.delete_marker), (Some("v1"), 42, true));
         let s = ObjectMeta::decode_summary(&m.encode()).unwrap();
         assert_eq!((s.size, s.mtime_ms), (42, 7));
     }
@@ -314,12 +340,16 @@ mod compat_tests {
             checksum: None,
             storage: Storage::Inline(9),
             tags: vec![],
+            version: None,
+            seq: 0,
+            delete_marker: false,
         };
         let mut v1 = m.encode();
         v1[0] = 1;
-        v1.truncate(v1.len() - 4); // drop the empty tag list
+        v1.truncate(v1.len() - 4 - 1 - 8 - 1); // drop the v2 (tags) and v3 (version) trailers
         let d = ObjectMeta::decode(&v1).unwrap();
         assert_eq!(d.storage, Storage::Inline(9));
         assert!(d.tags.is_empty());
+        assert_eq!((d.version, d.seq, d.delete_marker), (None, 2 << 20, false));
     }
 }

@@ -573,6 +573,126 @@ def t_presigned_post():
     assert st == 403
 
 
+def _all_versions(bucket, **kw):
+    out = []
+    for page in s3.get_paginator("list_object_versions").paginate(Bucket=bucket, **kw):
+        out += [("v", v["Key"], v["VersionId"], v["IsLatest"]) for v in page.get("Versions", [])]
+        out += [("dm", d["Key"], d["VersionId"], d["IsLatest"]) for d in page.get("DeleteMarkers", [])]
+    return out
+
+
+def _wipe_versioned(bucket):
+    for page in s3.get_paginator("list_object_versions").paginate(Bucket=bucket):
+        objs = [{"Key": v["Key"], "VersionId": v["VersionId"]} for v in page.get("Versions", []) + page.get("DeleteMarkers", [])]
+        if objs:
+            s3.delete_objects(Bucket=bucket, Delete={"Objects": objs, "Quiet": True})
+    s3.delete_bucket(Bucket=bucket)
+
+
+def t_versioning():
+    vb = B + "-ver"
+    s3.create_bucket(Bucket=vb)
+    assert "Status" not in s3.get_bucket_versioning(Bucket=vb)
+    s3.put_object(Bucket=vb, Key="k", Body=b"v0")  # pre-versioning "null" version
+    s3.put_bucket_versioning(Bucket=vb, VersioningConfiguration={"Status": "Enabled"})
+    assert s3.get_bucket_versioning(Bucket=vb)["Status"] == "Enabled"
+    v1 = s3.put_object(Bucket=vb, Key="k", Body=b"v1")["VersionId"]
+    v2 = s3.put_object(Bucket=vb, Key="k", Body=b"v2")["VersionId"]
+    assert v1 != v2 and v1 != "null"
+    g = s3.get_object(Bucket=vb, Key="k")
+    assert g["Body"].read() == b"v2" and g["VersionId"] == v2
+    assert s3.get_object(Bucket=vb, Key="k", VersionId=v1)["Body"].read() == b"v1"
+    assert s3.get_object(Bucket=vb, Key="k", VersionId="null")["Body"].read() == b"v0"
+    assert s3.head_object(Bucket=vb, Key="k", VersionId=v1)["ContentLength"] == 2
+    assert _all_versions(vb) == [("v", "k", v2, True), ("v", "k", v1, False), ("v", "k", "null", False)], _all_versions(vb)
+    expect_error("NoSuchVersion", lambda: s3.get_object(Bucket=vb, Key="k", VersionId="0" * 32))
+
+    # Delete creates a marker; the key disappears from normal listings.
+    d = s3.delete_object(Bucket=vb, Key="k")
+    assert d["DeleteMarker"] is True and d["VersionId"] not in (v1, v2)
+    dm = d["VersionId"]
+    try:
+        s3.get_object(Bucket=vb, Key="k")
+        raise AssertionError("expected 404")
+    except ClientError as e:
+        assert e.response["Error"]["Code"] == "NoSuchKey"
+        assert e.response["ResponseMetadata"]["HTTPHeaders"].get("x-amz-delete-marker") == "true"
+    expect_error("405", lambda: s3.head_object(Bucket=vb, Key="k", VersionId=dm))
+    assert "Contents" not in s3.list_objects_v2(Bucket=vb)
+    assert ("dm", "k", dm, True) in _all_versions(vb)
+    expect_error("BucketNotEmpty", lambda: s3.delete_bucket(Bucket=vb))
+
+    # Removing the delete marker restores the object; removing the latest version promotes the previous one.
+    s3.delete_object(Bucket=vb, Key="k", VersionId=dm)
+    assert s3.get_object(Bucket=vb, Key="k")["Body"].read() == b"v2"
+    s3.delete_object(Bucket=vb, Key="k", VersionId=v2)
+    g = s3.get_object(Bucket=vb, Key="k")
+    assert g["Body"].read() == b"v1" and g["VersionId"] == v1
+
+    # Copy from an old version.
+    c = s3.copy_object(Bucket=vb, Key="copy", CopySource={"Bucket": vb, "Key": "k", "VersionId": "null"})
+    assert c["CopySourceVersionId"] == "null" and c["VersionId"]
+    assert s3.get_object(Bucket=vb, Key="copy")["Body"].read() == b"v0"
+
+    # Tagging a specific version.
+    s3.put_object_tagging(Bucket=vb, Key="k", VersionId="null", Tagging={"TagSet": [{"Key": "old", "Value": "yes"}]})
+    assert s3.get_object_tagging(Bucket=vb, Key="k", VersionId="null")["TagSet"] == [{"Key": "old", "Value": "yes"}]
+    assert s3.get_object_tagging(Bucket=vb, Key="k")["TagSet"] == []
+
+    # Multipart uploads create versions too.
+    uid = s3.create_multipart_upload(Bucket=vb, Key="mp")["UploadId"]
+    e = s3.upload_part(Bucket=vb, Key="mp", UploadId=uid, PartNumber=1, Body=b"m")["ETag"]
+    r = s3.complete_multipart_upload(Bucket=vb, Key="mp", UploadId=uid, MultipartUpload={"Parts": [{"PartNumber": 1, "ETag": e}]})
+    assert r.get("VersionId")
+
+    # Batch delete with and without versions.
+    many = [s3.put_object(Bucket=vb, Key=f"batch/{i}", Body=b"x")["VersionId"] for i in range(3)]
+    res = s3.delete_objects(Bucket=vb, Delete={"Objects": [{"Key": "batch/0", "VersionId": many[0]}, {"Key": "batch/1"}]})
+    by_key = {d["Key"]: d for d in res["Deleted"]}
+    assert by_key["batch/0"]["VersionId"] == many[0] and "DeleteMarker" not in by_key["batch/0"]
+    assert by_key["batch/1"]["DeleteMarker"] is True and by_key["batch/1"]["DeleteMarkerVersionId"]
+    assert [o["Key"] for o in s3.list_objects_v2(Bucket=vb, Prefix="batch/")["Contents"]] == ["batch/2"]
+
+    # Paginated version listing (MaxKeys=1) matches the full listing.
+    full = _all_versions(vb)
+    paged = []
+    for page in s3.get_paginator("list_object_versions").paginate(Bucket=vb, PaginationConfig={"PageSize": 1}):
+        paged += [("v", v["Key"], v["VersionId"], v["IsLatest"]) for v in page.get("Versions", [])]
+        paged += [("dm", d["Key"], d["VersionId"], d["IsLatest"]) for d in page.get("DeleteMarkers", [])]
+    assert sorted(paged) == sorted(full) and len(paged) == len(set(paged)), (paged, full)
+
+    # Suspended: new writes replace the single "null" version, older versions stay.
+    s3.put_bucket_versioning(Bucket=vb, VersioningConfiguration={"Status": "Suspended"})
+    s3.put_object(Bucket=vb, Key="k", Body=b"s1")
+    s3.put_object(Bucket=vb, Key="k", Body=b"s2")
+    ks = [x for x in _all_versions(vb, Prefix="k") if x[1] == "k"]
+    assert [x[2] for x in ks] == ["null", v1], ks
+    assert s3.get_object(Bucket=vb, Key="k")["Body"].read() == b"s2"
+    _wipe_versioned(vb)
+
+
+def t_lifecycle_versions():
+    if not os.environ.get("S3RS_FAST_LIFECYCLE"):
+        print("        (skipped: set S3RS_FAST_LIFECYCLE=1 with a fast-sweeping server)")
+        return
+    lb = B + "-lcv"
+    s3.create_bucket(Bucket=lb)
+    s3.put_bucket_versioning(Bucket=lb, VersioningConfiguration={"Status": "Enabled"})
+    s3.put_bucket_lifecycle_configuration(Bucket=lb, LifecycleConfiguration={"Rules": [{
+        "ID": "nc", "Status": "Enabled", "Filter": {"Prefix": ""},
+        "NoncurrentVersionExpiration": {"NoncurrentDays": 1},
+        "Expiration": {"ExpiredObjectDeleteMarker": True}}]})
+    s3.put_object(Bucket=lb, Key="k", Body=b"old")
+    keep = s3.put_object(Bucket=lb, Key="k", Body=b"new")["VersionId"]
+    s3.put_object(Bucket=lb, Key="solo", Body=b"x")
+    s3.delete_object(Bucket=lb, Key="solo")
+    deadline = time.time() + 20
+    while time.time() < deadline and _all_versions(lb) != [("v", "k", keep, True)]:
+        time.sleep(0.5)
+    assert _all_versions(lb) == [("v", "k", keep, True)], _all_versions(lb)
+    _wipe_versioned(lb)
+
+
 def t_overwrite():
     s3.put_object(Bucket=B, Key="ow", Body=b"x" * 300_000)
     s3.put_object(Bucket=B, Key="ow", Body=b"small")

@@ -30,7 +30,67 @@ const PARTS: TableDefinition<(u128, u32), &[u8]> = TableDefinition::new("parts")
 const CONFIG: TableDefinition<(&str, &str), &[u8]> = TableDefinition::new("bucket_config");
 
 /// Kinds of bucket configuration stored in `CONFIG`.
-pub const CONFIG_KINDS: &[&str] = &["acl", "policy", "cors", "tagging", "lifecycle"];
+pub const CONFIG_KINDS: &[&str] = &["acl", "policy", "cors", "tagging", "lifecycle", "versioning"];
+/// Noncurrent object versions and delete markers: `bucket \0 key \0 (u64::MAX - seq)` -> meta.
+/// Keys sort newest-first within an object. The current version of a key always lives in
+/// OBJECTS (if it is not a delete marker), so unversioned reads never touch this table.
+const VERSIONS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("versions");
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Versioning {
+    #[default]
+    Unversioned,
+    Enabled,
+    Suspended,
+}
+
+impl Versioning {
+    pub fn parse(v: Option<&[u8]>) -> Self {
+        match v {
+            Some(b"Enabled") => Versioning::Enabled,
+            Some(b"Suspended") => Versioning::Suspended,
+            _ => Versioning::Unversioned,
+        }
+    }
+}
+
+/// Result of deleting a key or a specific version.
+#[derive(Debug, Clone, Default)]
+pub struct DeleteOutcome {
+    /// Version id that was removed, or of the delete marker that was created.
+    pub version_id: Option<String>,
+    pub delete_marker: bool,
+}
+
+fn ver_prefix(bucket: &str, key: &str) -> Vec<u8> {
+    let mut k = obj_key(bucket, key);
+    k.push(0);
+    k
+}
+
+fn ver_key(bucket: &str, key: &str, seq: u64) -> Vec<u8> {
+    let mut k = ver_prefix(bucket, key);
+    k.extend_from_slice(&(u64::MAX - seq).to_be_bytes());
+    k
+}
+
+/// Version ids are `<seq as 16 hex><16 random hex>`, so a lookup by id needs no index.
+fn new_version_id(seq: u64) -> String {
+    format!("{seq:016x}{:016x}", util::new_id() as u64)
+}
+
+/// The sequence number encoded in a version id (`None` for "null" or malformed ids).
+pub fn version_seq(vid: &str) -> Option<u64> {
+    if vid.len() != 32 || !vid.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    u64::from_str_radix(&vid[..16], 16).ok()
+}
+
+/// Validate a client-supplied version id: "null" or one of ours.
+pub fn valid_version_id(vid: &str) -> bool {
+    vid == "null" || version_seq(vid).is_some()
+}
 
 pub const MIN_PART_SIZE: u64 = 5 * 1024 * 1024;
 const MAX_BATCH: usize = 1024;
@@ -78,9 +138,10 @@ pub enum Op {
         inline: Option<Bytes>,
         cond: Option<WriteCond>,
     },
+    /// Delete keys (current version, possibly creating delete markers) or specific versions.
     DeleteObjects {
         bucket: String,
-        keys: Vec<String>,
+        items: Vec<(String, Option<String>)>,
     },
     CreateUpload {
         id: u128,
@@ -113,7 +174,13 @@ pub enum Op {
     SetObjectTags {
         bucket: String,
         key: String,
+        version: Option<String>,
         tags: Vec<(String, String)>,
+    },
+    /// Lifecycle: permanently remove noncurrent entries (key, seq).
+    PurgeVersions {
+        bucket: String,
+        items: Vec<(String, u64)>,
     },
     /// Lifecycle expiration: delete each (key, mtime_ms) only if the object still has that
     /// mtime, so an object overwritten after the sweeper looked at it is left alone.
@@ -127,7 +194,7 @@ pub enum Op {
 pub enum OpOut {
     Done,
     Object(ObjectMeta),
-    Deleted(Vec<S3Result<()>>),
+    Deleted(Vec<S3Result<DeleteOutcome>>),
     Count(usize),
 }
 
@@ -141,6 +208,35 @@ pub struct ListResult {
     pub prefixes: Vec<String>,
     pub truncated: bool,
     pub next_marker: Option<String>,
+}
+
+#[derive(Default)]
+pub struct VersionList {
+    pub entries: Vec<VersionEntry>,
+    pub prefixes: Vec<String>,
+    pub truncated: bool,
+    /// (key marker, version id marker) to resume from.
+    pub next: Option<(String, Option<String>)>,
+}
+
+pub struct VersionEntry {
+    pub key: String,
+    pub is_latest: bool,
+    pub meta: ObjectMeta,
+}
+
+#[derive(Default)]
+pub struct NoncurrentPage {
+    pub items: Vec<NoncurrentItem>,
+    /// Raw table key to continue after.
+    pub last: Option<Vec<u8>>,
+}
+
+pub struct NoncurrentItem {
+    pub key: String,
+    pub meta: ObjectMeta,
+    pub noncurrent_since_ms: Option<u64>,
+    pub only_version: bool,
 }
 
 pub struct UploadEntry {
@@ -203,6 +299,7 @@ impl Store {
             txn.open_table(UPLOADS)?;
             txn.open_table(PARTS)?;
             txn.open_table(CONFIG)?;
+            txn.open_table(VERSIONS)?;
             txn.commit()?;
         }
         if unclean {
@@ -303,7 +400,22 @@ impl Store {
         let objects = txn.open_table(OBJECTS)?;
         let Some(v) = objects.get(obj_key(bucket, key).as_slice())? else {
             let buckets = txn.open_table(BUCKETS)?;
-            return Err(if buckets.get(bucket)?.is_some() { err::NoSuchKey() } else { err::NoSuchBucket() });
+            if buckets.get(bucket)?.is_none() {
+                return Err(err::NoSuchBucket());
+            }
+            // If the latest version is a delete marker, say so (as S3 does).
+            let versions = txn.open_table(VERSIONS)?;
+            let p = ver_prefix(bucket, key);
+            let end = prefix_successor(&p).expect("prefix ends with 0");
+            if let Some(e) = versions.range::<&[u8]>(p.as_slice()..end.as_slice())?.next() {
+                let m = ObjectMeta::decode(e?.1.value())?;
+                if m.delete_marker {
+                    return Err(err::NoSuchKey()
+                        .with_header("x-amz-delete-marker", "true")
+                        .with_header("x-amz-version-id", m.version.unwrap_or_else(|| "null".into())));
+                }
+            }
+            return Err(err::NoSuchKey());
         };
         let meta = ObjectMeta::decode(v.value())?;
         let inline = match meta.storage {
@@ -444,6 +556,269 @@ impl Store {
         Ok((out, truncated))
     }
 
+    /// A specific version of an object (and its inline bytes). Delete markers produce
+    /// `MethodNotAllowed` with `x-amz-delete-marker`, like S3.
+    pub fn get_object_version(&self, bucket: &str, key: &str, vid: &str) -> S3Result<(ObjectMeta, Option<Bytes>)> {
+        if !valid_version_id(vid) {
+            return Err(err::InvalidArgument().with_message("Invalid version id specified"));
+        }
+        let txn = self.db.begin_read()?;
+        if txn.open_table(BUCKETS)?.get(bucket)?.is_none() {
+            return Err(err::NoSuchBucket());
+        }
+        let want = (vid != "null").then_some(vid);
+        let mut found = None;
+        if let Some(v) = txn.open_table(OBJECTS)?.get(obj_key(bucket, key).as_slice())? {
+            let m = ObjectMeta::decode(v.value())?;
+            if m.version.as_deref() == want {
+                found = Some(m);
+            }
+        }
+        if found.is_none() {
+            let versions = txn.open_table(VERSIONS)?;
+            match want.and_then(version_seq) {
+                Some(seq) => {
+                    if let Some(v) = versions.get(ver_key(bucket, key, seq).as_slice())? {
+                        let m = ObjectMeta::decode(v.value())?;
+                        if m.version.as_deref() == want {
+                            found = Some(m);
+                        }
+                    }
+                }
+                None => {
+                    let p = ver_prefix(bucket, key);
+                    let end = prefix_successor(&p).expect("prefix ends with 0");
+                    for e in versions.range::<&[u8]>(p.as_slice()..end.as_slice())? {
+                        let m = ObjectMeta::decode(e?.1.value())?;
+                        if m.version.is_none() {
+                            found = Some(m);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        let Some(meta) = found else {
+            return Err(S3Error::new("NoSuchVersion", hyper::StatusCode::NOT_FOUND, "The specified version does not exist."));
+        };
+        if meta.delete_marker {
+            return Err(err::MethodNotAllowed()
+                .with_header("x-amz-delete-marker", "true")
+                .with_header("x-amz-version-id", vid.to_string()));
+        }
+        let inline = match meta.storage {
+            Storage::Inline(id) => {
+                let t = txn.open_table(INLINE)?;
+                let g = t.get(id)?.ok_or_else(|| S3Error::internal("missing inline data"))?;
+                Some(Bytes::copy_from_slice(g.value()))
+            }
+            Storage::Segments(_) => None,
+        };
+        Ok((meta, inline))
+    }
+
+    pub fn versioning(&self, bucket: &str) -> S3Result<Versioning> {
+        Ok(Versioning::parse(self.bucket_config(bucket, "versioning")?.as_deref()))
+    }
+
+    /// ListObjectVersions: every version and delete marker, keys ascending, newest first per key.
+    pub fn list_object_versions(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        delimiter: &str,
+        key_marker: Option<&str>,
+        version_marker: Option<&str>,
+        max: usize,
+    ) -> S3Result<VersionList> {
+        let txn = self.db.begin_read()?;
+        if txn.open_table(BUCKETS)?.get(bucket)?.is_none() {
+            return Err(err::NoSuchBucket());
+        }
+        let objects = txn.open_table(OBJECTS)?;
+        let versions = txn.open_table(VERSIONS)?;
+        let base = obj_key(bucket, "");
+        let full_prefix = obj_key(bucket, prefix);
+        let end: Vec<u8> = prefix_successor(&full_prefix).unwrap_or_else(|| {
+            let mut e = bucket.as_bytes().to_vec();
+            e.push(1);
+            e
+        });
+        let mut out = VersionList::default();
+        let mut count = 0usize;
+
+        // Cursor over key bytes (relative to `base`): (bytes, inclusive).
+        let mut cursor: (Vec<u8>, bool) = (prefix.as_bytes().to_vec(), true);
+        let mut resume: Option<(String, String)> = None;
+        if let Some(km) = key_marker.filter(|k| *k >= prefix) {
+            match version_marker.filter(|v| !v.is_empty()) {
+                Some(vm) => {
+                    cursor = (km.as_bytes().to_vec(), true);
+                    resume = Some((km.to_string(), vm.to_string()));
+                }
+                None => {
+                    cursor = (km.as_bytes().to_vec(), false);
+                    // Resuming after a common prefix: skip everything rolled up under it.
+                    if !delimiter.is_empty() && km.ends_with(delimiter) {
+                        let rest = &km[prefix.len()..];
+                        if rest.find(delimiter) == Some(rest.len() - delimiter.len()) {
+                            match prefix_successor(km.as_bytes()) {
+                                Some(s) => cursor = (s, true),
+                                None => return Ok(VersionList::default()),
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        loop {
+            // Next key present in either table.
+            let (ob, vb) = {
+                let mut o = base.clone();
+                o.extend_from_slice(&cursor.0);
+                let mut v = o.clone();
+                if !cursor.1 {
+                    v.push(1); // skip every version entry of the cursor key itself
+                }
+                (o, v)
+            };
+            if ob.as_slice() >= end.as_slice() {
+                break;
+            }
+            let lower = if cursor.1 { Bound::Included(ob.as_slice()) } else { Bound::Excluded(ob.as_slice()) };
+            let next_obj = match objects.range::<&[u8]>((lower, Bound::Excluded(end.as_slice())))?.next() {
+                Some(e) => Some(e?.0.value()[base.len()..].to_vec()),
+                None => None,
+            };
+            let next_ver = match versions.range::<&[u8]>(vb.as_slice()..end.as_slice())?.next() {
+                Some(e) => {
+                    let k = e?.0.value().to_vec();
+                    Some(k[base.len()..k.len() - 9].to_vec())
+                }
+                None => None,
+            };
+            let kb = match (next_obj, next_ver) {
+                (Some(a), Some(b)) => a.min(b),
+                (Some(a), None) | (None, Some(a)) => a,
+                (None, None) => break,
+            };
+            let key = String::from_utf8(kb.clone()).map_err(|_| S3Error::internal("bad key"))?;
+            if !key.starts_with(prefix) {
+                break;
+            }
+            if !delimiter.is_empty()
+                && let Some(i) = key[prefix.len()..].find(delimiter)
+            {
+                let cp = key[..prefix.len() + i + delimiter.len()].to_string();
+                if count >= max {
+                    out.truncated = true;
+                    break;
+                }
+                count += 1;
+                out.next = Some((cp.clone(), None));
+                out.prefixes.push(cp.clone());
+                match prefix_successor(cp.as_bytes()) {
+                    Some(s) => cursor = (s, true),
+                    None => break,
+                }
+                continue;
+            }
+
+            // All entries of this key, newest first.
+            let mut entries = Vec::new();
+            if let Some(v) = objects.get(obj_key(bucket, &key).as_slice())? {
+                entries.push(ObjectMeta::decode(v.value())?);
+            }
+            let p = ver_prefix(bucket, &key);
+            let pend = prefix_successor(&p).expect("prefix ends with 0");
+            for e in versions.range::<&[u8]>(p.as_slice()..pend.as_slice())? {
+                entries.push(ObjectMeta::decode(e?.1.value())?);
+            }
+            let mut skipping = resume.as_ref().is_some_and(|(k, _)| *k == key);
+            for (i, m) in entries.into_iter().enumerate() {
+                let vid = m.version.clone().unwrap_or_else(|| "null".into());
+                if skipping {
+                    if resume.as_ref().is_some_and(|(_, v)| *v == vid) {
+                        skipping = false;
+                    }
+                    continue;
+                }
+                if count >= max {
+                    out.truncated = true;
+                    return Ok(out);
+                }
+                count += 1;
+                out.next = Some((key.clone(), Some(vid)));
+                out.entries.push(VersionEntry { key: key.clone(), is_latest: i == 0, meta: m });
+            }
+            resume = None;
+            cursor = (kb, false);
+        }
+        if !out.truncated {
+            out.next = None;
+        }
+        Ok(out)
+    }
+
+    /// Noncurrent entries for lifecycle: (key, meta, became-noncurrent time in ms or None if the
+    /// entry is itself the latest version, whether it is the only version of its key).
+    pub fn scan_noncurrent(&self, bucket: &str, prefix: &str, after: Option<&[u8]>, limit: usize) -> S3Result<NoncurrentPage> {
+        let txn = self.db.begin_read()?;
+        let objects = txn.open_table(OBJECTS)?;
+        let versions = txn.open_table(VERSIONS)?;
+        let base_len = bucket.len() + 1;
+        let start = match after {
+            Some(a) => Bound::Excluded(a.to_vec()),
+            None => Bound::Included(obj_key(bucket, prefix)),
+        };
+        let full_prefix = obj_key(bucket, prefix);
+        let end = prefix_successor(&full_prefix).unwrap_or_else(|| {
+            let mut e = bucket.as_bytes().to_vec();
+            e.push(1);
+            e
+        });
+        let lower = match &start {
+            Bound::Included(v) => Bound::Included(v.as_slice()),
+            Bound::Excluded(v) => Bound::Excluded(v.as_slice()),
+            Bound::Unbounded => Bound::Unbounded,
+        };
+        let mut page = NoncurrentPage::default();
+        // Previous (newer) entry of the same key: (key, mtime).
+        let mut newer: Option<(String, u64)> = None;
+        let mut items: Vec<(String, ObjectMeta, Option<u64>)> = Vec::new();
+        for e in versions.range::<&[u8]>((lower, Bound::Excluded(end.as_slice())))? {
+            let (k, v) = e?;
+            let kb = k.value();
+            let key = String::from_utf8(kb[base_len..kb.len() - 9].to_vec()).map_err(|_| S3Error::internal("bad key"))?;
+            let m = ObjectMeta::decode(v.value())?;
+            let since = match &newer {
+                Some((nk, mt)) if *nk == key => Some(*mt),
+                _ => objects
+                    .get(obj_key(bucket, &key).as_slice())?
+                    .map(|c| ObjectMeta::decode(c.value()))
+                    .transpose()?
+                    .map(|c| c.mtime_ms),
+            };
+            newer = Some((key.clone(), m.mtime_ms));
+            page.last = Some(kb.to_vec());
+            items.push((key, m, since));
+            if items.len() >= limit {
+                break;
+            }
+        }
+        // A latest delete marker is the only version when nothing else exists for its key.
+        for (key, m, since) in items {
+            let only = since.is_none() && {
+                let p = ver_prefix(bucket, &key);
+                let pend = prefix_successor(&p).expect("prefix ends with 0");
+                versions.range::<&[u8]>(p.as_slice()..pend.as_slice())?.take(2).count() == 1
+            };
+            page.items.push(NoncurrentItem { key, meta: m, noncurrent_since_ms: since, only_version: only });
+        }
+        Ok(page)
+    }
+
     /// Objects with full metadata, in key order: keys starting with `prefix` and greater than
     /// `after`, at most `limit`. Used by background jobs that need tags.
     pub fn scan_objects(
@@ -511,6 +886,12 @@ fn collect_orphans(db: &Database, root: &Path) -> S3Result<(usize, u64)> {
             live.extend(segs.into_iter().map(|(id, _)| id));
         }
     }
+    for e in txn.open_table(VERSIONS)?.iter()? {
+        let (_, v) = e?;
+        if let Storage::Segments(segs) = ObjectMeta::decode(v.value())?.storage {
+            live.extend(segs.into_iter().map(|(id, _)| id));
+        }
+    }
     for e in txn.open_table(PARTS)?.iter()? {
         let (_, v) = e?;
         live.insert(PartMeta::decode(v.value())?.file);
@@ -546,6 +927,7 @@ fn writer_loop(db: Arc<Database>, rx: mpsc::Receiver<Job>, deleter: mpsc::Sender
     const DURABLE_EVERY: Duration = Duration::from_secs(1);
     let mut dirty = false;
     let mut last_durable = Instant::now();
+    let mut last_seq = 0u64;
     loop {
         let first = if durable || !dirty {
             match rx.recv() {
@@ -591,11 +973,12 @@ fn writer_loop(db: Arc<Database>, rx: mpsc::Receiver<Job>, deleter: mpsc::Sender
                     uploads: txn.open_table(UPLOADS)?,
                     parts: txn.open_table(PARTS)?,
                     config: txn.open_table(CONFIG)?,
+                    versions: txn.open_table(VERSIONS)?,
                 };
                 for job in batch.iter_mut() {
                     let mut garbage = Vec::new();
                     let op = std::mem::replace(&mut job.op, Op::Flush);
-                    let r = apply(&mut tx, op, &mut garbage);
+                    let r = apply(&mut tx, op, &mut garbage, &mut last_seq);
                     if let Err(e) = &r
                         && e.code == "InternalError"
                     {
@@ -650,6 +1033,7 @@ struct Tables<'t> {
     uploads: redb::Table<'t, u128, &'static [u8]>,
     parts: redb::Table<'t, (u128, u32), &'static [u8]>,
     config: redb::Table<'t, (&'static str, &'static str), &'static [u8]>,
+    versions: redb::Table<'t, &'static [u8], &'static [u8]>,
 }
 
 fn check_cond(existing: Option<&ObjectMeta>, cond: &Option<WriteCond>) -> S3Result<()> {
@@ -666,24 +1050,6 @@ fn check_cond(existing: Option<&ObjectMeta>, cond: &Option<WriteCond>) -> S3Resu
             }
         }
     }
-}
-
-/// Replace (or remove) the object at `k`, releasing whatever backed the previous version.
-fn replace_object(tx: &mut Tables, k: &[u8], new: Option<&ObjectMeta>, garbage: &mut Vec<u128>) -> S3Result<()> {
-    let old = match new {
-        Some(m) => tx.objects.insert(k, m.encode().as_slice())?.map(|g| ObjectMeta::decode(g.value())),
-        None => tx.objects.remove(k)?.map(|g| ObjectMeta::decode(g.value())),
-    };
-    if let Some(old) = old {
-        let old = old?;
-        match old.storage {
-            Storage::Inline(id) => {
-                tx.inline.remove(id)?;
-            }
-            Storage::Segments(s) => garbage.extend(s.into_iter().map(|(id, _)| id)),
-        }
-    }
-    Ok(())
 }
 
 fn get_meta(tx: &Tables, k: &[u8]) -> S3Result<Option<ObjectMeta>> {
@@ -707,7 +1073,227 @@ fn drop_upload(tx: &mut Tables, upload: u128, garbage: &mut Vec<u128>) -> S3Resu
     Ok(())
 }
 
-fn apply(tx: &mut Tables, op: Op, garbage: &mut Vec<u128>) -> S3Result<OpOut> {
+// -------------------------------------------------------------------- versioning (writer side)
+
+fn versioning_state(tx: &Tables, bucket: &str) -> S3Result<Versioning> {
+    Ok(Versioning::parse(tx.config.get((bucket, "versioning"))?.as_ref().map(|v| v.value())))
+}
+
+/// Release the storage behind a version (no-op for delete markers).
+fn release(tx: &mut Tables, meta: &ObjectMeta, garbage: &mut Vec<u128>) -> S3Result<()> {
+    match &meta.storage {
+        Storage::Inline(id) => {
+            tx.inline.remove(*id)?;
+        }
+        Storage::Segments(s) => garbage.extend(s.iter().map(|(id, _)| *id)),
+    }
+    Ok(())
+}
+
+/// Newest noncurrent entry of a key.
+fn newest_noncurrent(tx: &Tables, bucket: &str, key: &str) -> S3Result<Option<(Vec<u8>, ObjectMeta)>> {
+    let p = ver_prefix(bucket, key);
+    let end = prefix_successor(&p).expect("prefix ends with 0");
+    match tx.versions.range::<&[u8]>(p.as_slice()..end.as_slice())?.next() {
+        Some(e) => {
+            let (k, v) = e?;
+            Ok(Some((k.value().to_vec(), ObjectMeta::decode(v.value())?)))
+        }
+        None => Ok(None),
+    }
+}
+
+/// A sequence number newer than anything this key has (robust against clock steps).
+fn alloc_seq(tx: &Tables, last: &mut u64, bucket: &str, key: &str, current: Option<&ObjectMeta>) -> S3Result<u64> {
+    let mut seq = (*last + 1).max(now_ms() << 20);
+    if let Some(c) = current {
+        seq = seq.max(c.seq + 1);
+    }
+    if let Some((_, n)) = newest_noncurrent(tx, bucket, key)? {
+        seq = seq.max(n.seq + 1);
+    }
+    *last = seq;
+    Ok(seq)
+}
+
+/// Remove every noncurrent "null" version (or null delete marker) of a key.
+fn remove_null_versions(tx: &mut Tables, bucket: &str, key: &str, garbage: &mut Vec<u128>) -> S3Result<()> {
+    let p = ver_prefix(bucket, key);
+    let end = prefix_successor(&p).expect("prefix ends with 0");
+    let mut doomed = Vec::new();
+    for e in tx.versions.range::<&[u8]>(p.as_slice()..end.as_slice())? {
+        let (k, v) = e?;
+        let m = ObjectMeta::decode(v.value())?;
+        if m.version.is_none() {
+            doomed.push((k.value().to_vec(), m));
+        }
+    }
+    for (k, m) in doomed {
+        tx.versions.remove(k.as_slice())?;
+        release(tx, &m, garbage)?;
+    }
+    Ok(())
+}
+
+/// Move the current version (if any) out of OBJECTS according to the bucket's versioning.
+fn retire_current(tx: &mut Tables, state: Versioning, bucket: &str, key: &str, garbage: &mut Vec<u128>) -> S3Result<()> {
+    let k = obj_key(bucket, key);
+    let Some(old) = tx.objects.remove(k.as_slice())?.map(|g| ObjectMeta::decode(g.value())).transpose()? else {
+        return Ok(());
+    };
+    // Unversioned buckets keep no history; a suspended bucket's new "null" version replaces
+    // the old null one; with versioning enabled every previous version is kept.
+    let discard = match state {
+        Versioning::Unversioned => true,
+        Versioning::Suspended => old.version.is_none(),
+        Versioning::Enabled => false,
+    };
+    if discard {
+        release(tx, &old, garbage)
+    } else {
+        tx.versions.insert(ver_key(bucket, key, old.seq).as_slice(), old.encode().as_slice())?;
+        Ok(())
+    }
+}
+
+/// Install `meta` as the new current version of a key.
+fn put_version(
+    tx: &mut Tables,
+    last_seq: &mut u64,
+    bucket: &str,
+    key: &str,
+    mut meta: ObjectMeta,
+    garbage: &mut Vec<u128>,
+) -> S3Result<ObjectMeta> {
+    let state = versioning_state(tx, bucket)?;
+    let k = obj_key(bucket, key);
+    let current = get_meta(tx, &k)?;
+    meta.seq = alloc_seq(tx, last_seq, bucket, key, current.as_ref())?;
+    meta.delete_marker = false;
+    meta.version = (state == Versioning::Enabled).then(|| new_version_id(meta.seq));
+    retire_current(tx, state, bucket, key, garbage)?;
+    if state == Versioning::Suspended {
+        remove_null_versions(tx, bucket, key, garbage)?;
+    }
+    tx.objects.insert(k.as_slice(), meta.encode().as_slice())?;
+    Ok(meta)
+}
+
+/// DELETE without a version id.
+fn delete_current(
+    tx: &mut Tables,
+    last_seq: &mut u64,
+    bucket: &str,
+    key: &str,
+    garbage: &mut Vec<u128>,
+) -> S3Result<DeleteOutcome> {
+    let state = versioning_state(tx, bucket)?;
+    if state == Versioning::Unversioned {
+        retire_current(tx, state, bucket, key, garbage)?;
+        return Ok(DeleteOutcome::default());
+    }
+    let current = get_meta(tx, &obj_key(bucket, key))?;
+    let seq = alloc_seq(tx, last_seq, bucket, key, current.as_ref())?;
+    retire_current(tx, state, bucket, key, garbage)?;
+    if state == Versioning::Suspended {
+        remove_null_versions(tx, bucket, key, garbage)?;
+    }
+    let version = (state == Versioning::Enabled).then(|| new_version_id(seq));
+    let marker = ObjectMeta {
+        size: 0,
+        mtime_ms: now_ms(),
+        etag: String::new(),
+        headers: Vec::new(),
+        checksum: None,
+        storage: Storage::Segments(Vec::new()),
+        tags: Vec::new(),
+        version: version.clone(),
+        seq,
+        delete_marker: true,
+    };
+    tx.versions.insert(ver_key(bucket, key, seq).as_slice(), marker.encode().as_slice())?;
+    Ok(DeleteOutcome { version_id: Some(version.unwrap_or_else(|| "null".into())), delete_marker: true })
+}
+
+/// If a key has no current version, make its newest noncurrent entry current, unless that
+/// entry is a delete marker (which then simply remains the latest version).
+fn promote(tx: &mut Tables, bucket: &str, key: &str) -> S3Result<()> {
+    let k = obj_key(bucket, key);
+    if tx.objects.get(k.as_slice())?.is_some() {
+        return Ok(());
+    }
+    if let Some((vk, m)) = newest_noncurrent(tx, bucket, key)?
+        && !m.delete_marker
+    {
+        tx.versions.remove(vk.as_slice())?;
+        tx.objects.insert(k.as_slice(), m.encode().as_slice())?;
+    }
+    Ok(())
+}
+
+/// Locate a specific version: Some((in_objects, versions_key, meta)).
+fn find_version(tx: &Tables, bucket: &str, key: &str, vid: &str) -> S3Result<Option<(bool, Vec<u8>, ObjectMeta)>> {
+    let want = (vid != "null").then_some(vid);
+    let k = obj_key(bucket, key);
+    if let Some(cur) = get_meta(tx, &k)?
+        && cur.version.as_deref() == want
+    {
+        return Ok(Some((true, k, cur)));
+    }
+    match want {
+        Some(v) => {
+            let Some(seq) = version_seq(v) else { return Ok(None) };
+            let vk = ver_key(bucket, key, seq);
+            match tx.versions.get(vk.as_slice())? {
+                Some(g) => {
+                    let m = ObjectMeta::decode(g.value())?;
+                    Ok((m.version.as_deref() == Some(v)).then_some((false, vk, m)))
+                }
+                None => Ok(None),
+            }
+        }
+        None => {
+            let p = ver_prefix(bucket, key);
+            let end = prefix_successor(&p).expect("prefix ends with 0");
+            for e in tx.versions.range::<&[u8]>(p.as_slice()..end.as_slice())? {
+                let (vk, v) = e?;
+                let m = ObjectMeta::decode(v.value())?;
+                if m.version.is_none() {
+                    return Ok(Some((false, vk.value().to_vec(), m)));
+                }
+            }
+            Ok(None)
+        }
+    }
+}
+
+/// DELETE with a version id: permanently remove that version.
+fn delete_version(tx: &mut Tables, bucket: &str, key: &str, vid: &str, garbage: &mut Vec<u128>) -> S3Result<DeleteOutcome> {
+    if !valid_version_id(vid) {
+        return Err(err::InvalidArgument().with_message("Invalid version id specified"));
+    }
+    let mut out = DeleteOutcome { version_id: Some(vid.to_string()), delete_marker: false };
+    if let Some((in_objects, k, m)) = find_version(tx, bucket, key, vid)? {
+        if in_objects {
+            tx.objects.remove(k.as_slice())?;
+        } else {
+            tx.versions.remove(k.as_slice())?;
+        }
+        out.delete_marker = m.delete_marker;
+        release(tx, &m, garbage)?;
+        promote(tx, bucket, key)?;
+    }
+    Ok(out)
+}
+
+fn bucket_has_versions(tx: &Tables, bucket: &str) -> S3Result<bool> {
+    let lo = obj_key(bucket, "");
+    let mut hi = bucket.as_bytes().to_vec();
+    hi.push(1);
+    Ok(tx.versions.range::<&[u8]>(lo.as_slice()..hi.as_slice())?.next().is_some())
+}
+
+fn apply(tx: &mut Tables, op: Op, garbage: &mut Vec<u128>, last_seq: &mut u64) -> S3Result<OpOut> {
     match op {
         Op::Flush => Ok(OpOut::Done),
         Op::CreateBucket(name) => {
@@ -724,7 +1310,7 @@ fn apply(tx: &mut Tables, op: Op, garbage: &mut Vec<u128>) -> S3Result<OpOut> {
             let lo = obj_key(&name, "");
             let mut hi = name.as_bytes().to_vec();
             hi.push(1);
-            if tx.objects.range::<&[u8]>(lo.as_slice()..hi.as_slice())?.next().is_some() {
+            if tx.objects.range::<&[u8]>(lo.as_slice()..hi.as_slice())?.next().is_some() || bucket_has_versions(tx, &name)? {
                 return Err(err::BucketNotEmpty());
             }
             let mut stale = Vec::new();
@@ -754,28 +1340,35 @@ fn apply(tx: &mut Tables, op: Op, garbage: &mut Vec<u128>) -> S3Result<OpOut> {
             if let (Storage::Inline(id), Some(data)) = (&meta.storage, &inline) {
                 tx.inline.insert(*id, data.as_ref())?;
             }
-            replace_object(tx, &k, Some(&meta), garbage)?;
-            Ok(OpOut::Object(meta))
+            Ok(OpOut::Object(put_version(tx, last_seq, &bucket, &key, meta, garbage)?))
         }
         Op::Expire { bucket, items } => {
             let mut n = 0;
             for (key, mtime) in items {
                 let k = obj_key(&bucket, &key);
                 if get_meta(tx, &k)?.is_some_and(|m| m.mtime_ms == mtime) {
-                    replace_object(tx, &k, None, garbage)?;
+                    delete_current(tx, last_seq, &bucket, &key, garbage)?;
                     n += 1;
                 }
             }
             Ok(OpOut::Count(n))
         }
-        Op::DeleteObjects { bucket, keys } => {
+        Op::DeleteObjects { bucket, items } => {
             if tx.buckets.get(bucket.as_str())?.is_none() {
                 return Err(err::NoSuchBucket());
             }
-            let mut out = Vec::with_capacity(keys.len());
-            for key in keys {
-                replace_object(tx, &obj_key(&bucket, &key), None, garbage)?;
-                out.push(Ok(()));
+            let mut out = Vec::with_capacity(items.len());
+            for (key, version) in items {
+                let r = match version {
+                    Some(v) => delete_version(tx, &bucket, &key, &v, garbage),
+                    None => delete_current(tx, last_seq, &bucket, &key, garbage),
+                };
+                if let Err(e) = &r
+                    && e.code == "InternalError"
+                {
+                    return Err(e.clone());
+                }
+                out.push(r);
             }
             Ok(OpOut::Deleted(out))
         }
@@ -818,14 +1411,38 @@ fn apply(tx: &mut Tables, op: Op, garbage: &mut Vec<u128>) -> S3Result<OpOut> {
             };
             Ok(OpOut::Done)
         }
-        Op::SetObjectTags { bucket, key, tags } => {
-            let k = obj_key(&bucket, &key);
-            let Some(mut meta) = get_meta(tx, &k)? else {
-                return Err(if tx.buckets.get(bucket.as_str())?.is_some() { err::NoSuchKey() } else { err::NoSuchBucket() });
+        Op::SetObjectTags { bucket, key, version, tags } => {
+            if tx.buckets.get(bucket.as_str())?.is_none() {
+                return Err(err::NoSuchBucket());
+            }
+            let found = match &version {
+                Some(v) => find_version(tx, &bucket, &key, v)?,
+                None => get_meta(tx, &obj_key(&bucket, &key))?.map(|m| (true, obj_key(&bucket, &key), m)),
             };
+            let Some((in_objects, k, mut meta)) = found else { return Err(err::NoSuchKey()) };
+            if meta.delete_marker {
+                return Err(err::MethodNotAllowed());
+            }
             meta.tags = tags;
-            tx.objects.insert(k.as_slice(), meta.encode().as_slice())?;
+            if in_objects {
+                tx.objects.insert(k.as_slice(), meta.encode().as_slice())?;
+            } else {
+                tx.versions.insert(k.as_slice(), meta.encode().as_slice())?;
+            }
             Ok(OpOut::Done)
+        }
+        Op::PurgeVersions { bucket, items } => {
+            let mut n = 0;
+            for (key, seq) in items {
+                let vk = ver_key(&bucket, &key, seq);
+                let removed = tx.versions.remove(vk.as_slice())?.map(|g| ObjectMeta::decode(g.value())).transpose()?;
+                if let Some(m) = removed {
+                    release(tx, &m, garbage)?;
+                    promote(tx, &bucket, &key)?;
+                    n += 1;
+                }
+            }
+            Ok(OpOut::Count(n))
         }
         Op::Complete { bucket, key, upload, parts, cond } => {
             let Some(u) = tx.uploads.get(upload)?.map(|v| UploadMeta::decode(v.value())).transpose()? else {
@@ -873,8 +1490,11 @@ fn apply(tx: &mut Tables, op: Op, garbage: &mut Vec<u128>) -> S3Result<OpOut> {
                 checksum: None,
                 storage: Storage::Segments(segs.clone()),
                 tags: u.tags,
+                version: None,
+                seq: 0,
+                delete_marker: false,
             };
-            replace_object(tx, &k, Some(&meta), garbage)?;
+            let meta = put_version(tx, last_seq, &bucket, &key, meta, garbage)?;
             // Release all parts except those now owned by the object.
             let mut released = Vec::new();
             drop_upload(tx, upload, &mut released)?;

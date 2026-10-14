@@ -336,7 +336,8 @@ impl Server {
             .bucket_config(bucket, "cors")?
             .and_then(|v| xml::parse(&String::from_utf8_lossy(&v)))
             .and_then(|d| access::parse_cors(&d).ok());
-        let a = Arc::new(BucketAccess { acl, policy, cors });
+        let versioning = store::Versioning::parse(self.store.bucket_config(bucket, "versioning")?.as_deref());
+        let a = Arc::new(BucketAccess { acl, policy, cors, versioning });
         let mut cache = self.access_cache.write().unwrap();
         if self.access_gen.load(Ordering::SeqCst) == generation {
             if cache.len() > 10_000 {
@@ -489,6 +490,9 @@ impl Server {
                     eprintln!("error: {method} {path}: {e}");
                 }
                 let mut r = Resp::new(e.status);
+                for (k, v) in &e.headers {
+                    r.set(k, v);
+                }
                 if method != Method::HEAD {
                     r.set("content-type", "application/xml");
                     r.body = Body::full(error_body(&e, &path, &rid));
@@ -646,8 +650,13 @@ impl Server {
                 Ok(Resp::xml(x.0))
             }
             Method::GET if r.has("versioning") => {
-                self.store.require_bucket(bucket)?;
-                Ok(Resp::xml(Xml::new("VersioningConfiguration").finish("VersioningConfiguration")))
+                let mut x = Xml::new("VersioningConfiguration");
+                match self.store.versioning(bucket)? {
+                    store::Versioning::Enabled => x.elem("Status", "Enabled"),
+                    store::Versioning::Suspended => x.elem("Status", "Suspended"),
+                    store::Versioning::Unversioned => &mut x,
+                };
+                Ok(Resp::xml(x.finish("VersioningConfiguration")))
             }
             Method::GET if r.has("uploads") => self.list_uploads(r, bucket),
             Method::GET if r.has("versions") => self.list_versions(r, bucket),
@@ -735,7 +744,28 @@ impl Server {
                 self.set_bucket_config(bucket, "lifecycle", Some(body.to_vec())).await?;
                 Ok(Resp::ok())
             }
-            Method::PUT if sub.is_some() || r.has("versioning") => Err(err::NotImplemented()),
+            Method::PUT if r.has("versioning") => {
+                let doc = self.read_xml(r).await?;
+                if doc.name != "VersioningConfiguration" {
+                    return Err(err::MalformedXML());
+                }
+                let status: &'static [u8] = match doc.child_text("Status").map(str::trim) {
+                    Some("Enabled") => b"Enabled",
+                    Some("Suspended") => b"Suspended",
+                    // No status leaves the configuration unchanged.
+                    None => {
+                        self.store.require_bucket(bucket)?;
+                        return Ok(Resp::ok());
+                    }
+                    Some(_) => return Err(err::MalformedXML()),
+                };
+                if doc.child_text("MfaDelete").map(str::trim) == Some("Enabled") {
+                    return Err(err::NotImplemented().with_message("MFA delete is not supported"));
+                }
+                self.set_bucket_config(bucket, "versioning", Some(status.to_vec())).await?;
+                Ok(Resp::ok())
+            }
+            Method::PUT if sub.is_some() => Err(err::NotImplemented()),
             Method::PUT => {
                 if !valid_bucket_name(bucket) {
                     return Err(err::InvalidBucketName());
@@ -778,32 +808,42 @@ impl Server {
         if UNSUPPORTED.iter().any(|s| r.has(s)) {
             return Err(err::NotImplemented());
         }
-        if let Some(v) = r.q("versionId")
-            && v != "null"
+        let version = r.q("versionId").filter(|v| !v.is_empty()).map(str::to_string);
+        if let Some(v) = &version
+            && !store::valid_version_id(v)
         {
-            return Err(S3Error::new("NoSuchVersion", StatusCode::NOT_FOUND, "The specified version does not exist."));
+            return Err(err::InvalidArgument().with_message("Invalid version id specified"));
         }
+        let vref = version.as_deref();
         match m {
             Method::GET if r.has("uploadId") => self.list_parts(r, bucket, key),
             Method::GET if r.has("acl") => {
-                self.store.get_object(bucket, key)?;
+                self.lookup(bucket, key, vref)?;
                 Ok(Resp::xml(acl_doc(CannedAcl::Private)))
             }
             Method::GET if r.has("tagging") => {
-                let (meta, _) = self.store.get_object(bucket, key)?;
-                Ok(Resp::xml(access::tagging_xml(&meta.tags)))
+                let (meta, _) = self.lookup(bucket, key, vref)?;
+                let mut resp = Resp::xml(access::tagging_xml(&meta.tags));
+                set_version_header(&mut resp, &meta);
+                Ok(resp)
             }
             Method::GET | Method::HEAD => self.get_object(r, bucket, key, m == Method::HEAD).await,
             Method::PUT if r.has("partNumber") && r.has("uploadId") => self.upload_part(r, bucket, key).await,
             Method::PUT if r.has("acl") => {
-                self.store.get_object(bucket, key)?;
+                self.lookup(bucket, key, vref)?;
                 Ok(Resp::ok())
             }
             Method::PUT if r.has("tagging") => {
                 let doc = self.read_xml(r).await?;
                 let tags = access::parse_tagging_xml(&doc, 10)?;
-                self.store.submit(Op::SetObjectTags { bucket: bucket.into(), key: key.into(), tags }).await?;
-                Ok(Resp::ok())
+                self.store
+                    .submit(Op::SetObjectTags { bucket: bucket.into(), key: key.into(), version: version.clone(), tags })
+                    .await?;
+                let mut resp = Resp::ok();
+                if let Some(v) = &version {
+                    resp.set("x-amz-version-id", v);
+                }
+                Ok(resp)
             }
             Method::PUT if r.header("x-amz-copy-source").is_some() => self.copy_object(r, bucket, key).await,
             Method::PUT => self.put_object(r, bucket, key).await,
@@ -815,12 +855,28 @@ impl Server {
                 Ok(Resp::new(StatusCode::NO_CONTENT))
             }
             Method::DELETE if r.has("tagging") => {
-                self.store.submit(Op::SetObjectTags { bucket: bucket.into(), key: key.into(), tags: vec![] }).await?;
+                self.store
+                    .submit(Op::SetObjectTags { bucket: bucket.into(), key: key.into(), version: version.clone(), tags: vec![] })
+                    .await?;
                 Ok(Resp::new(StatusCode::NO_CONTENT))
             }
             Method::DELETE => {
-                self.store.submit(Op::DeleteObjects { bucket: bucket.into(), keys: vec![key.into()] }).await?;
-                Ok(Resp::new(StatusCode::NO_CONTENT))
+                let OpOut::Deleted(mut res) = self
+                    .store
+                    .submit(Op::DeleteObjects { bucket: bucket.into(), items: vec![(key.into(), version.clone())] })
+                    .await?
+                else {
+                    return Err(S3Error::internal("unexpected writer reply"));
+                };
+                let outcome = res.pop().ok_or_else(|| S3Error::internal("missing delete result"))??;
+                let mut resp = Resp::new(StatusCode::NO_CONTENT);
+                if let Some(v) = &outcome.version_id {
+                    resp.set("x-amz-version-id", v);
+                }
+                if outcome.delete_marker {
+                    resp.set("x-amz-delete-marker", "true");
+                }
+                Ok(resp)
             }
             _ => Err(err::MethodNotAllowed()),
         }
@@ -911,13 +967,17 @@ impl Server {
         let delimiter = r.q("delimiter").unwrap_or("");
         let max = parse_max(r.q("max-keys"), 1000)?;
         let enc = Enc(r.q("encoding-type").is_some_and(|e| e.eq_ignore_ascii_case("url")));
-        let marker = r.q("key-marker").filter(|m| !m.is_empty());
-        let res = self.store.list_objects(bucket, prefix, delimiter, marker, max)?;
+        let key_marker = r.q("key-marker").filter(|m| !m.is_empty());
+        let vid_marker = r.q("version-id-marker").filter(|m| !m.is_empty());
+        if vid_marker.is_some() && key_marker.is_none() {
+            return Err(err::InvalidArgument().with_message("A version-id marker cannot be specified without a key marker."));
+        }
+        let res = self.store.list_object_versions(bucket, prefix, delimiter, key_marker, vid_marker, max)?;
         let mut x = Xml::new("ListVersionsResult");
         x.elem("Name", bucket)
             .elem("Prefix", enc.e(prefix))
-            .elem("KeyMarker", enc.e(marker.unwrap_or("")))
-            .elem("VersionIdMarker", r.q("version-id-marker").unwrap_or(""))
+            .elem("KeyMarker", enc.e(key_marker.unwrap_or("")))
+            .elem("VersionIdMarker", vid_marker.unwrap_or(""))
             .elem("MaxKeys", max.to_string());
         if !delimiter.is_empty() {
             x.elem("Delimiter", enc.e(delimiter));
@@ -926,20 +986,37 @@ impl Server {
             x.elem("EncodingType", "url");
         }
         x.elem("IsTruncated", res.truncated.to_string());
-        if let Some(n) = &res.next_marker {
-            x.elem("NextKeyMarker", enc.e(n)).elem("NextVersionIdMarker", "null");
+        if res.truncated
+            && let Some((k, v)) = &res.next
+        {
+            x.elem("NextKeyMarker", enc.e(k));
+            if let Some(v) = v {
+                x.elem("NextVersionIdMarker", v);
+            }
         }
-        for (key, s) in &res.contents {
-            x.open("Version")
-                .elem("Key", enc.e(key))
-                .elem("VersionId", "null")
-                .elem("IsLatest", "true")
-                .elem("LastModified", iso8601(s.mtime_ms))
-                .elem("ETag", &s.etag)
-                .elem("Size", s.size.to_string())
-                .elem("StorageClass", "STANDARD")
-                .owner("Owner")
-                .close("Version");
+        for e in &res.entries {
+            let m = &e.meta;
+            let vid = m.version.as_deref().unwrap_or("null");
+            if m.delete_marker {
+                x.open("DeleteMarker")
+                    .elem("Key", enc.e(&e.key))
+                    .elem("VersionId", vid)
+                    .elem("IsLatest", e.is_latest.to_string())
+                    .elem("LastModified", iso8601(m.mtime_ms))
+                    .owner("Owner")
+                    .close("DeleteMarker");
+            } else {
+                x.open("Version")
+                    .elem("Key", enc.e(&e.key))
+                    .elem("VersionId", vid)
+                    .elem("IsLatest", e.is_latest.to_string())
+                    .elem("LastModified", iso8601(m.mtime_ms))
+                    .elem("ETag", &m.etag)
+                    .elem("Size", m.size.to_string())
+                    .elem("StorageClass", "STANDARD")
+                    .owner("Owner")
+                    .close("Version");
+            }
         }
         for p in &res.prefixes {
             x.open("CommonPrefixes").elem("Prefix", enc.e(p)).close("CommonPrefixes");
@@ -1059,6 +1136,14 @@ impl Server {
 
     // -------------------------------------------------------------- objects
 
+    /// The current object, or a specific version when `version` is given.
+    fn lookup(&self, bucket: &str, key: &str, version: Option<&str>) -> S3Result<(ObjectMeta, Option<Bytes>)> {
+        match version {
+            Some(v) => self.store.get_object_version(bucket, key, v),
+            None => self.store.get_object(bucket, key),
+        }
+    }
+
     fn expect(&self, r: &Req, max_len: u64, allow_inline: bool) -> S3Result<Expect> {
         let chunked = matches!(r.payload, Payload::Chunked { .. });
         let len_header = if chunked { "x-amz-decoded-content-length" } else { "content-length" };
@@ -1093,9 +1178,11 @@ impl Server {
     }
 
     async fn put_object(&self, r: &mut Req, bucket: &str, key: &str) -> S3Result<Resp> {
-        self.store.require_bucket(bucket)?;
+        // Versioned buckets keep every version, so small objects go to data files rather than
+        // inline in the metadata database (which would otherwise only ever grow).
+        let versioned = self.bucket_access(bucket)?.versioning == store::Versioning::Enabled;
         let tags = request_tags(r)?;
-        let expect = self.expect(r, MAX_OBJECT_SIZE, true)?;
+        let expect = self.expect(r, MAX_OBJECT_SIZE, !versioned)?;
         let body = std::mem::replace(&mut r.body, BodyStream::empty());
         let ing = io::ingest(&self.store, body, expect).await?;
         self.metrics.add_bytes_in(ing.size);
@@ -1108,11 +1195,18 @@ impl Server {
             checksum: ing.checksum.clone(),
             storage,
             tags,
+            version: None,
+            seq: 0,
+            delete_marker: false,
         };
         let cond = write_cond(&r.parts.headers);
-        self.store.submit_owning(Op::PutObject { bucket: bucket.into(), key: key.into(), meta, inline, cond }, files).await?;
+        let out =
+            self.store.submit_owning(Op::PutObject { bucket: bucket.into(), key: key.into(), meta, inline, cond }, files).await?;
         let mut resp = Resp::ok();
         resp.set("etag", &ing.etag());
+        if let OpOut::Object(m) = &out {
+            set_version_header(&mut resp, m);
+        }
         if let Some((a, v)) = &ing.checksum {
             resp.set(a.header(), v);
         }
@@ -1122,9 +1216,10 @@ impl Server {
     async fn get_object(&self, r: &Req, bucket: &str, key: &str, head: bool) -> S3Result<Resp> {
         let h = &r.parts.headers;
         for attempt in 0..3 {
-            let (meta, inline) = self.store.get_object(bucket, key)?;
+            let (meta, inline) = self.lookup(bucket, key, r.q("versionId").filter(|v| !v.is_empty()))?;
             let mut resp = Resp::ok();
             resp.set("etag", &meta.etag).set("last-modified", &http_date(meta.mtime_ms)).set("accept-ranges", "bytes");
+            set_version_header(&mut resp, &meta);
             if check_read_conditions(h, &meta)? {
                 resp.status = StatusCode::NOT_MODIFIED;
                 return Ok(resp);
@@ -1208,18 +1303,20 @@ impl Server {
         Err(err::NoSuchKey())
     }
 
-    fn copy_source(&self, r: &Req) -> S3Result<(String, String)> {
+    /// Parse `x-amz-copy-source`: (bucket, key, version id).
+    fn copy_source(&self, r: &Req) -> S3Result<(String, String, Option<String>)> {
         let raw = r.header("x-amz-copy-source").ok_or_else(err::InvalidArgument)?;
         let (path, query) = raw.split_once('?').unwrap_or((raw, ""));
-        if let Some(v) = parse_query(query).iter().find(|(k, _)| k == "versionId").map(|(_, v)| v.as_str())
-            && v != "null"
+        let version = parse_query(query).into_iter().find(|(k, _)| k == "versionId").map(|(_, v)| v);
+        if let Some(v) = &version
+            && !store::valid_version_id(v)
         {
-            return Err(S3Error::new("NoSuchVersion", StatusCode::NOT_FOUND, "The specified version does not exist."));
+            return Err(err::InvalidArgument().with_message("Invalid version id specified"));
         }
         let path = uri_decode(path, false).ok_or_else(|| err::InvalidArgument().with_message("Invalid copy source encoding"))?;
         let path = path.strip_prefix('/').unwrap_or(&path);
         match path.split_once('/') {
-            Some((b, k)) if !b.is_empty() && !k.is_empty() => Ok((b.to_string(), k.to_string())),
+            Some((b, k)) if !b.is_empty() && !k.is_empty() => Ok((b.to_string(), k.to_string(), version)),
             _ => {
                 Err(err::InvalidArgument()
                     .with_message("Copy Source must mention the source bucket and key: sourcebucket/sourcekey"))
@@ -1228,15 +1325,15 @@ impl Server {
     }
 
     async fn copy_object(&self, r: &mut Req, bucket: &str, key: &str) -> S3Result<Resp> {
-        let (sb, sk) = self.copy_source(r)?;
+        let (sb, sk, sv) = self.copy_source(r)?;
         self.store.require_bucket(bucket)?;
         let replace = r.header("x-amz-metadata-directive").is_some_and(|d| d.eq_ignore_ascii_case("REPLACE"));
         let replace_tags = r.header("x-amz-tagging-directive").is_some_and(|d| d.eq_ignore_ascii_case("REPLACE"));
         let _ = r.body.read_all(MAX_XML_BODY).await?;
         for attempt in 0..3 {
-            let (src, inline) = self.store.get_object(&sb, &sk)?;
+            let (src, inline) = self.lookup(&sb, &sk, sv.as_deref())?;
             check_copy_conditions(&r.parts.headers, &src)?;
-            if sb == bucket && sk == key && !replace {
+            if sb == bucket && sk == key && !replace && sv.is_none() {
                 return Err(err::InvalidRequest().with_message(
                     "This copy request is illegal because it is trying to copy an object to itself without changing the object's metadata, storage class, website redirect location or encryption attributes.",
                 ));
@@ -1268,10 +1365,16 @@ impl Server {
                 checksum: src.checksum.clone(),
                 storage,
                 tags,
+                version: None,
+                seq: 0,
+                delete_marker: false,
             };
             let mtime = meta.mtime_ms;
             let cond = write_cond(&r.parts.headers);
-            self.store.submit_owning(Op::PutObject { bucket: bucket.into(), key: key.into(), meta, inline, cond }, files).await?;
+            let out = self
+                .store
+                .submit_owning(Op::PutObject { bucket: bucket.into(), key: key.into(), meta, inline, cond }, files)
+                .await?;
             let mut x = Xml::new("CopyObjectResult");
             x.elem("LastModified", iso8601(mtime)).elem("ETag", &src.etag);
             if let Some((a, v)) = &src.checksum {
@@ -1284,7 +1387,14 @@ impl Server {
                 };
                 x.elem(tag, v);
             }
-            return Ok(Resp::xml(x.finish("CopyObjectResult")));
+            let mut resp = Resp::xml(x.finish("CopyObjectResult"));
+            if let Some(v) = src.version.as_deref().or(sv.as_deref()) {
+                resp.set("x-amz-copy-source-version-id", v);
+            }
+            if let OpOut::Object(m) = &out {
+                set_version_header(&mut resp, m);
+            }
+            return Ok(resp);
         }
         Err(err::NoSuchKey())
     }
@@ -1333,10 +1443,10 @@ impl Server {
     }
 
     async fn upload_part_copy(&self, r: &mut Req, bucket: &str, key: &str, upload: u128, part: u32) -> S3Result<Resp> {
-        let (sb, sk) = self.copy_source(r)?;
+        let (sb, sk, sv) = self.copy_source(r)?;
         let _ = r.body.read_all(MAX_XML_BODY).await?;
         for attempt in 0..3 {
-            let (src, inline) = self.store.get_object(&sb, &sk)?;
+            let (src, inline) = self.lookup(&sb, &sk, sv.as_deref())?;
             check_copy_conditions(&r.parts.headers, &src)?;
             let (start, len) = match r.header("x-amz-copy-source-range") {
                 None => (0, src.size),
@@ -1434,7 +1544,8 @@ impl Server {
         headers.sort();
 
         let (min, max) = range.unwrap_or((0, MAX_OBJECT_SIZE));
-        let expect = Expect { max_len: max.min(MAX_OBJECT_SIZE), allow_inline: true, ..Default::default() };
+        let versioned = self.bucket_access(bucket)?.versioning == store::Versioning::Enabled;
+        let expect = Expect { max_len: max.min(MAX_OBJECT_SIZE), allow_inline: !versioned, ..Default::default() };
         let ing = io::ingest(&self.store, file, expect).await?;
         let (storage, inline, files) = ing.storage();
         if ing.size < min {
@@ -1443,10 +1554,26 @@ impl Server {
         }
         self.metrics.add_bytes_in(ing.size);
         let etag = ing.etag();
-        let meta = ObjectMeta { size: ing.size, mtime_ms: now_ms(), etag: etag.clone(), headers, checksum: None, storage, tags };
-        self.store
+        let meta = ObjectMeta {
+            size: ing.size,
+            mtime_ms: now_ms(),
+            etag: etag.clone(),
+            headers,
+            checksum: None,
+            storage,
+            tags,
+            version: None,
+            seq: 0,
+            delete_marker: false,
+        };
+        let out = self
+            .store
             .submit_owning(Op::PutObject { bucket: bucket.into(), key: key.clone(), meta, inline, cond: None }, files)
             .await?;
+        let version = match &out {
+            OpOut::Object(m) => m.version.clone(),
+            _ => None,
+        };
 
         let host = header(&parts.headers, "host").unwrap_or("localhost");
         let location = format!("http://{host}/{bucket}/{}", uri_encode(&key, true));
@@ -1475,6 +1602,9 @@ impl Server {
             _ => Resp::new(StatusCode::NO_CONTENT),
         };
         resp.set("etag", &etag).set("location", &location);
+        if let Some(v) = &version {
+            resp.set("x-amz-version-id", v);
+        }
         Ok(resp)
     }
 
@@ -1524,7 +1654,9 @@ impl Server {
             .elem("Bucket", bucket)
             .elem("Key", key)
             .elem("ETag", &meta.etag);
-        Ok(Resp::xml(x.finish("CompleteMultipartUploadResult")))
+        let mut resp = Resp::xml(x.finish("CompleteMultipartUploadResult"));
+        set_version_header(&mut resp, &meta);
+        Ok(resp)
     }
 
     async fn delete_objects(&self, r: &mut Req, bucket: &str) -> S3Result<Resp> {
@@ -1533,29 +1665,49 @@ impl Server {
             return Err(err::MalformedXML());
         }
         let quiet = doc.child_text("Quiet").is_some_and(|q| q.trim().eq_ignore_ascii_case("true"));
-        let keys: Vec<String> = doc.children_named("Object").filter_map(|o| o.child_text("Key").map(str::to_string)).collect();
-        if keys.len() > 1000 {
+        let objects: Vec<(String, Option<String>)> = doc
+            .children_named("Object")
+            .filter_map(|o| {
+                let key = o.child_text("Key")?.to_string();
+                let version = o.child_text("VersionId").map(str::trim).filter(|v| !v.is_empty()).map(str::to_string);
+                Some((key, version))
+            })
+            .collect();
+        if objects.len() > 1000 {
             return Err(err::MalformedXML().with_message("The request must contain no more than 1000 keys"));
         }
-        let (valid, invalid): (Vec<String>, Vec<String>) =
-            keys.into_iter().partition(|k| !k.is_empty() && k.len() <= MAX_KEY_LEN);
-        let OpOut::Deleted(results) = self.store.submit(Op::DeleteObjects { bucket: bucket.into(), keys: valid.clone() }).await?
+        let (valid, invalid): (Vec<_>, Vec<_>) = objects.into_iter().partition(|(k, _)| !k.is_empty() && k.len() <= MAX_KEY_LEN);
+        let OpOut::Deleted(results) =
+            self.store.submit(Op::DeleteObjects { bucket: bucket.into(), items: valid.clone() }).await?
         else {
             return Err(S3Error::internal("unexpected writer reply"));
         };
         let mut x = Xml::new("DeleteResult");
-        for (k, res) in valid.iter().zip(results) {
+        for ((k, requested), res) in valid.iter().zip(results) {
             match res {
-                Ok(()) if !quiet => {
-                    x.open("Deleted").elem("Key", k).close("Deleted");
+                Ok(_) if quiet => {}
+                Ok(o) => {
+                    x.open("Deleted").elem("Key", k);
+                    if let Some(v) = requested {
+                        x.elem("VersionId", v);
+                    }
+                    if o.delete_marker {
+                        x.elem("DeleteMarker", "true");
+                        if let Some(v) = &o.version_id
+                            && requested.is_none()
+                        {
+                            x.elem("DeleteMarkerVersionId", v);
+                        }
+                    }
+                    x.close("Deleted");
                 }
-                Ok(()) => {}
                 Err(e) => {
-                    x.open("Error").elem("Key", k).elem("Code", e.code).elem("Message", &e.message).close("Error");
+                    x.open("Error").elem("Key", k).opt("VersionId", requested.as_deref());
+                    x.elem("Code", e.code).elem("Message", &e.message).close("Error");
                 }
             }
         }
-        for k in invalid {
+        for (k, _) in invalid {
             x.open("Error").elem("Key", &k).elem("Code", "InvalidArgument").elem("Message", "Invalid key").close("Error");
         }
         Ok(Resp::xml(x.finish("DeleteResult")))
@@ -1571,6 +1723,13 @@ fn request_tags(r: &Req) -> S3Result<Vec<(String, String)>> {
 fn form_key(key: &str, filename: Option<&str>) -> String {
     let base = filename.map(|f| f.rsplit(['/', '\\']).next().unwrap_or(f)).unwrap_or("");
     key.replace("${filename}", base)
+}
+
+/// `x-amz-version-id` for responses about an object version (absent for unversioned objects).
+fn set_version_header(resp: &mut Resp, meta: &ObjectMeta) {
+    if let Some(v) = &meta.version {
+        resp.set("x-amz-version-id", v);
+    }
 }
 
 fn parse_upload_id(r: &Req) -> S3Result<u128> {

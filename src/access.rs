@@ -467,6 +467,7 @@ impl CannedAcl {
 #[derive(Debug, Default)]
 pub struct BucketAccess {
     pub acl: CannedAcl,
+    pub versioning: crate::store::Versioning,
     pub policy: Option<Policy>,
     pub cors: Option<Vec<CorsRule>>,
 }

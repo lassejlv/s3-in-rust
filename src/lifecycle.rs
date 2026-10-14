@@ -24,6 +24,10 @@ pub struct Rule {
     /// Unix seconds.
     pub expire_date: Option<u64>,
     pub abort_mpu_days: Option<u64>,
+    /// Remove versions this many days after they became noncurrent.
+    pub noncurrent_days: Option<u64>,
+    /// Remove delete markers that are the only remaining version of their key.
+    pub expired_delete_marker: bool,
 }
 
 fn bad(msg: &str) -> crate::error::S3Error {
@@ -90,6 +94,17 @@ pub fn parse(doc: &xml::Node) -> S3Result<Vec<Rule>> {
                 }
                 rule.expire_date = Some(t);
             }
+            if let Some(v) = e.child_text("ExpiredObjectDeleteMarker") {
+                rule.expired_delete_marker = v.trim().eq_ignore_ascii_case("true");
+            }
+        }
+        if let Some(n) = r.child("NoncurrentVersionExpiration") {
+            let d: u64 = n
+                .child_text("NoncurrentDays")
+                .and_then(|d| d.trim().parse().ok())
+                .filter(|d| *d > 0)
+                .ok_or_else(|| bad("Invalid NoncurrentDays"))?;
+            rule.noncurrent_days = Some(d);
         }
         if let Some(a) = r.child("AbortIncompleteMultipartUpload") {
             let d: u64 = a
@@ -99,11 +114,15 @@ pub fn parse(doc: &xml::Node) -> S3Result<Vec<Rule>> {
                 .ok_or_else(|| bad("Invalid DaysAfterInitiation"))?;
             rule.abort_mpu_days = Some(d);
         }
-        // Transitions and noncurrent-version actions are accepted but have no effect: there is a
-        // single storage class and no versioning.
-        let has_other =
-            ["Transition", "NoncurrentVersionExpiration", "NoncurrentVersionTransition"].iter().any(|n| r.child(n).is_some());
-        if rule.expire_days.is_none() && rule.expire_date.is_none() && rule.abort_mpu_days.is_none() && !has_other {
+        // Transitions are accepted but have no effect: there is a single storage class.
+        let has_other = ["Transition", "NoncurrentVersionTransition"].iter().any(|n| r.child(n).is_some());
+        if rule.expire_days.is_none()
+            && rule.expire_date.is_none()
+            && rule.abort_mpu_days.is_none()
+            && rule.noncurrent_days.is_none()
+            && !rule.expired_delete_marker
+            && !has_other
+        {
             return Err(err::InvalidRequest().with_message("At least one action needs to be specified in a rule"));
         }
         rules.push(rule);
@@ -178,6 +197,41 @@ pub async fn sweep(store: &Arc<Store>, day_secs: u64) -> S3Result<(u64, u64)> {
                     }
                 }
             }
+            if rule.noncurrent_days.is_some() || rule.expired_delete_marker {
+                let mut after: Option<Vec<u8>> = None;
+                loop {
+                    let (st, b, p, a) = (store.clone(), bucket.clone(), rule.prefix.clone(), after.clone());
+                    let page = tokio::task::spawn_blocking(move || st.scan_noncurrent(&b, &p, a.as_deref(), 1000))
+                        .await
+                        .map_err(crate::error::S3Error::internal)??;
+                    let n = page.items.len();
+                    let due: Vec<(String, u64)> = page
+                        .items
+                        .iter()
+                        // Delete markers carry no tags or size, so only the prefix applies to them.
+                        .filter(|it| {
+                            if it.meta.delete_marker { it.key.starts_with(&rule.prefix) } else { rule.matches(&it.key, &it.meta) }
+                        })
+                        .filter(|it| match it.noncurrent_since_ms {
+                            Some(since) => rule.noncurrent_days.is_some_and(|d| {
+                                let due = (since / 1000 + d * day_secs).div_ceil(day_secs) * day_secs;
+                                now >= due
+                            }),
+                            None => rule.expired_delete_marker && it.meta.delete_marker && it.only_version,
+                        })
+                        .map(|it| (it.key.clone(), it.meta.seq))
+                        .collect();
+                    if !due.is_empty()
+                        && let Ok(OpOut::Count(c)) = store.submit(Op::PurgeVersions { bucket: bucket.clone(), items: due }).await
+                    {
+                        expired += c as u64;
+                    }
+                    match page.last {
+                        Some(l) if n >= 1000 => after = Some(l),
+                        _ => break,
+                    }
+                }
+            }
             if let Some(days) = rule.abort_mpu_days {
                 let cutoff_ms = now.saturating_sub(days * day_secs) * 1000;
                 for u in store.list_uploads(&bucket, &rule.prefix)? {
@@ -224,6 +278,9 @@ mod tests {
             checksum: None,
             storage: Storage::Inline(0),
             tags: tags.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+            version: None,
+            seq: 0,
+            delete_marker: false,
         }
     }
 
@@ -258,6 +315,18 @@ mod tests {
         assert!(!r.expired(&m, day + 10 * 3600, day));
         assert!(!r.expired(&m, 2 * day - 1, day));
         assert!(r.expired(&m, 2 * day, day));
+    }
+
+    #[test]
+    fn parses_noncurrent_actions() {
+        let doc = xml::parse(
+            "<LifecycleConfiguration><Rule><Status>Enabled</Status><Filter><Prefix></Prefix></Filter>\
+             <NoncurrentVersionExpiration><NoncurrentDays>3</NoncurrentDays></NoncurrentVersionExpiration>\
+             <Expiration><ExpiredObjectDeleteMarker>true</ExpiredObjectDeleteMarker></Expiration></Rule></LifecycleConfiguration>",
+        )
+        .unwrap();
+        let r = &parse(&doc).unwrap()[0];
+        assert_eq!((r.noncurrent_days, r.expired_delete_marker, r.expire_days), (Some(3), true, None));
     }
 
     #[test]

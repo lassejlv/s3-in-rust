@@ -5,7 +5,12 @@
 
 use crate::error::{S3Error, S3Result};
 
-const VERSION: u8 = 1;
+/// Record format version. v2 appended object/upload tags; v1 records are still readable.
+const VERSION: u8 = 2;
+
+fn check_version(v: u8) -> S3Result<u8> {
+    if (1..=VERSION).contains(&v) { Ok(v) } else { Err(corrupt()) }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChecksumAlgo {
@@ -69,6 +74,7 @@ pub struct ObjectMeta {
     pub headers: Vec<(String, String)>,
     pub checksum: Option<(ChecksumAlgo, String)>,
     pub storage: Storage,
+    pub tags: Vec<(String, String)>,
 }
 
 pub struct ObjectSummary {
@@ -83,6 +89,7 @@ pub struct UploadMeta {
     pub key: String,
     pub initiated_ms: u64,
     pub headers: Vec<(String, String)>,
+    pub tags: Vec<(String, String)>,
 }
 
 #[derive(Debug, Clone)]
@@ -191,14 +198,13 @@ impl ObjectMeta {
                 }
             }
         }
+        w.headers(&self.tags);
         w.0
     }
 
     pub fn decode(b: &[u8]) -> S3Result<Self> {
         let mut r = R(b);
-        if r.u8()? != VERSION {
-            return Err(corrupt());
-        }
+        let version = check_version(r.u8()?)?;
         let size = r.u64()?;
         let mtime_ms = r.u64()?;
         let etag = r.str()?;
@@ -219,14 +225,13 @@ impl ObjectMeta {
             }
             _ => return Err(corrupt()),
         };
-        Ok(ObjectMeta { size, mtime_ms, etag, headers, checksum, storage })
+        let tags = if version >= 2 { r.headers()? } else { Vec::new() };
+        Ok(ObjectMeta { size, mtime_ms, etag, headers, checksum, storage, tags })
     }
 
     pub fn decode_summary(b: &[u8]) -> S3Result<ObjectSummary> {
         let mut r = R(b);
-        if r.u8()? != VERSION {
-            return Err(corrupt());
-        }
+        check_version(r.u8()?)?;
         Ok(ObjectSummary { size: r.u64()?, mtime_ms: r.u64()?, etag: r.str()? })
     }
 }
@@ -239,15 +244,16 @@ impl UploadMeta {
         w.str(&self.key);
         w.u64(self.initiated_ms);
         w.headers(&self.headers);
+        w.headers(&self.tags);
         w.0
     }
 
     pub fn decode(b: &[u8]) -> S3Result<Self> {
         let mut r = R(b);
-        if r.u8()? != VERSION {
-            return Err(corrupt());
-        }
-        Ok(UploadMeta { bucket: r.str()?, key: r.str()?, initiated_ms: r.u64()?, headers: r.headers()? })
+        let version = check_version(r.u8()?)?;
+        let (bucket, key, initiated_ms, headers) = (r.str()?, r.str()?, r.u64()?, r.headers()?);
+        let tags = if version >= 2 { r.headers()? } else { Vec::new() };
+        Ok(UploadMeta { bucket, key, initiated_ms, headers, tags })
     }
 }
 
@@ -280,13 +286,40 @@ mod tests {
             headers: vec![("content-type".into(), "text/plain".into())],
             checksum: Some((ChecksumAlgo::Crc32c, "AAAA".into())),
             storage: Storage::Segments(vec![(1, 2), (3, 4)]),
+            tags: vec![("k".into(), "v".into())],
         };
         let d = ObjectMeta::decode(&m.encode()).unwrap();
         assert_eq!(d.size, 42);
         assert_eq!(d.etag, "\"abc\"");
         assert_eq!(d.storage, m.storage);
         assert_eq!(d.checksum, m.checksum);
+        assert_eq!(d.tags, m.tags);
         let s = ObjectMeta::decode_summary(&m.encode()).unwrap();
         assert_eq!((s.size, s.mtime_ms), (42, 7));
+    }
+}
+
+#[cfg(test)]
+mod compat_tests {
+    use super::*;
+
+    /// Records written by v1 (no tags) must still decode.
+    #[test]
+    fn decodes_v1_records() {
+        let m = ObjectMeta {
+            size: 1,
+            mtime_ms: 2,
+            etag: "\"e\"".into(),
+            headers: vec![],
+            checksum: None,
+            storage: Storage::Inline(9),
+            tags: vec![],
+        };
+        let mut v1 = m.encode();
+        v1[0] = 1;
+        v1.truncate(v1.len() - 4); // drop the empty tag list
+        let d = ObjectMeta::decode(&v1).unwrap();
+        assert_eq!(d.storage, Storage::Inline(9));
+        assert!(d.tags.is_empty());
     }
 }

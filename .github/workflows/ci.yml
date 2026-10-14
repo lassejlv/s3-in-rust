@@ -1,0 +1,71 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: fmt, clippy, unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test
+
+  e2e:
+    name: end-to-end (boto3, aws-cli, minio-go)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache-dependency-path: tests/minio-go/go.sum
+      - run: pip install boto3 awscli
+      - run: cargo build --release
+      - name: Start s3rs
+        run: |
+          printf 'rokey:rosecret:ro\n' > /tmp/creds
+          ./target/release/s3rs -d /tmp/s3rs-data -l 127.0.0.1:9000 \
+            --access-key testkey --secret-key testsecret --credentials-file /tmp/creds > /tmp/s3rs.log 2>&1 &
+          for i in $(seq 50); do curl -sf http://127.0.0.1:9000/_health && break; sleep 0.1; done
+      - name: boto3 suite
+        env:
+          S3RS_RO_ACCESS_KEY: rokey
+          S3RS_RO_SECRET_KEY: rosecret
+        run: python3 tests/e2e.py
+      - name: aws-cli smoke test
+        env:
+          AWS_ACCESS_KEY_ID: testkey
+          AWS_SECRET_ACCESS_KEY: testsecret
+          AWS_DEFAULT_REGION: us-east-1
+        run: |
+          E="--endpoint-url http://127.0.0.1:9000"
+          mkdir -p /tmp/sync/sub && head -c 20000000 /dev/urandom > /tmp/sync/big.bin && echo hi > /tmp/sync/sub/a.txt
+          aws $E s3 mb s3://cli-test
+          aws $E s3 sync --only-show-errors /tmp/sync s3://cli-test/data/
+          aws $E s3 sync --only-show-errors s3://cli-test/data/ /tmp/sync2
+          diff -r /tmp/sync /tmp/sync2
+          aws $E s3 rm --only-show-errors --recursive s3://cli-test/
+          aws $E s3 rb s3://cli-test
+      - name: minio-go suite
+        working-directory: tests/minio-go
+        run: go run .
+      - name: Server log
+        if: always()
+        run: cat /tmp/s3rs.log

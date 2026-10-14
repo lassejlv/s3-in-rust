@@ -50,7 +50,9 @@ Each flag can also be set with the environment variable shown.
 | `-d, --data-dir` | `S3RS_DATA_DIR` | `./data` | Storage directory |
 | `--access-key` | `S3RS_ACCESS_KEY` | | Access key ID |
 | `--secret-key` | `S3RS_SECRET_KEY` | | Secret access key |
+| `--credentials-file` | `S3RS_CREDENTIALS_FILE` | | More keys, one `access_key:secret_key[:ro]` per line. `ro` keys can only read. |
 | `--anonymous` | | off | Turns off authentication. Use it only on trusted networks. |
+| `--cors-origins` | `S3RS_CORS_ORIGINS` | | Comma-separated origins (e.g. `*`) allowed for buckets that have no CORS configuration of their own |
 | `--region` | `S3RS_REGION` | `us-east-1` | Region reported to clients |
 | `--domain` | `S3RS_DOMAIN` | | Turns on virtual-hosted-style requests (`<bucket>.<domain>`) |
 | `--inline-threshold` | `S3RS_INLINE_THRESHOLD` | `65536` | Objects up to this many bytes are stored inside the metadata DB |
@@ -58,15 +60,54 @@ Each flag can also be set with the environment variable shown.
 | `--no-fsync` | | off | Skips fsync. Faster, but a power loss can lose up to ~1s of acknowledged writes. |
 | `-v, --verbose` | | off | Logs every request |
 
-The server refuses to start without credentials unless you pass `--anonymous`. `GET /_health` returns
-`200 ok` without authentication.
+The server refuses to start without credentials unless you pass `--anonymous`.
+
+`GET /_health` returns `200 ok`. `GET /_metrics` serves Prometheus metrics: request counts by method
+and status, a latency histogram, bytes in and out, and the bucket count. Neither endpoint needs
+authentication.
+
+On `SIGTERM` or Ctrl-C the server stops accepting connections and waits up to 30 seconds for
+in-flight requests to finish. It then flushes metadata and records a clean shutdown. If a run
+crashes, the next start scans the store before serving and removes orphaned data files.
+
+## Access control
+
+Authenticated requests have full access. Requests made with a `ro` key from `--credentials-file`
+can only read. ACLs and bucket policies control what **anonymous** requests may do:
+
+```bash
+# Public read: anyone can GET objects and list the bucket
+aws --endpoint-url $E s3api put-bucket-acl --bucket site --acl public-read      # or create-bucket --acl public-read
+
+# Finer control with a bucket policy: public prefix, a denied subfolder, an anonymous upload drop-box
+aws --endpoint-url $E s3api put-bucket-policy --bucket site --policy '{
+  "Version": "2012-10-17",
+  "Statement": [
+    {"Effect": "Allow", "Principal": "*", "Action": "s3:GetObject", "Resource": "arn:aws:s3:::site/public/*"},
+    {"Effect": "Deny",  "Principal": "*", "Action": "s3:*",         "Resource": "arn:aws:s3:::site/public/private/*"},
+    {"Effect": "Allow", "Principal": "*", "Action": "s3:PutObject", "Resource": "arn:aws:s3:::site/uploads/*"}
+  ]}'
+```
+
+Policy evaluation supports `Allow` and `Deny`, wildcard actions such as `s3:Get*`, and wildcard
+resources. An explicit `Deny` wins. The server can't evaluate statements that use `Condition`,
+`NotAction`, `NotResource` or `NotPrincipal`, so it treats them conservatively: such an `Allow`
+grants nothing, and such a `Deny` always applies. Policies only affect anonymous access.
+
+The `public-read` ACL lets anonymous callers GET objects and list the bucket. `public-read-write`
+also lets them upload and delete. Per-object ACLs are accepted but ignored.
+
+**CORS.** `PutBucketCors`, `GetBucketCors` and `DeleteBucketCors` are supported. `OPTIONS` preflight
+requests are answered without authentication. Matching responses get `Access-Control-*` headers, and
+error responses get them too, so browsers can read the error. Use `--cors-origins` to set a
+server-wide default for buckets that have no CORS configuration.
 
 ## S3 API coverage
 
 | Area | Operations |
 |---|---|
-| Buckets | ListBuckets, CreateBucket, DeleteBucket, HeadBucket, GetBucketLocation, GetBucketVersioning, GetBucketAcl/PutBucketAcl (fixed owner-only ACL) |
-| Objects | PutObject, GetObject, HeadObject, DeleteObject, DeleteObjects, CopyObject (COPY/REPLACE metadata), GetObjectAcl, GetObjectTagging (empty) |
+| Buckets | ListBuckets, CreateBucket (with canned ACL), DeleteBucket, HeadBucket, GetBucketLocation, GetBucketVersioning, Get/PutBucketAcl, Get/Put/DeleteBucketPolicy, GetBucketPolicyStatus, Get/Put/DeleteBucketCors, Get/Put/DeleteBucketTagging |
+| Objects | PutObject, GetObject, HeadObject, DeleteObject, DeleteObjects, CopyObject (COPY/REPLACE for metadata and tags), Get/Put/DeleteObjectTagging, `x-amz-tagging` on upload, GetObjectAcl |
 | Listing | ListObjects (v1), ListObjectsV2, ListObjectVersions (one `null` version per key); prefix, delimiter, pagination, `start-after`, `encoding-type=url` |
 | Multipart | CreateMultipartUpload, UploadPart, UploadPartCopy (with ranges), CompleteMultipartUpload, AbortMultipartUpload, ListParts, ListMultipartUploads |
 | Reads | Single `Range` requests, `partNumber` reads, `If-Match` / `If-None-Match` / `If-Modified-Since` / `If-Unmodified-Since`, `response-*` header overrides |
@@ -75,8 +116,8 @@ The server refuses to start without credentials unless you pass `--anonymous`. `
 | Auth | SigV4 headers, SigV4 presigned URLs, SigV4 streaming (`STREAMING-AWS4-HMAC-SHA256-PAYLOAD[-TRAILER]`, `STREAMING-UNSIGNED-PAYLOAD-TRAILER`), SigV2 headers and presigned URLs |
 | Transport | HTTP/1.1 keep-alive, HTTP/2 (h2c), path-style and virtual-hosted-style addressing |
 
-Not implemented: versioning, bucket policies/IAM (one credential, full access), server-side encryption,
-object lock, lifecycle rules, tagging writes, CORS, website hosting, and SigV4A. These requests return
+Not implemented: versioning, per-user IAM policies, server-side encryption, object lock, lifecycle
+rules, website hosting, and SigV4A. These requests return
 `NotImplemented` or the matching "not found" configuration error.
 
 ## Architecture
@@ -142,13 +183,17 @@ cargo test                        # unit tests, including the AWS SigV4 test vec
 # end-to-end compatibility suite (needs boto3)
 ./target/release/s3rs -d /tmp/s3rs-test --access-key testkey --secret-key testsecret &
 S3RS_ACCESS_KEY=testkey S3RS_SECRET_KEY=testsecret python3 tests/e2e.py
+
+# MinIO Go SDK (exercises signed aws-chunked uploads)
+cd tests/minio-go && S3RS_ACCESS_KEY=testkey S3RS_SECRET_KEY=testsecret go run .
 ```
+
+CI (`.github/workflows/ci.yml`) runs fmt, clippy, the unit tests, the boto3 suite, an AWS CLI sync
+round-trip and the minio-go suite on every push.
 
 ## Limitations and notes
 
-- There is one set of credentials, and it has full access to everything.
-- If the server crashes between renaming a data file into place and committing its metadata, that
-  file is left behind as an orphan. It wastes space but cannot be reached.
+- Keys are either read-write or read-only for every bucket. There are no per-user IAM policies.
 - Each object can be at most 5 GiB on a single PUT. A multipart upload can have up to 10,000 parts of
   5 GiB each, the same limits as S3.
 - Only one `s3rs` process can use a data directory at a time.

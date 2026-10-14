@@ -79,10 +79,33 @@ impl ChunkSigner {
     }
 }
 
+/// One access key: its secret and whether it may only read.
+pub struct Credential {
+    pub secret: String,
+    pub read_only: bool,
+}
+
+/// Who made a request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Principal {
+    Anonymous,
+    User {
+        read_only: bool,
+    },
+    /// Authentication is disabled server-wide (`--anonymous`).
+    Everyone,
+}
+
 pub struct Auth {
-    access_key: String,
-    secret_key: String,
+    creds: HashMap<String, Credential>,
     key_cache: Mutex<HashMap<String, [u8; 32]>>,
+}
+
+/// Whether a request carries any authentication (header or presigned query).
+pub fn has_credentials(parts: &Parts, raw_query: &str) -> bool {
+    parts.headers.contains_key(hyper::header::AUTHORIZATION)
+        || raw_query.contains("X-Amz-Signature=")
+        || (raw_query.contains("Signature=") && raw_query.contains("AWSAccessKeyId="))
 }
 
 struct SigParams<'a> {
@@ -126,38 +149,46 @@ pub fn payload_mode(parts: &Parts) -> S3Result<Payload> {
 }
 
 impl Auth {
-    pub fn new(access_key: String, secret_key: String) -> Self {
-        Auth { access_key, secret_key, key_cache: Mutex::new(HashMap::new()) }
+    pub fn new(creds: HashMap<String, Credential>) -> Self {
+        Auth { creds, key_cache: Mutex::new(HashMap::new()) }
     }
 
-    fn signing_key(&self, date: &str, region: &str, service: &str) -> [u8; 32] {
-        let cache_key = format!("{date}/{region}/{service}");
+    fn credential(&self, access_key: &str) -> S3Result<&Credential> {
+        self.creds.get(access_key).ok_or_else(err::InvalidAccessKeyId)
+    }
+
+    fn principal(&self, access_key: &str) -> Principal {
+        Principal::User { read_only: self.creds.get(access_key).is_some_and(|c| c.read_only) }
+    }
+
+    fn signing_key(&self, access_key: &str, date: &str, region: &str, service: &str) -> S3Result<[u8; 32]> {
+        let secret = &self.credential(access_key)?.secret;
+        let cache_key = format!("{access_key}/{date}/{region}/{service}");
         if let Some(k) = self.key_cache.lock().unwrap().get(&cache_key) {
-            return *k;
+            return Ok(*k);
         }
-        let k_date = hmac(format!("AWS4{}", self.secret_key).as_bytes(), date.as_bytes());
+        let k_date = hmac(format!("AWS4{secret}").as_bytes(), date.as_bytes());
         let k_region = hmac(&k_date, region.as_bytes());
         let k_service = hmac(&k_region, service.as_bytes());
         let key = hmac(&k_service, b"aws4_request");
         let mut cache = self.key_cache.lock().unwrap();
-        if cache.len() > 64 {
+        if cache.len() > 1024 {
             cache.clear();
         }
         cache.insert(cache_key, key);
-        key
+        Ok(key)
     }
 
-    /// Authenticate a request. Returns how the payload must be verified.
     /// Authenticate a request. `vhost_bucket` is the bucket taken from the Host header for
     /// virtual-hosted-style requests (needed for SigV2's canonical resource).
-    pub fn verify(&self, parts: &Parts, raw_query: &str, vhost_bucket: Option<&str>) -> S3Result<Payload> {
+    pub fn verify(&self, parts: &Parts, raw_query: &str, vhost_bucket: Option<&str>) -> S3Result<(Payload, Principal)> {
         if let Some(h) = parts.headers.get(hyper::header::AUTHORIZATION) {
             let h = h.to_str().map_err(|_| err::AccessDenied())?;
             if let Some(v2) = h.strip_prefix("AWS ") {
                 let (ak, sig) =
                     v2.split_once(':').ok_or_else(|| err::InvalidArgument().with_message("Malformed Authorization header"))?;
                 self.verify_v2(parts, raw_query, vhost_bucket, ak, sig, None)?;
-                return payload_mode(parts);
+                return Ok((payload_mode(parts)?, self.principal(ak)));
             }
             return self.verify_header(parts, raw_query, h);
         }
@@ -175,8 +206,9 @@ impl Auth {
             if util::now_ms() / 1000 > expires {
                 return Err(err::AccessDenied().with_message("Request has expired"));
             }
-            self.verify_v2(parts, raw_query, vhost_bucket, get("AWSAccessKeyId")?, get("Signature")?, Some(expires))?;
-            return payload_mode(parts);
+            let ak = get("AWSAccessKeyId")?;
+            self.verify_v2(parts, raw_query, vhost_bucket, ak, get("Signature")?, Some(expires))?;
+            return Ok((payload_mode(parts)?, self.principal(ak)));
         }
         Err(err::AccessDenied())
     }
@@ -191,9 +223,7 @@ impl Auth {
         signature: &str,
         expires: Option<u64>,
     ) -> S3Result<()> {
-        if !ct_eq(access_key.as_bytes(), self.access_key.as_bytes()) {
-            return Err(err::InvalidAccessKeyId());
-        }
+        let secret = self.credential(access_key)?.secret.as_bytes();
         let h = |n: &str| parts.headers.get(n).and_then(|v| v.to_str().ok()).unwrap_or("").trim();
         let date = match expires {
             Some(e) => e.to_string(),
@@ -283,7 +313,7 @@ impl Auth {
                 sts.push_str(v);
             }
         }
-        let mut m = <hmac::Hmac<sha1::Sha1> as KeyInit>::new_from_slice(self.secret_key.as_bytes()).expect("hmac key");
+        let mut m = <hmac::Hmac<sha1::Sha1> as KeyInit>::new_from_slice(secret).expect("hmac key");
         m.update(sts.as_bytes());
         let expected = util::base64(&m.finalize().into_bytes());
         if !ct_eq(expected.as_bytes(), signature.as_bytes()) {
@@ -292,7 +322,7 @@ impl Auth {
         Ok(())
     }
 
-    fn verify_header(&self, parts: &Parts, raw_query: &str, h: &str) -> S3Result<Payload> {
+    fn verify_header(&self, parts: &Parts, raw_query: &str, h: &str) -> S3Result<(Payload, Principal)> {
         let Some(rest) = h.strip_prefix(ALGO) else {
             return Err(
                 err::InvalidArgument().with_message("Unsupported authorization type (only AWS4-HMAC-SHA256 is supported)")
@@ -348,10 +378,10 @@ impl Auth {
                 prev: signature.to_string(),
             });
         }
-        Ok(mode)
+        Ok((mode, self.principal(access_key)))
     }
 
-    fn verify_presigned(&self, parts: &Parts, raw_query: &str) -> S3Result<Payload> {
+    fn verify_presigned(&self, parts: &Parts, raw_query: &str) -> S3Result<(Payload, Principal)> {
         let mut get = HashMap::new();
         for pair in raw_query.split('&') {
             let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
@@ -393,7 +423,7 @@ impl Auth {
             Payload::Chunked { .. } => {
                 Err(err::NotImplemented().with_message("Streaming payloads are not supported with presigned URLs"))
             }
-            m => Ok(m),
+            m => Ok((m, self.principal(access_key))),
         }
     }
 
@@ -406,9 +436,6 @@ impl Auth {
         content_sha: &str,
         presigned: bool,
     ) -> S3Result<[u8; 32]> {
-        if !ct_eq(p.access_key.as_bytes(), self.access_key.as_bytes()) {
-            return Err(err::InvalidAccessKeyId());
-        }
         if !amz_date.starts_with(p.date) {
             return Err(err::SignatureDoesNotMatch().with_message("Credential date does not match request date"));
         }
@@ -419,7 +446,7 @@ impl Auth {
         let canonical_headers = canonical_headers(parts, &signed);
         let canonical_query = canonical_query(raw_query, presigned);
         let scope = format!("{}/{}/{}/aws4_request", p.date, p.region, p.service);
-        let key = self.signing_key(p.date, p.region, p.service);
+        let key = self.signing_key(p.access_key, p.date, p.region, p.service)?;
 
         let raw_path = parts.uri.path();
         let normalized = uri_decode(raw_path, false).map(|d| uri_encode(&d, true));
@@ -523,10 +550,19 @@ fn push_trimmed(out: &mut String, v: &str) {
 mod tests {
     use super::*;
 
+    fn doc_auth() -> Auth {
+        let mut m = HashMap::new();
+        m.insert(
+            "AKIAIOSFODNN7EXAMPLE".to_string(),
+            Credential { secret: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".into(), read_only: false },
+        );
+        Auth::new(m)
+    }
+
     /// Example from the AWS SigV4 documentation ("GET Object" with a Range header).
     #[test]
     fn aws_doc_get_object() {
-        let auth = Auth::new("AKIAIOSFODNN7EXAMPLE".into(), "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".into());
+        let auth = doc_auth();
         let req = hyper::Request::builder()
             .method("GET")
             .uri("/test.txt")
@@ -553,7 +589,7 @@ mod tests {
     /// Example from the AWS documentation for presigned URLs.
     #[test]
     fn aws_doc_presigned() {
-        let auth = Auth::new("AKIAIOSFODNN7EXAMPLE".into(), "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".into());
+        let auth = doc_auth();
         let q = "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIAIOSFODNN7EXAMPLE%2F20130524%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Date=20130524T000000Z&X-Amz-Expires=86400&X-Amz-SignedHeaders=host&X-Amz-Signature=aeeed9bbccd4d02ee5c0109b86d86835f995330da4c265957d157751f604d404";
         let req = hyper::Request::builder()
             .method("GET")
@@ -576,9 +612,9 @@ mod tests {
     /// Chunk signature example from the AWS streaming SigV4 documentation.
     #[test]
     fn aws_doc_chunk_signature() {
-        let auth = Auth::new("AKIAIOSFODNN7EXAMPLE".into(), "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".into());
+        let auth = doc_auth();
         let mut s = ChunkSigner {
-            key: auth.signing_key("20130524", "us-east-1", "s3"),
+            key: auth.signing_key("AKIAIOSFODNN7EXAMPLE", "20130524", "us-east-1", "s3").unwrap(),
             date: "20130524T000000Z".into(),
             scope: "20130524/us-east-1/s3/aws4_request".into(),
             prev: "4f232c4386841ef735655705268965c44a0e4690baa4adea153f7db9fa80a0a9".into(),

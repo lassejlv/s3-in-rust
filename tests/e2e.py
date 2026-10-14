@@ -21,6 +21,9 @@ from botocore.exceptions import ClientError
 ENDPOINT = os.environ.get("S3RS_ENDPOINT", "http://127.0.0.1:9000")
 AK = os.environ.get("S3RS_ACCESS_KEY", "testkey")
 SK = os.environ.get("S3RS_SECRET_KEY", "testsecret")
+# Optional read-only credential (configured via --credentials-file with `key:secret:ro`).
+RO_AK = os.environ.get("S3RS_RO_ACCESS_KEY")
+RO_SK = os.environ.get("S3RS_RO_SECRET_KEY")
 
 
 def client(**cfg):
@@ -308,6 +311,156 @@ def t_bad_credentials():
         raise AssertionError("anonymous request accepted")
     except urllib.error.HTTPError as e:
         assert e.code == 403
+
+
+def http(method, path, headers=None, data=None):
+    """Raw unauthenticated HTTP request; returns (status, headers, body)."""
+    req = urllib.request.Request(f"{ENDPOINT}{path}", data=data, method=method, headers=headers or {})
+    try:
+        with urllib.request.urlopen(req) as r:
+            return r.status, r.headers, r.read()
+    except urllib.error.HTTPError as e:
+        return e.code, e.headers, e.read()
+
+
+def t_object_tagging():
+    s3.put_object(Bucket=B, Key="tagged", Body=b"t", Tagging="env=prod&team=a%20b")
+    tags = {t["Key"]: t["Value"] for t in s3.get_object_tagging(Bucket=B, Key="tagged")["TagSet"]}
+    assert tags == {"env": "prod", "team": "a b"}, tags
+    assert s3.get_object(Bucket=B, Key="tagged")["TagCount"] == 2
+    s3.put_object_tagging(Bucket=B, Key="tagged", Tagging={"TagSet": [{"Key": "x", "Value": "1"}]})
+    assert s3.get_object_tagging(Bucket=B, Key="tagged")["TagSet"] == [{"Key": "x", "Value": "1"}]
+    s3.copy_object(Bucket=B, Key="tagged-copy", CopySource=f"{B}/tagged")
+    assert s3.get_object_tagging(Bucket=B, Key="tagged-copy")["TagSet"] == [{"Key": "x", "Value": "1"}]
+    s3.copy_object(Bucket=B, Key="tagged-copy", CopySource=f"{B}/tagged", TaggingDirective="REPLACE", Tagging="y=2")
+    assert s3.get_object_tagging(Bucket=B, Key="tagged-copy")["TagSet"] == [{"Key": "y", "Value": "2"}]
+    s3.delete_object_tagging(Bucket=B, Key="tagged")
+    assert s3.get_object_tagging(Bucket=B, Key="tagged")["TagSet"] == []
+    expect_error("InvalidTag", lambda: s3.put_object(Bucket=B, Key="bad-tags", Body=b"", Tagging="a=1&a=2"))
+    uid = s3.create_multipart_upload(Bucket=B, Key="mp-tagged", Tagging="mp=yes")["UploadId"]
+    e = s3.upload_part(Bucket=B, Key="mp-tagged", UploadId=uid, PartNumber=1, Body=b"z")["ETag"]
+    s3.complete_multipart_upload(Bucket=B, Key="mp-tagged", UploadId=uid, MultipartUpload={"Parts": [{"PartNumber": 1, "ETag": e}]})
+    assert s3.get_object_tagging(Bucket=B, Key="mp-tagged")["TagSet"] == [{"Key": "mp", "Value": "yes"}]
+
+
+def t_bucket_tagging():
+    expect_error("NoSuchTagSet", lambda: s3.get_bucket_tagging(Bucket=B))
+    s3.put_bucket_tagging(Bucket=B, Tagging={"TagSet": [{"Key": "owner", "Value": "me"}]})
+    assert s3.get_bucket_tagging(Bucket=B)["TagSet"] == [{"Key": "owner", "Value": "me"}]
+    s3.delete_bucket_tagging(Bucket=B)
+    expect_error("NoSuchTagSet", lambda: s3.get_bucket_tagging(Bucket=B))
+
+
+def t_public_read_acl():
+    pb = B + "-pub"
+    s3.create_bucket(Bucket=pb)
+    s3.put_object(Bucket=pb, Key="file.txt", Body=b"public data")
+    assert http("GET", f"/{pb}/file.txt")[0] == 403
+    s3.put_bucket_acl(Bucket=pb, ACL="public-read")
+    grants = s3.get_bucket_acl(Bucket=pb)["Grants"]
+    assert any(g["Grantee"].get("URI", "").endswith("AllUsers") and g["Permission"] == "READ" for g in grants), grants
+    st, _, body = http("GET", f"/{pb}/file.txt")
+    assert (st, body) == (200, b"public data"), st
+    assert http("HEAD", f"/{pb}/file.txt")[0] == 200
+    st, _, body = http("GET", f"/{pb}?list-type=2")
+    assert st == 200 and b"<Key>file.txt</Key>" in body
+    assert http("PUT", f"/{pb}/new.txt", data=b"nope")[0] == 403
+    assert http("DELETE", f"/{pb}/file.txt")[0] == 403
+    assert http("GET", f"/{pb}?acl")[0] == 403
+    s3.put_bucket_acl(Bucket=pb, ACL="private")
+    assert http("GET", f"/{pb}/file.txt")[0] == 403
+    # Canned ACL at creation time.
+    pb2 = B + "-pub2"
+    s3.create_bucket(Bucket=pb2, ACL="public-read")
+    s3.put_object(Bucket=pb2, Key="k", Body=b"v")
+    assert http("GET", f"/{pb2}/k")[2] == b"v"
+    for b in (pb, pb2):
+        for o in s3.list_objects_v2(Bucket=b).get("Contents", []):
+            s3.delete_object(Bucket=b, Key=o["Key"])
+        s3.delete_bucket(Bucket=b)
+
+
+def t_bucket_policy():
+    import json
+    expect_error("NoSuchBucketPolicy", lambda: s3.get_bucket_policy(Bucket=B))
+    policy = {
+        "Version": "2012-10-17",
+        "Statement": [
+            {"Effect": "Allow", "Principal": "*", "Action": "s3:GetObject", "Resource": f"arn:aws:s3:::{B}/public/*"},
+            {"Effect": "Deny", "Principal": "*", "Action": "s3:GetObject", "Resource": f"arn:aws:s3:::{B}/public/secret*"},
+            {"Effect": "Allow", "Principal": {"AWS": ["*"]}, "Action": ["s3:PutObject"], "Resource": f"arn:aws:s3:::{B}/dropbox/*"},
+        ],
+    }
+    s3.put_bucket_policy(Bucket=B, Policy=json.dumps(policy))
+    assert json.loads(s3.get_bucket_policy(Bucket=B)["Policy"]) == policy
+    assert s3.get_bucket_policy_status(Bucket=B)["PolicyStatus"]["IsPublic"] is True
+    s3.put_object(Bucket=B, Key="public/page.html", Body=b"<h1>hi</h1>")
+    s3.put_object(Bucket=B, Key="public/secret.txt", Body=b"s")
+    assert http("GET", f"/{B}/public/page.html")[2] == b"<h1>hi</h1>"
+    assert http("GET", f"/{B}/public/secret.txt")[0] == 403
+    assert http("GET", f"/{B}/hello.txt")[0] == 403
+    assert http("GET", f"/{B}?list-type=2")[0] == 403
+    assert http("PUT", f"/{B}/dropbox/upload.bin", data=b"anon upload")[0] == 200
+    assert s3.get_object(Bucket=B, Key="dropbox/upload.bin")["Body"].read() == b"anon upload"
+    assert http("PUT", f"/{B}/elsewhere.bin", data=b"x")[0] == 403
+    bad = dict(policy, Statement=[{"Effect": "Allow", "Principal": "*", "Action": "s3:GetObject", "Resource": "arn:aws:s3:::other/*"}])
+    expect_error("MalformedPolicy", lambda: s3.put_bucket_policy(Bucket=B, Policy=json.dumps(bad)))
+    expect_error("MalformedPolicy", lambda: s3.put_bucket_policy(Bucket=B, Policy="{not json"))
+    s3.delete_bucket_policy(Bucket=B)
+    assert http("GET", f"/{B}/public/page.html")[0] == 403
+
+
+def t_cors():
+    expect_error("NoSuchCORSConfiguration", lambda: s3.get_bucket_cors(Bucket=B))
+    rules = [{"AllowedOrigins": ["https://*.example.com"], "AllowedMethods": ["GET", "PUT"],
+              "AllowedHeaders": ["*"], "ExposeHeaders": ["ETag"], "MaxAgeSeconds": 600}]
+    s3.put_bucket_cors(Bucket=B, CORSConfiguration={"CORSRules": rules})
+    got = s3.get_bucket_cors(Bucket=B)["CORSRules"]
+    assert got[0]["AllowedOrigins"] == ["https://*.example.com"] and got[0]["MaxAgeSeconds"] == 600, got
+    st, h, _ = http("OPTIONS", f"/{B}/some/key", headers={
+        "Origin": "https://app.example.com", "Access-Control-Request-Method": "PUT",
+        "Access-Control-Request-Headers": "content-type, x-amz-meta-foo"})
+    assert st == 200, st
+    assert h["Access-Control-Allow-Origin"] == "https://app.example.com"
+    assert "PUT" in h["Access-Control-Allow-Methods"] and h["Access-Control-Max-Age"] == "600"
+    assert "x-amz-meta-foo" in h["Access-Control-Allow-Headers"]
+    st, _, _ = http("OPTIONS", f"/{B}/k", headers={"Origin": "https://evil.com", "Access-Control-Request-Method": "GET"})
+    assert st == 403
+    st, _, _ = http("OPTIONS", f"/{B}/k", headers={"Origin": "https://app.example.com", "Access-Control-Request-Method": "DELETE"})
+    assert st == 403
+    # Actual requests (signed) get CORS headers too.
+    c = client()
+    def add_origin(request, **kw):
+        request.headers["Origin"] = "https://app.example.com"
+    c.meta.events.register("before-sign.s3.GetObject", add_origin)
+    r = c.get_object(Bucket=B, Key="hello.txt")
+    hdrs = r["ResponseMetadata"]["HTTPHeaders"]
+    assert hdrs.get("access-control-allow-origin") == "https://app.example.com", hdrs
+    assert hdrs.get("access-control-expose-headers") == "ETag"
+    s3.delete_bucket_cors(Bucket=B)
+    expect_error("NoSuchCORSConfiguration", lambda: s3.get_bucket_cors(Bucket=B))
+
+
+def t_read_only_key():
+    if not RO_AK:
+        print("        (skipped: S3RS_RO_ACCESS_KEY not set)")
+        return
+    ro = boto3.client("s3", endpoint_url=ENDPOINT, aws_access_key_id=RO_AK, aws_secret_access_key=RO_SK,
+                      region_name="us-east-1", config=Config(retries={"max_attempts": 1}, s3={"addressing_style": "path"}))
+    assert ro.get_object(Bucket=B, Key="hello.txt")["Body"].read() == b"hello world"
+    assert any(o["Key"] == "hello.txt" for o in ro.list_objects_v2(Bucket=B)["Contents"])
+    expect_error("AccessDenied", lambda: ro.put_object(Bucket=B, Key="ro-write", Body=b"x"))
+    expect_error("AccessDenied", lambda: ro.delete_object(Bucket=B, Key="hello.txt"))
+    expect_error("AccessDenied", lambda: ro.create_bucket(Bucket=B + "-ro"))
+
+
+def t_metrics_and_health():
+    st, _, body = http("GET", "/_health")
+    assert st == 200 and body == b"ok\n"
+    st, h, body = http("GET", "/_metrics")
+    text = body.decode()
+    assert st == 200 and "s3rs_requests_total{method=\"GET\",code=\"2xx\"}" in text, text[:500]
+    assert "s3rs_request_duration_seconds_bucket" in text and "s3rs_buckets" in text
 
 
 def t_overwrite():

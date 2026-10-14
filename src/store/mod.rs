@@ -26,6 +26,11 @@ const OBJECTS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("objects");
 const INLINE: TableDefinition<u128, &[u8]> = TableDefinition::new("inline");
 const UPLOADS: TableDefinition<u128, &[u8]> = TableDefinition::new("uploads");
 const PARTS: TableDefinition<(u128, u32), &[u8]> = TableDefinition::new("parts");
+/// Per-bucket configuration documents: (bucket, kind) -> raw document.
+const CONFIG: TableDefinition<(&str, &str), &[u8]> = TableDefinition::new("bucket_config");
+
+/// Kinds of bucket configuration stored in `CONFIG`.
+pub const CONFIG_KINDS: &[&str] = &["acl", "policy", "cors", "tagging"];
 
 pub const MIN_PART_SIZE: u64 = 5 * 1024 * 1024;
 const MAX_BATCH: usize = 1024;
@@ -72,6 +77,8 @@ pub enum Op {
     PutPart { upload: u128, bucket: String, key: String, part: u32, meta: PartMeta },
     Complete { bucket: String, key: String, upload: u128, parts: Vec<(u32, String)>, cond: Option<WriteCond> },
     Abort { bucket: String, key: String, upload: u128 },
+    SetBucketConfig { bucket: String, kind: &'static str, value: Option<Vec<u8>> },
+    SetObjectTags { bucket: String, key: String, tags: Vec<(String, String)> },
     Flush,
 }
 
@@ -138,6 +145,12 @@ impl Store {
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp)?;
 
+        // The marker exists only between a clean shutdown and the next start. If the database
+        // exists but the marker does not, the last run crashed and may have left orphaned files.
+        let marker = root.join(CLEAN_MARKER);
+        let unclean = root.join("meta.redb").exists() && !marker.exists();
+        let _ = std::fs::remove_file(&marker);
+
         let db = Database::builder().set_cache_size(cfg.cache_bytes).create(root.join("meta.redb"))?;
         {
             let txn = db.begin_write()?;
@@ -146,7 +159,18 @@ impl Store {
             txn.open_table(INLINE)?;
             txn.open_table(UPLOADS)?;
             txn.open_table(PARTS)?;
+            txn.open_table(CONFIG)?;
             txn.commit()?;
+        }
+        if unclean {
+            let started = std::time::Instant::now();
+            match collect_orphans(&db, &root) {
+                Ok((n, bytes)) => eprintln!(
+                    "recovery: removed {n} orphaned data file(s), {bytes} bytes, in {:.1}s",
+                    started.elapsed().as_secs_f64()
+                ),
+                Err(e) => eprintln!("recovery: orphan scan failed: {e}"),
+            }
         }
         let db = Arc::new(db);
 
@@ -171,6 +195,11 @@ impl Store {
         std::thread::Builder::new().name("s3rs-writer".into()).spawn(move || writer_loop(wdb, rx, wdel, durable))?;
 
         Ok(Arc::new(Store { root, fsync: cfg.fsync, inline_threshold: cfg.inline_threshold, db, writer: tx, deleter: del_tx }))
+    }
+
+    /// Record that the store shut down cleanly (all metadata flushed, nothing in flight).
+    pub fn mark_clean_shutdown(&self) {
+        let _ = std::fs::write(self.root.join(CLEAN_MARKER), b"");
     }
 
     pub fn data_path(&self, id: u128) -> PathBuf {
@@ -339,6 +368,15 @@ impl Store {
         Ok(res)
     }
 
+    /// A bucket configuration document, if set. Errors with NoSuchBucket.
+    pub fn bucket_config(&self, bucket: &str, kind: &str) -> S3Result<Option<Vec<u8>>> {
+        let txn = self.db.begin_read()?;
+        if txn.open_table(BUCKETS)?.get(bucket)?.is_none() {
+            return Err(err::NoSuchBucket());
+        }
+        Ok(txn.open_table(CONFIG)?.get((bucket, kind))?.map(|v| v.value().to_vec()))
+    }
+
     pub fn get_upload(&self, id: u128) -> S3Result<Option<UploadMeta>> {
         let t = self.db.begin_read()?.open_table(UPLOADS)?;
         match t.get(id)? {
@@ -376,6 +414,42 @@ impl Store {
         out.sort_by(|a, b| (&a.meta.key, a.meta.initiated_ms, a.id).cmp(&(&b.meta.key, b.meta.initiated_ms, b.id)));
         Ok(out)
     }
+}
+
+const CLEAN_MARKER: &str = "clean-shutdown";
+
+/// Delete data files that no object or part references. Only safe while nothing else is
+/// writing, i.e. before the server starts serving.
+fn collect_orphans(db: &Database, root: &Path) -> S3Result<(usize, u64)> {
+    let txn = db.begin_read()?;
+    let mut live = std::collections::HashSet::new();
+    for e in txn.open_table(OBJECTS)?.iter()? {
+        let (_, v) = e?;
+        if let Storage::Segments(segs) = ObjectMeta::decode(v.value())?.storage {
+            live.extend(segs.into_iter().map(|(id, _)| id));
+        }
+    }
+    for e in txn.open_table(PARTS)?.iter()? {
+        let (_, v) = e?;
+        live.insert(PartMeta::decode(v.value())?.file);
+    }
+    let (mut n, mut bytes) = (0usize, 0u64);
+    for dir in std::fs::read_dir(root.join("data"))? {
+        let dir = dir?;
+        if !dir.file_type()?.is_dir() {
+            continue;
+        }
+        for f in std::fs::read_dir(dir.path())? {
+            let f = f?;
+            let Some(id) = f.file_name().to_str().and_then(util::parse_id_hex) else { continue };
+            if !live.contains(&id) {
+                bytes += f.metadata().map(|m| m.len()).unwrap_or(0);
+                std::fs::remove_file(f.path())?;
+                n += 1;
+            }
+        }
+    }
+    Ok((n, bytes))
 }
 
 pub fn data_path(root: &Path, id: u128) -> PathBuf {
@@ -434,6 +508,7 @@ fn writer_loop(db: Arc<Database>, rx: mpsc::Receiver<Job>, deleter: mpsc::Sender
                     inline: txn.open_table(INLINE)?,
                     uploads: txn.open_table(UPLOADS)?,
                     parts: txn.open_table(PARTS)?,
+                    config: txn.open_table(CONFIG)?,
                 };
                 for job in batch.iter_mut() {
                     let mut garbage = Vec::new();
@@ -492,6 +567,7 @@ struct Tables<'t> {
     inline: redb::Table<'t, u128, &'static [u8]>,
     uploads: redb::Table<'t, u128, &'static [u8]>,
     parts: redb::Table<'t, (u128, u32), &'static [u8]>,
+    config: redb::Table<'t, (&'static str, &'static str), &'static [u8]>,
 }
 
 fn check_cond(existing: Option<&ObjectMeta>, cond: &Option<WriteCond>) -> S3Result<()> {
@@ -579,6 +655,9 @@ fn apply(tx: &mut Tables, op: Op, garbage: &mut Vec<u128>) -> S3Result<OpOut> {
             for id in stale {
                 drop_upload(tx, id, garbage)?;
             }
+            for kind in CONFIG_KINDS {
+                tx.config.remove((name.as_str(), *kind))?;
+            }
             tx.buckets.remove(name.as_str())?;
             Ok(OpOut::Done)
         }
@@ -636,6 +715,25 @@ fn apply(tx: &mut Tables, op: Op, garbage: &mut Vec<u128>) -> S3Result<OpOut> {
             drop_upload(tx, upload, garbage)?;
             Ok(OpOut::Done)
         }
+        Op::SetBucketConfig { bucket, kind, value } => {
+            if tx.buckets.get(bucket.as_str())?.is_none() {
+                return Err(err::NoSuchBucket());
+            }
+            match value {
+                Some(v) => tx.config.insert((bucket.as_str(), kind), v.as_slice())?,
+                None => tx.config.remove((bucket.as_str(), kind))?,
+            };
+            Ok(OpOut::Done)
+        }
+        Op::SetObjectTags { bucket, key, tags } => {
+            let k = obj_key(&bucket, &key);
+            let Some(mut meta) = get_meta(tx, &k)? else {
+                return Err(if tx.buckets.get(bucket.as_str())?.is_some() { err::NoSuchKey() } else { err::NoSuchBucket() });
+            };
+            meta.tags = tags;
+            tx.objects.insert(k.as_slice(), meta.encode().as_slice())?;
+            Ok(OpOut::Done)
+        }
         Op::Complete { bucket, key, upload, parts, cond } => {
             let Some(u) = tx.uploads.get(upload)?.map(|v| UploadMeta::decode(v.value())).transpose()? else {
                 return Err(err::NoSuchUpload());
@@ -681,6 +779,7 @@ fn apply(tx: &mut Tables, op: Op, garbage: &mut Vec<u128>) -> S3Result<OpOut> {
                 headers: u.headers,
                 checksum: None,
                 storage: Storage::Segments(segs.clone()),
+                tags: u.tags,
             };
             replace_object(tx, &k, Some(&meta), garbage)?;
             // Release all parts except those now owned by the object.

@@ -53,6 +53,7 @@ OPTIONS (each also settable through the environment variable shown):
                                                                  [S3RS_ENCRYPTION_KEY]
         --encryption-key-file <P> Read the master key from a file
         --encrypt-by-default     Encrypt every new object with the master key
+                                                                 [S3RS_ENCRYPT_BY_DEFAULT=1]
         --metrics-token <T>      Require `Authorization: Bearer <T>` for /_metrics
                                                                  [S3RS_METRICS_TOKEN]
         --region <REGION>        Region reported to clients      [S3RS_REGION, default us-east-1]
@@ -62,8 +63,9 @@ OPTIONS (each also settable through the environment variable shown):
                                                                  [S3RS_INLINE_THRESHOLD, default 65536]
         --cache-mb <N>           Metadata cache size in MiB      [S3RS_CACHE_MB, default 256]
         --no-fsync               Do not fsync data or metadata (faster, less durable)
+                                                                 [S3RS_NO_FSYNC=1]
         --lifecycle-interval <S> Seconds between lifecycle sweeps [S3RS_LIFECYCLE_INTERVAL, default 3600]
-    -v, --verbose                Log every request
+    -v, --verbose                Log every request               [S3RS_VERBOSE=1]
     -h, --help                   Show this help
 ";
 
@@ -93,6 +95,15 @@ fn env(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|v| !v.is_empty())
 }
 
+/// Boolean switch from the environment: 1/true/yes/on or 0/false/no/off (unset means off).
+fn env_flag(name: &str) -> Result<bool, String> {
+    match env(name).map(|v| v.to_ascii_lowercase()).as_deref() {
+        None | Some("0" | "false" | "no" | "off") => Ok(false),
+        Some("1" | "true" | "yes" | "on") => Ok(true),
+        Some(v) => Err(format!("{name}: expected 1/0, true/false, yes/no or on/off, got `{v}`")),
+    }
+}
+
 fn parse_args() -> Result<Config, String> {
     let mut c = Config {
         listen: env("S3RS_LISTEN").unwrap_or_else(|| "0.0.0.0:9000".into()).parse().map_err(|e| format!("S3RS_LISTEN: {e}"))?,
@@ -107,15 +118,15 @@ fn parse_args() -> Result<Config, String> {
             .map(|k| parse_key(&k))
             .transpose()
             .map_err(|e| format!("S3RS_ENCRYPTION_KEY: {e}"))?,
-        encrypt_by_default: false,
+        encrypt_by_default: env_flag("S3RS_ENCRYPT_BY_DEFAULT")?,
         region: env("S3RS_REGION").unwrap_or_else(|| "us-east-1".into()),
         domain: env("S3RS_DOMAIN"),
         inline_threshold: env("S3RS_INLINE_THRESHOLD")
             .map_or(Ok(65536), |v| v.parse())
             .map_err(|e| format!("S3RS_INLINE_THRESHOLD: {e}"))?,
         cache_mb: env("S3RS_CACHE_MB").map_or(Ok(256), |v| v.parse()).map_err(|e| format!("S3RS_CACHE_MB: {e}"))?,
-        fsync: true,
-        verbose: false,
+        fsync: !env_flag("S3RS_NO_FSYNC")?,
+        verbose: env_flag("S3RS_VERBOSE")?,
         lifecycle_interval: env("S3RS_LIFECYCLE_INTERVAL")
             .map_or(Ok(3600), |v| v.parse())
             .map_err(|e| format!("S3RS_LIFECYCLE_INTERVAL: {e}"))?,

@@ -41,7 +41,7 @@ docker run -p 9000:9000 -v $PWD/data:/data -e S3RS_ACCESS_KEY=mykey -e S3RS_SECR
 ```
 
 ## Configuration
-
+Each flag can also be set with the environment variable shown (switches take `1`/`true`/`yes`/`on`).
 Each flag can also be set with the environment variable shown.
 
 | Flag | Env | Default | |
@@ -57,13 +57,13 @@ Each flag can also be set with the environment variable shown.
 | `--lifecycle-interval` | `S3RS_LIFECYCLE_INTERVAL` | `3600` | Seconds between lifecycle sweeps. `0` turns lifecycle off. |
 | `--encryption-key` | `S3RS_ENCRYPTION_KEY` | | Master key for SSE-S3, as 64 hex characters or base64 (e.g. `openssl rand -hex 32`) |
 | `--encryption-key-file` | | | Reads the master key from a file |
-| `--encrypt-by-default` | | off | Encrypts every new object with the master key |
+| `--encrypt-by-default` | `S3RS_ENCRYPT_BY_DEFAULT` | off | Encrypts every new object with the master key |
 | `--region` | `S3RS_REGION` | `us-east-1` | Region reported to clients |
 | `--domain` | `S3RS_DOMAIN` | | Turns on virtual-hosted-style requests (`<bucket>.<domain>`) |
 | `--inline-threshold` | `S3RS_INLINE_THRESHOLD` | `65536` | Objects up to this many bytes are stored inside the metadata DB |
 | `--cache-mb` | `S3RS_CACHE_MB` | `256` | Metadata cache size |
-| `--no-fsync` | | off | Skips fsync. Faster, but a power loss can lose up to ~1s of acknowledged writes. |
-| `-v, --verbose` | | off | Logs every request |
+| `--no-fsync` | `S3RS_NO_FSYNC` | off | Skips fsync. Faster, but a power loss can lose up to ~1s of acknowledged writes. |
+| `-v, --verbose` | `S3RS_VERBOSE` | off | Logs every request |
 
 The server refuses to start without credentials unless you pass `--anonymous`.
 

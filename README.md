@@ -81,6 +81,8 @@ Each flag can also be set with the environment variable shown (switches take `1`
 | `--metrics-token` | `S3RS_METRICS_TOKEN` | | Requires `Authorization: Bearer <token>` on `/_metrics` |
 | `--no-console` | `S3RS_NO_CONSOLE` | off | Turns off the web console at `/_console/` |
 | `--behind-proxy` | `S3RS_BEHIND_PROXY` | off | Trusts `X-Forwarded-For` / `X-Forwarded-Proto` for policy conditions |
+| `--webhook ID=URL` | `S3RS_WEBHOOKS` (comma-separated) | | Event notification target (repeatable); see [Event notifications](#event-notifications) |
+| `--webhook-secret` | `S3RS_WEBHOOK_SECRET` | | Signs webhook bodies with HMAC-SHA256 |
 | `--lifecycle-interval` | `S3RS_LIFECYCLE_INTERVAL` | `3600` | Seconds between lifecycle sweeps. `0` turns lifecycle off. |
 | `--encryption-key` | `S3RS_ENCRYPTION_KEY` | | Master key for SSE-S3, as 64 hex characters or base64 (e.g. `openssl rand -hex 32`) |
 | `--encryption-key-file` | | | Reads the master key from a file |
@@ -324,6 +326,54 @@ Supported: index documents (`/` and `/dir/`, and `/dir` redirects to `/dir/`), e
 accepts only anonymous GET and HEAD, and never lists buckets. Behind a TLS-terminating proxy,
 redirects use the scheme from `X-Forwarded-Proto`.
 
+## Event notifications
+
+s3rs can tell other services when objects are created or removed, in S3's event format.
+
+**Webhooks.** The operator defines the targets, so bucket owners can't make the server call
+arbitrary URLs:
+
+```bash
+s3rs ... --webhook thumbnails=http://worker.internal:8080/s3-events --webhook-secret "$(openssl rand -hex 16)"
+```
+
+Buckets then subscribe with the standard API, using the target's ARN `arn:s3rs:webhook::<id>`:
+
+```python
+s3.put_bucket_notification_configuration(Bucket="photos", NotificationConfiguration={"QueueConfigurations": [{
+    "Id": "new-images", "QueueArn": "arn:s3rs:webhook::thumbnails",
+    "Events": ["s3:ObjectCreated:*"],
+    "Filter": {"Key": {"FilterRules": [{"Name": "prefix", "Value": "uploads/"}, {"Name": "suffix", "Value": ".jpg"}]}}}]})
+```
+
+How delivery works:
+- **Body:** each event is POSTed as `{"Records":[...]}`, the same JSON S3 sends to SQS/SNS/Lambda.
+  Object keys are URL-encoded, and the body includes the size, ETag, version id and a sequencer.
+- **Signature:** with `--webhook-secret`, the `X-S3rs-Signature: sha256=<HMAC-SHA256 of the body>`
+  header lets receivers verify it.
+- **Ordering and retries:** each target gets its events in order, over a reused connection, with
+  5 attempts and backoff.
+- **Outages:** while a target is down, events get a single attempt each, so a backlog drains
+  quickly once it recovers. Writes never wait for deliveries.
+- **Full queue:** at 10,000 queued events, new ones are dropped.
+- **Monitoring:** `s3rs_notifications_total{result="delivered|failed|dropped"}` in `/_metrics`
+  counts outcomes.
+
+Webhooks are plain `http://`, because s3rs has no TLS client. Point them at services on a private
+network (such as `*.railway.internal`), or at a local relay.
+
+Supported events:
+- `s3:ObjectCreated:*`: `Put`, `Post`, `Copy`, `CompleteMultipartUpload`.
+- `s3:ObjectRemoved:*`: `Delete`, `DeleteMarkerCreated`.
+- `s3:LifecycleExpiration:*`: `Delete`, `DeleteMarkerCreated`.
+
+**Live streams.** `GET /<bucket>?events=s3:ObjectCreated:*&prefix=...&suffix=...` (or `GET /?events=...`
+for all buckets) is MinIO's ListenBucketNotification API. It is a signed request that keeps the
+connection open and sends one JSON event per line, plus a space every 10 seconds to keep idle
+connections alive. MinIO clients use it directly, e.g. `ListenBucketNotification` in minio-go or
+`mc watch`. It needs the `s3:ListenBucketNotification` (or, for all buckets,
+`s3:ListenNotification`) permission.
+
 ## Browser uploads (POST policy)
 
 `POST /<bucket>` with `multipart/form-data` accepts browser form uploads, including those made with
@@ -343,7 +393,7 @@ direct uploads from web apps.
 
 | Area | Operations |
 |---|---|
-| Buckets | ListBuckets, CreateBucket (with canned ACL), DeleteBucket, HeadBucket, GetBucketLocation, Get/PutBucketVersioning, Get/PutBucketAcl, Get/Put/DeleteBucketPolicy, GetBucketPolicyStatus, Get/Put/DeleteBucketCors, Get/Put/DeleteBucketTagging, Get/Put/DeleteBucketEncryption, Get/PutObjectLockConfiguration, Get/Put/DeleteBucketWebsite |
+| Buckets | ListBuckets, CreateBucket (with canned ACL), DeleteBucket, HeadBucket, GetBucketLocation, Get/PutBucketVersioning, Get/PutBucketAcl, Get/Put/DeleteBucketPolicy, GetBucketPolicyStatus, Get/Put/DeleteBucketCors, Get/Put/DeleteBucketTagging, Get/Put/DeleteBucketEncryption, Get/PutObjectLockConfiguration, Get/Put/DeleteBucketWebsite, Get/PutBucketNotificationConfiguration, ListenBucketNotification (MinIO) |
 | Objects | PutObject, GetObject, HeadObject, DeleteObject, DeleteObjects, CopyObject (COPY/REPLACE for metadata and tags), Get/Put/DeleteObjectTagging, `x-amz-tagging` on upload, GetObjectAcl, Get/PutObjectRetention, Get/PutObjectLegalHold, SSE-S3 and SSE-C on every read/write/copy path |
 | Listing | ListObjects (v1), ListObjectsV2, ListObjectVersions (versions and delete markers); prefix, delimiter, pagination, `start-after`, `encoding-type=url` |
 | Multipart | CreateMultipartUpload, UploadPart, UploadPartCopy (with ranges), CompleteMultipartUpload, AbortMultipartUpload, ListParts, ListMultipartUploads |

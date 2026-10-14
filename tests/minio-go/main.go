@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"time"
 
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
@@ -72,6 +73,22 @@ func main() {
 	st, err := c.StatObject(ctx, "gotest", "obj-100-true", minio.StatObjectOptions{})
 	must(err, "stat")
 	fmt.Println("stat", st.Size, st.ContentType, st.UserMetadata)
+	// Event stream (ListenBucketNotification).
+	lctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	events := c.ListenBucketNotification(lctx, "gotest", "listen/", "", []string{"s3:ObjectCreated:*"})
+	go func() {
+		time.Sleep(500 * time.Millisecond)
+		_, err := c.PutObject(ctx, "gotest", "listen/hello.txt", bytes.NewReader([]byte("hi")), 2, minio.PutObjectOptions{})
+		must(err, "put for listen")
+	}()
+	info := <-events
+	must(info.Err, "listen")
+	if len(info.Records) != 1 || info.Records[0].S3.Object.Key != "listen/hello.txt" || info.Records[0].S3.Object.Size != 2 {
+		fmt.Printf("FAIL listen: unexpected event %+v\n", info.Records)
+		os.Exit(1)
+	}
+	cancel()
+	fmt.Println("listen", info.Records[0].EventName, info.Records[0].S3.Object.Key)
 	for o := range c.ListObjects(ctx, "gotest", minio.ListObjectsOptions{Recursive: true}) {
 		must(c.RemoveObject(ctx, "gotest", o.Key, minio.RemoveObjectOptions{}), "rm")
 	}

@@ -164,7 +164,25 @@ pub struct Stats {
 }
 
 /// Run one sweep over all buckets. Returns (objects expired, uploads aborted).
-pub async fn sweep(store: &Arc<Store>, day_secs: u64) -> S3Result<(u64, u64)> {
+pub async fn sweep(store: &Arc<Store>, day_secs: u64, events: Option<&crate::events::Bus>) -> S3Result<(u64, u64)> {
+    let notify = |bucket: &str, removed: &[crate::store::Removed]| {
+        let Some(bus) = events else { return };
+        for r in removed {
+            bus.emit(crate::events::Event {
+                name: if r.marker_created { "LifecycleExpiration:DeleteMarkerCreated" } else { "LifecycleExpiration:Delete" },
+                bucket: bucket.to_string(),
+                key: r.key.clone(),
+                size: r.size,
+                etag: r.etag.clone(),
+                version: r.version.clone(),
+                principal: String::new(),
+                source_ip: String::new(),
+                request_id: String::new(),
+                time_ms: util::now_ms(),
+                sequencer: 0,
+            });
+        }
+    };
     let (mut expired, mut aborted) = (0u64, 0u64);
     let st = store.clone();
     let buckets = tokio::task::spawn_blocking(move || st.list_buckets()).await.map_err(crate::error::S3Error::internal)??;
@@ -188,9 +206,10 @@ pub async fn sweep(store: &Arc<Store>, day_secs: u64) -> S3Result<(u64, u64)> {
                         .map(|(k, m)| (k.clone(), m.mtime_ms))
                         .collect();
                     if !due.is_empty()
-                        && let Ok(OpOut::Count(n)) = store.submit(Op::Expire { bucket: bucket.clone(), items: due }).await
+                        && let Ok(OpOut::Removed(removed)) = store.submit(Op::Expire { bucket: bucket.clone(), items: due }).await
                     {
-                        expired += n as u64;
+                        expired += removed.len() as u64;
+                        notify(&bucket, &removed);
                     }
                     if page.len() < 1000 {
                         break;
@@ -230,9 +249,11 @@ pub async fn sweep(store: &Arc<Store>, day_secs: u64) -> S3Result<(u64, u64)> {
                         })
                         .collect();
                     if !due.is_empty()
-                        && let Ok(OpOut::Count(c)) = store.submit(Op::PurgeVersions { bucket: bucket.clone(), items: due }).await
+                        && let Ok(OpOut::Removed(removed)) =
+                            store.submit(Op::PurgeVersions { bucket: bucket.clone(), items: due }).await
                     {
-                        expired += c as u64;
+                        expired += removed.len() as u64;
+                        notify(&bucket, &removed);
                     }
                     match page.last {
                         Some(l) if n >= 1000 => after = Some(l),
@@ -256,10 +277,10 @@ pub async fn sweep(store: &Arc<Store>, day_secs: u64) -> S3Result<(u64, u64)> {
 }
 
 /// Background loop: sweep every `interval`.
-pub async fn run(store: Arc<Store>, interval: Duration, day_secs: u64, stats: Arc<Stats>) {
+pub async fn run(store: Arc<Store>, interval: Duration, day_secs: u64, stats: Arc<Stats>, events: Arc<crate::events::Bus>) {
     loop {
         tokio::time::sleep(interval).await;
-        match sweep(&store, day_secs).await {
+        match sweep(&store, day_secs, Some(&events)).await {
             Ok((e, a)) => {
                 stats.expired.fetch_add(e, Ordering::Relaxed);
                 stats.aborted_uploads.fetch_add(a, Ordering::Relaxed);

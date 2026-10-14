@@ -10,7 +10,12 @@ use tokio::sync::mpsc;
 pub enum Body {
     Empty,
     Full(Option<Bytes>),
-    Stream { rx: mpsc::Receiver<io::Result<Bytes>>, remaining: u64 },
+    Stream {
+        rx: mpsc::Receiver<io::Result<Bytes>>,
+        remaining: u64,
+    },
+    /// An open-ended stream (event notifications); ends when the sender is dropped.
+    Live(mpsc::Receiver<Bytes>),
 }
 
 impl Body {
@@ -40,6 +45,7 @@ impl http_body::Body for Body {
                 Poll::Ready(None) => Poll::Ready(None),
                 Poll::Pending => Poll::Pending,
             },
+            Body::Live(rx) => rx.poll_recv(cx).map(|b| b.map(|b| Ok(Frame::data(b)))),
         }
     }
 
@@ -48,6 +54,7 @@ impl http_body::Body for Body {
             Body::Empty => true,
             Body::Full(b) => b.is_none(),
             Body::Stream { remaining, .. } => *remaining == 0,
+            Body::Live(_) => false,
         }
     }
 
@@ -56,6 +63,7 @@ impl http_body::Body for Body {
             Body::Empty => SizeHint::with_exact(0),
             Body::Full(b) => SizeHint::with_exact(b.as_ref().map_or(0, |b| b.len() as u64)),
             Body::Stream { remaining, .. } => SizeHint::with_exact(*remaining),
+            Body::Live(_) => SizeHint::default(),
         }
     }
 }

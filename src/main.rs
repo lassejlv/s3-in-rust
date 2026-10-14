@@ -7,6 +7,7 @@ mod chunked;
 mod console;
 mod crypt;
 mod error;
+mod events;
 mod iam;
 mod io;
 mod lifecycle;
@@ -59,6 +60,12 @@ OPTIONS (each also settable through the environment variable shown):
         --encryption-key-file <P> Read the master key from a file
         --encrypt-by-default     Encrypt every new object with the master key
                                                                  [S3RS_ENCRYPT_BY_DEFAULT=1]
+        --webhook <ID=URL>       Event notification target (repeatable), e.g.
+                                 `thumbnails=http://worker.internal:8080/s3-events`; buckets
+                                 refer to it as arn:s3rs:webhook::<ID>
+                                                                 [S3RS_WEBHOOKS, comma-separated]
+        --webhook-secret <S>     Sign webhook bodies (X-S3rs-Signature: sha256=<hmac>)
+                                                                 [S3RS_WEBHOOK_SECRET]
         --behind-proxy           Trust X-Forwarded-For / X-Forwarded-Proto from a reverse proxy
                                  (client IP and HTTPS for policy conditions and redirects)
                                                                  [S3RS_BEHIND_PROXY=1]
@@ -96,6 +103,8 @@ struct Config {
     metrics_token: Option<String>,
     console: bool,
     behind_proxy: bool,
+    webhooks: Vec<(String, events::Url)>,
+    webhook_secret: Option<String>,
     encryption_key: Option<[u8; 32]>,
     encrypt_by_default: bool,
     region: String,
@@ -136,6 +145,11 @@ fn parse_args() -> Result<Config, String> {
         metrics_token: env("S3RS_METRICS_TOKEN"),
         console: !env_flag("S3RS_NO_CONSOLE")?,
         behind_proxy: env_flag("S3RS_BEHIND_PROXY")?,
+        webhooks: env("S3RS_WEBHOOKS")
+            .map(|v| split_list(&v).iter().map(|w| parse_webhook(w)).collect())
+            .transpose()?
+            .unwrap_or_default(),
+        webhook_secret: env("S3RS_WEBHOOK_SECRET"),
         encryption_key: env("S3RS_ENCRYPTION_KEY")
             .map(|k| parse_key(&k))
             .transpose()
@@ -179,6 +193,14 @@ fn parse_args() -> Result<Config, String> {
             "--metrics-token" => c.metrics_token = Some(val()?),
             "--no-console" => c.console = false,
             "--behind-proxy" => c.behind_proxy = true,
+            "--webhook" => {
+                let w = parse_webhook(&val()?)?;
+                if c.webhooks.iter().any(|(id, _)| *id == w.0) {
+                    return Err(format!("--webhook: duplicate id `{}`", w.0));
+                }
+                c.webhooks.push(w);
+            }
+            "--webhook-secret" => c.webhook_secret = Some(val()?),
             "--encryption-key" => c.encryption_key = Some(parse_key(&val()?).map_err(|e| format!("--encryption-key: {e}"))?),
             "--encryption-key-file" => {
                 let path = val()?;
@@ -205,6 +227,16 @@ fn parse_args() -> Result<Config, String> {
         }
     }
     Ok(c)
+}
+
+/// `id=http://host[:port]/path`
+fn parse_webhook(s: &str) -> Result<(String, events::Url), String> {
+    let (id, url) = s.split_once('=').ok_or_else(|| format!("--webhook {s}: expected ID=URL"))?;
+    let id = id.trim();
+    if id.is_empty() || !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+        return Err(format!("--webhook {s}: the id may only contain letters, digits, '-' and '_'"));
+    }
+    Ok((id.to_string(), events::Url::parse(url.trim()).map_err(|e| format!("--webhook: {e}"))?))
 }
 
 /// A 256-bit key given as 64 hex characters or base64.
@@ -366,6 +398,7 @@ async fn serve(cfg: Config, store: Arc<store::Store>, auth: Option<auth::Auth>) 
         website_domain: cfg.website_domain.clone(),
         console: cfg.console,
         behind_proxy: cfg.behind_proxy,
+        events: events::Bus::new(store.clone(), cfg.region.clone(), cfg.webhooks.clone(), cfg.webhook_secret.clone()),
     };
     let server = Arc::new(s3::Server::new(store.clone(), auth, opts));
     if cfg.lifecycle_interval > 0 {
@@ -374,6 +407,7 @@ async fn serve(cfg: Config, store: Arc<store::Store>, auth: Option<auth::Auth>) 
             Duration::from_secs(cfg.lifecycle_interval),
             cfg.lifecycle_day_secs.max(1),
             server.metrics.lifecycle.clone(),
+            server.events.clone(),
         ));
     }
     eprintln!(
@@ -391,6 +425,9 @@ async fn serve(cfg: Config, store: Arc<store::Store>, auth: Option<auth::Auth>) 
     );
     if cfg.console {
         eprintln!("s3rs web console on http://{}/_console/", cfg.listen);
+    }
+    for (id, url) in &cfg.webhooks {
+        eprintln!("webhook target {id}: http://{}:{}{} (arn:s3rs:webhook::{id})", url.host, url.port, url.path);
     }
     if let Some(a) = cfg.website_listen {
         eprintln!("s3rs website endpoint on http://{a}");
@@ -471,6 +508,8 @@ async fn serve(cfg: Config, store: Arc<store::Store>, auth: Option<auth::Auth>) 
     }
     drop(listener);
     drop(website_listener);
+    // End open event streams so they don't hold up the drain.
+    server.events.shutdown();
     eprintln!("shutting down: draining in-flight requests (up to {}s)", SHUTDOWN_GRACE.as_secs());
     let drained = tokio::select! {
         _ = graceful.shutdown() => true,

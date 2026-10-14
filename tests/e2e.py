@@ -1213,6 +1213,102 @@ def _signed_request(c, method, path):
     return req
 
 
+def t_notifications():
+    port = os.environ.get("S3RS_WEBHOOK_PORT")
+    if not port:
+        print("        (skipped: run the server with --webhook test=http://127.0.0.1:<port>/hook and set S3RS_WEBHOOK_PORT)")
+        return
+    import hmac
+    import http.server
+    import queue
+    import threading
+
+    got = queue.Queue()
+
+    class Hook(http.server.BaseHTTPRequestHandler):
+        def do_POST(self):  # noqa: N802
+            body = self.rfile.read(int(self.headers["Content-Length"]))
+            got.put((self.path, self.headers.get("X-S3rs-Signature"), body))
+            self.send_response(200)
+            self.end_headers()
+
+        def log_message(self, *a):
+            pass
+
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", int(port)), Hook)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    nb = B + "-notify"
+    s3.create_bucket(Bucket=nb)
+    try:
+        expect_error("InvalidArgument", lambda: s3.put_bucket_notification_configuration(Bucket=nb, NotificationConfiguration={
+            "QueueConfigurations": [{"QueueArn": "arn:s3rs:webhook::missing", "Events": ["s3:ObjectCreated:*"]}]}))
+        cfg = {"QueueConfigurations": [{"Id": "images", "QueueArn": "arn:s3rs:webhook::test",
+                                        "Events": ["s3:ObjectCreated:*", "s3:ObjectRemoved:*"],
+                                        "Filter": {"Key": {"FilterRules": [{"Name": "prefix", "Value": "img/"}]}}}]}
+        s3.put_bucket_notification_configuration(Bucket=nb, NotificationConfiguration=cfg)
+        back = s3.get_bucket_notification_configuration(Bucket=nb)["QueueConfigurations"][0]
+        assert back["Id"] == "images" and back["QueueArn"] == "arn:s3rs:webhook::test", back
+
+        def next_event():
+            path, sig, body = got.get(timeout=15)
+            secret = os.environ.get("S3RS_WEBHOOK_SECRET")
+            if secret:
+                want = "sha256=" + hmac.new(secret.encode(), body, "sha256").hexdigest()
+                assert sig == want, (sig, want)
+            assert path == "/hook", path
+            return json.loads(body)["Records"][0]
+
+        s3.put_object(Bucket=nb, Key="other/skip.txt", Body=b"x")  # filtered out by prefix
+        s3.put_object(Bucket=nb, Key="img/a b.jpg", Body=b"jpeg!")
+        rec = next_event()
+        assert rec["eventName"] == "ObjectCreated:Put" and rec["eventSource"] == "aws:s3", rec
+        assert rec["s3"]["bucket"]["name"] == nb and rec["s3"]["object"]["key"] == "img/a+b.jpg", rec
+        assert rec["s3"]["object"]["size"] == 5 and rec["s3"]["configurationId"] == "images", rec
+        assert rec["userIdentity"]["principalId"] == AK, rec
+        s3.copy_object(Bucket=nb, Key="img/copy.jpg", CopySource={"Bucket": nb, "Key": "img/a b.jpg"})
+        assert next_event()["eventName"] == "ObjectCreated:Copy"
+        s3.delete_objects(Bucket=nb, Delete={"Objects": [{"Key": "img/a b.jpg"}, {"Key": "img/copy.jpg"}], "Quiet": True})
+        names = sorted([next_event()["s3"]["object"]["key"], next_event()["s3"]["object"]["key"]])
+        assert names == ["img/a+b.jpg", "img/copy.jpg"], names
+        assert got.empty(), "unexpected extra events"
+
+        # Live stream (MinIO ListenBucketNotification): signed GET ?events=..., JSON lines.
+        import http.client
+        req = _signed_request(s3, "GET", f"/{nb}?events=s3%3AObjectCreated%3A%2A&prefix=live%2F")
+        u = req.url.split("://", 1)[1]
+        hostport, path = u.split("/", 1)
+        conn = http.client.HTTPConnection(*hostport.split(":"), timeout=10)
+        conn.request("GET", "/" + path, headers=dict(req.headers.items()))
+        resp = conn.getresponse()
+        assert resp.status == 200, resp.status
+        threading.Timer(0.3, lambda: s3.put_object(Bucket=nb, Key="live/x.txt", Body=b"hi")).start()
+        line = b""
+        while not line.strip():
+            line = resp.readline()
+        rec = json.loads(line)["Records"][0]
+        assert rec["eventName"] == "ObjectCreated:Put" and rec["s3"]["object"]["key"] == "live/x.txt", rec
+        conn.close()
+        while not got.empty():
+            got.get()
+        # Lifecycle expirations are events too (needs a fast-sweeping server).
+        if os.environ.get("S3RS_FAST_LIFECYCLE"):
+            s3.put_bucket_notification_configuration(Bucket=nb, NotificationConfiguration={"QueueConfigurations": [
+                {"Id": "expiry", "QueueArn": "arn:s3rs:webhook::test", "Events": ["s3:LifecycleExpiration:*"]}]})
+            s3.put_bucket_lifecycle_configuration(Bucket=nb, LifecycleConfiguration={"Rules": [
+                {"ID": "e", "Status": "Enabled", "Filter": {"Prefix": "tmp/"}, "Expiration": {"Days": 1}}]})
+            s3.put_object(Bucket=nb, Key="tmp/old.txt", Body=b"old")
+            rec = next_event()
+            assert rec["eventName"] == "LifecycleExpiration:Delete" and rec["s3"]["object"]["key"] == "tmp/old.txt", rec
+            s3.delete_bucket_lifecycle(Bucket=nb)
+        s3.put_bucket_notification_configuration(Bucket=nb, NotificationConfiguration={})
+        assert "QueueConfigurations" not in s3.get_bucket_notification_configuration(Bucket=nb)
+    finally:
+        for o in s3.list_objects_v2(Bucket=nb).get("Contents", []):
+            s3.delete_object(Bucket=nb, Key=o["Key"])
+        s3.delete_bucket(Bucket=nb)
+        srv.shutdown()
+
+
 def t_overwrite():
     s3.put_object(Bucket=B, Key="ow", Body=b"x" * 300_000)
     s3.put_object(Bucket=B, Key="ow", Body=b"small")

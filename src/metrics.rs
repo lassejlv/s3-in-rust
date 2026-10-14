@@ -22,6 +22,13 @@ pub struct Metrics {
     bytes_in: AtomicU64,
     bytes_out: AtomicU64,
     pub lifecycle: std::sync::Arc<crate::lifecycle::Stats>,
+    pub events: std::sync::Arc<crate::events::Stats>,
+}
+
+impl Metrics {
+    pub fn new(events: std::sync::Arc<crate::events::Stats>) -> Self {
+        Metrics { events, ..Default::default() }
+    }
 }
 
 pub struct Inflight<'a>(&'a Metrics);
@@ -99,6 +106,11 @@ impl Metrics {
             "# TYPE s3rs_lifecycle_aborted_uploads_total counter\ns3rs_lifecycle_aborted_uploads_total {}",
             self.lifecycle.aborted_uploads.load(Relaxed)
         );
+        for (name, v) in
+            [("delivered", &self.events.delivered), ("failed", &self.events.failed), ("dropped", &self.events.dropped)]
+        {
+            let _ = writeln!(o, "s3rs_notifications_total{{result=\"{name}\"}} {}", v.load(Relaxed));
+        }
         if let Ok(b) = store.list_buckets() {
             let _ = writeln!(o, "# TYPE s3rs_buckets gauge\ns3rs_buckets {}", b.len());
         }

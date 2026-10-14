@@ -46,7 +46,8 @@ jobs:
           S3RS_LIFECYCLE_DAY_SECS=2 ./target/release/s3rs -d /tmp/s3rs-data -l 127.0.0.1:9000 \
             --access-key testkey --secret-key testsecret --credentials-file /tmp/creds \
             --lifecycle-interval 1 --encryption-key "$(openssl rand -hex 32)" \
-            --website-listen 127.0.0.1:9001 --website-domain web.localhost > /tmp/s3rs.log 2>&1 &
+            --website-listen 127.0.0.1:9001 --website-domain web.localhost \
+            --webhook test=http://127.0.0.1:9399/hook --webhook-secret hooksecret > /tmp/s3rs.log 2>&1 &
           echo $! > /tmp/s3rs.pid
           for i in $(seq 50); do curl -sf http://127.0.0.1:9000/_health && break; sleep 0.1; done
       - name: boto3 suite
@@ -57,6 +58,8 @@ jobs:
           S3RS_SCOPED_SECRET_KEY: scopedsecret
           S3RS_POLICY_ACCESS_KEY: alice
           S3RS_POLICY_SECRET_KEY: alicesecret
+          S3RS_WEBHOOK_PORT: "9399"
+          S3RS_WEBHOOK_SECRET: hooksecret
           S3RS_FAST_LIFECYCLE: "1"
           S3RS_ENCRYPTION: "1"
           S3RS_DATA_DIR: /tmp/s3rs-data

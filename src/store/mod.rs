@@ -227,7 +227,19 @@ pub enum OpOut {
     Done,
     Object(ObjectMeta),
     Deleted(Vec<S3Result<DeleteOutcome>>),
-    Count(usize),
+    /// What lifecycle operations removed.
+    Removed(Vec<Removed>),
+}
+
+/// An object version (or delete marker) removed by lifecycle, or the delete marker it created.
+#[derive(Debug, Clone)]
+pub struct Removed {
+    pub key: String,
+    pub version: Option<String>,
+    /// A delete marker was created (current objects in versioned buckets).
+    pub marker_created: bool,
+    pub size: u64,
+    pub etag: String,
 }
 
 struct Job {
@@ -1422,15 +1434,17 @@ fn apply(tx: &mut Tables, op: Op, garbage: &mut Vec<u128>, last_seq: &mut u64) -
             Ok(OpOut::Object(put_version(tx, last_seq, &bucket, &key, meta, garbage)?))
         }
         Op::Expire { bucket, items } => {
-            let mut n = 0;
+            let mut out = Vec::new();
             for (key, mtime) in items {
                 let k = obj_key(&bucket, &key);
-                if get_meta(tx, &k)?.is_some_and(|m| m.mtime_ms == mtime) {
-                    delete_current(tx, last_seq, &bucket, &key, garbage)?;
-                    n += 1;
+                if let Some(m) = get_meta(tx, &k)?.filter(|m| m.mtime_ms == mtime) {
+                    let o = delete_current(tx, last_seq, &bucket, &key, garbage)?;
+                    let marker = o.delete_marker;
+                    let version = if marker { o.version_id.filter(|v| v != "null") } else { m.version.clone() };
+                    out.push(Removed { key, version, marker_created: marker, size: m.size, etag: m.etag });
                 }
             }
-            Ok(OpOut::Count(n))
+            Ok(OpOut::Removed(out))
         }
         Op::DeleteObjects { bucket, items, bypass } => {
             if tx.buckets.get(bucket.as_str())?.is_none() {
@@ -1535,7 +1549,7 @@ fn apply(tx: &mut Tables, op: Op, garbage: &mut Vec<u128>, last_seq: &mut u64) -
             Ok(OpOut::Object(meta))
         }
         Op::PurgeVersions { bucket, items } => {
-            let mut n = 0;
+            let mut out = Vec::new();
             for (key, seq, rule) in items {
                 let vk = ver_key(&bucket, &key, seq);
                 let Some(m) = tx.versions.get(vk.as_slice())?.map(|g| ObjectMeta::decode(g.value())).transpose()? else {
@@ -1564,10 +1578,16 @@ fn apply(tx: &mut Tables, op: Op, garbage: &mut Vec<u128>, last_seq: &mut u64) -
                     tx.versions.remove(vk.as_slice())?;
                     release(tx, &m, garbage)?;
                     promote(tx, &bucket, &key)?;
-                    n += 1;
+                    out.push(Removed {
+                        key,
+                        version: m.version.clone(),
+                        marker_created: false,
+                        size: m.size,
+                        etag: m.etag.clone(),
+                    });
                 }
             }
-            Ok(OpOut::Count(n))
+            Ok(OpOut::Removed(out))
         }
         Op::Complete { bucket, key, upload, parts, cond } => {
             let Some(u) = tx.uploads.get(upload)?.map(|v| UploadMeta::decode(v.value())).transpose()? else {
@@ -1709,7 +1729,7 @@ mod tests {
         let seq = version_seq(&v1).unwrap();
         let purge =
             Op::PurgeVersions { bucket: "b".into(), items: vec![("k".into(), seq, PurgeRule::NoncurrentBefore(u64::MAX))] };
-        assert!(matches!(store.submit(purge).await.unwrap(), OpOut::Count(0)));
+        assert!(matches!(store.submit(purge).await.unwrap(), OpOut::Removed(r) if r.is_empty()));
         assert_eq!(store.get_object_version("b", "k", &v1).unwrap().1.unwrap(), "one");
 
         // Legal hold blocks even with bypass; GOVERNANCE yields to bypass.

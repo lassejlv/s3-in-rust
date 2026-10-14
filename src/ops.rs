@@ -86,6 +86,7 @@ pub const BUCKET_SUBS: &[Sub] = &[
     sub("uploads", Some("s3:ListBucketMultipartUploads"), None, None),
     sub("versions", Some("s3:ListBucketVersions"), None, None),
     sub("delete", None, None, None),
+    sub("events", Some("s3:ListenBucketNotification"), None, None),
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -102,6 +103,8 @@ pub enum BucketOp {
     GetConfig(&'static str),
     PutConfig(&'static str),
     DeleteConfig(&'static str),
+    /// MinIO-style ListenBucketNotification (a stream of events).
+    Listen,
 }
 
 fn has(query: &[(String, String)], name: &str) -> bool {
@@ -130,6 +133,7 @@ pub fn classify_bucket(m: &Method, query: &[(String, String)]) -> S3Result<Bucke
             "location" => BucketOp::GetLocation,
             "uploads" => BucketOp::ListUploads,
             "versions" => BucketOp::ListVersions,
+            "events" => BucketOp::Listen,
             "delete" => return not_allowed(),
             name => BucketOp::GetConfig(name),
         },
@@ -151,6 +155,7 @@ impl BucketOp {
             BucketOp::GetLocation => Some("s3:GetBucketLocation"),
             BucketOp::ListUploads => Some("s3:ListBucketMultipartUploads"),
             BucketOp::ListVersions => Some("s3:ListBucketVersions"),
+            BucketOp::Listen => Some("s3:ListenBucketNotification"),
             BucketOp::GetConfig(n) => find(n).and_then(|s| s.get),
             BucketOp::PutConfig(n) => find(n).and_then(|s| s.put),
             BucketOp::DeleteConfig(n) => find(n).and_then(|s| s.delete),

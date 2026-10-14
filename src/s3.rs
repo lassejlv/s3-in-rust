@@ -5,6 +5,7 @@ use crate::auth::{self, Auth, Payload, Principal};
 use crate::body::Body;
 use crate::crypt::{self, KeyKind, WrapKey};
 use crate::error::{S3Error, S3Result, err};
+use crate::events;
 use crate::iam;
 use crate::io::{self, BodyStream, Data, Expect};
 use crate::lock;
@@ -48,6 +49,8 @@ pub struct Options {
     pub console: bool,
     /// Trust X-Forwarded-For / X-Forwarded-Proto (client IP and HTTPS for policies).
     pub behind_proxy: bool,
+    /// Event notifications (webhooks and live listeners).
+    pub events: Arc<events::Bus>,
 }
 
 pub struct Server {
@@ -69,6 +72,7 @@ pub struct Server {
     website_domain: Option<String>,
     console: bool,
     behind_proxy: bool,
+    pub events: Arc<events::Bus>,
     req_counter: AtomicU64,
     rid_base: u64,
 }
@@ -82,6 +86,8 @@ struct Req {
     client: Client,
     /// `REST-HEADER` or `REST-QUERY-STRING` (the `s3:authType` policy key).
     auth_type: &'static str,
+    /// Request id (also sent as `x-amz-request-id`).
+    rid: String,
 }
 
 /// Where a request came from.
@@ -348,7 +354,7 @@ impl Server {
             region: opts.region,
             domain: opts.domain,
             verbose: opts.verbose,
-            metrics: Default::default(),
+            metrics: crate::metrics::Metrics::new(opts.events.stats.clone()),
             default_cors,
             access_cache: RwLock::new(HashMap::new()),
             access_gen: AtomicU64::new(0),
@@ -358,6 +364,7 @@ impl Server {
             website_domain: opts.website_domain,
             console: opts.console,
             behind_proxy: opts.behind_proxy,
+            events: opts.events,
             req_counter: AtomicU64::new(1),
             rid_base: util::new_id() as u64,
         }
@@ -605,7 +612,7 @@ impl Server {
         let origin = header(req.headers(), "origin").map(str::to_string);
         let cors_bucket = origin.as_ref().and_then(|_| self.resolve(req.uri(), req.headers()).ok()).and_then(|(b, _, _)| b);
         let _inflight = self.metrics.start();
-        let mut resp = match self.route(req, peer).await {
+        let mut resp = match self.route(req, peer, &rid).await {
             Ok(r) => r,
             Err(e) => {
                 if e.status == StatusCode::INTERNAL_SERVER_ERROR {
@@ -796,6 +803,7 @@ impl Server {
             principal: Principal::Anonymous,
             client: Client { ip: ctx.source_ip, secure: ctx.secure },
             auth_type: "REST-HEADER",
+            rid: String::new(),
         };
         let mut r = self.get_object(&req, bucket, key, head).await?;
         // Objects that need a customer key cannot be served to anonymous visitors anyway; and
@@ -829,7 +837,7 @@ impl Server {
         })
     }
 
-    async fn route(&self, req: Request<Incoming>, peer: SocketAddr) -> S3Result<Resp> {
+    async fn route(&self, req: Request<Incoming>, peer: SocketAddr, rid: &str) -> S3Result<Resp> {
         let (parts, body) = req.into_parts();
         let raw_query = parts.uri.query().unwrap_or("");
         let (bucket, key, vhost) = self.resolve(&parts.uri, &parts.headers)?;
@@ -877,7 +885,7 @@ impl Server {
             && let Some(b) = &bucket
             && let Some(boundary) = header(&parts.headers, "content-type").and_then(crate::post::boundary)
         {
-            return self.post_object(&parts, body, b, &boundary, peer).await;
+            return self.post_object(&parts, body, b, &boundary, peer, rid).await;
         }
         let (mut payload, principal) = match &self.auth {
             None => (auth::payload_mode(&parts)?, Principal::Everyone),
@@ -890,7 +898,7 @@ impl Server {
         let body = BodyStream::new(body, &mut payload);
         let auth_type = if r_has_auth_header(&parts) { "REST-HEADER" } else { "REST-QUERY-STRING" };
         let client = self.client(&parts.headers, peer);
-        let mut r = Req { parts, query, payload, body, principal, client, auth_type };
+        let mut r = Req { parts, query, payload, body, principal, client, auth_type, rid: rid.to_string() };
         let m = r.parts.method.clone();
         // One classification decides both what is authorized and what runs.
         let op = match (&bucket, &key) {
@@ -903,6 +911,7 @@ impl Server {
             let (b, k) = (bucket.as_deref(), key.as_deref());
             let versioned = r.q("versionId").is_some_and(|v| !v.is_empty());
             let action = match op {
+                None if r.q("events").is_some() => Some("s3:ListenNotification"),
                 None => Some("s3:ListAllMyBuckets"),
                 Some(Err(bop)) => bop.action(),
                 Some(Ok(oop)) => oop.action(versioned),
@@ -927,6 +936,7 @@ impl Server {
 
         let Some(bucket) = bucket else {
             return match m {
+                Method::GET if r.q("events").is_some() => self.listen(&r, None),
                 Method::GET => self.list_buckets(&r.principal),
                 _ => Err(err::MethodNotAllowed()),
             };
@@ -1012,7 +1022,10 @@ impl Server {
                         Ok(Resp::xml(String::from_utf8_lossy(&doc).into_owned()))
                     }
                     "logging" => Ok(Resp::xml(Xml::new("BucketLoggingStatus").finish("BucketLoggingStatus"))),
-                    "notification" => Ok(Resp::xml(Xml::new("NotificationConfiguration").finish("NotificationConfiguration"))),
+                    "notification" => Ok(Resp::xml(match self.store.bucket_config(bucket, "notification")? {
+                        Some(doc) => String::from_utf8_lossy(&doc).into_owned(),
+                        None => Xml::new("NotificationConfiguration").finish("NotificationConfiguration"),
+                    })),
                     "accelerate" => Ok(Resp::xml(Xml::new("AccelerateConfiguration").finish("AccelerateConfiguration"))),
                     "requestPayment" => {
                         let mut x = Xml::new("RequestPaymentConfiguration");
@@ -1120,6 +1133,15 @@ impl Server {
                 self.set_bucket_config(bucket, "versioning", Some(status.to_vec())).await?;
                 Ok(Resp::ok())
             }
+            BucketOp::PutConfig("notification") => {
+                let doc = self.read_xml(r).await?;
+                let rules = events::parse_config(&doc, &self.events.target_ids())?;
+                let value = (!rules.is_empty()).then(|| events::config_xml(&rules).into_bytes());
+                let res = self.set_bucket_config(bucket, "notification", value).await;
+                self.events.invalidate(bucket);
+                res?;
+                Ok(Resp::ok())
+            }
             BucketOp::PutConfig(_) => Err(err::NotImplemented()),
             BucketOp::Create => {
                 if !valid_bucket_name(bucket) {
@@ -1155,10 +1177,12 @@ impl Server {
             BucketOp::Delete => {
                 let r = self.store.submit(Op::DeleteBucket(bucket.to_string())).await;
                 self.invalidate_access(bucket);
+                self.events.invalidate(bucket);
                 r?;
                 Ok(Resp::new(StatusCode::NO_CONTENT))
             }
             BucketOp::DeleteObjects => self.delete_objects(r, bucket).await,
+            BucketOp::Listen => self.listen(r, Some(bucket)),
         }
     }
 
@@ -1293,6 +1317,7 @@ impl Server {
                     return Err(S3Error::internal("unexpected writer reply"));
                 };
                 let outcome = res.pop().ok_or_else(|| S3Error::internal("missing delete result"))??;
+                self.notify_removed(r, bucket, key, version.as_deref(), &outcome);
                 let mut resp = Resp::new(StatusCode::NO_CONTENT);
                 if let Some(v) = &outcome.version_id {
                     resp.set("x-amz-version-id", v);
@@ -1574,6 +1599,96 @@ impl Server {
             && self.authorize(&r.principal, "s3:BypassGovernanceRetention", Some(bucket), Some(key), &self.req_ctx(r)).is_ok()
     }
 
+    // -------------------------------------------------------------- event notifications
+
+    fn event(&self, principal: &Principal, ip: IpAddr, rid: &str, name: &'static str, bucket: &str, key: &str) -> events::Event {
+        events::Event {
+            name,
+            bucket: bucket.to_string(),
+            key: key.to_string(),
+            size: 0,
+            etag: String::new(),
+            version: None,
+            principal: match principal {
+                Principal::User(c) => c.access_key.clone(),
+                _ => String::new(),
+            },
+            source_ip: ip.to_string(),
+            request_id: rid.to_string(),
+            time_ms: now_ms(),
+            sequencer: 0,
+        }
+    }
+
+    fn notify_created(&self, r: &Req, name: &'static str, bucket: &str, key: &str, m: &ObjectMeta) {
+        let mut ev = self.event(&r.principal, r.client.ip, &r.rid, name, bucket, key);
+        ev.size = m.size;
+        ev.etag = m.etag.clone();
+        ev.version = m.version.clone();
+        self.events.emit(ev);
+    }
+
+    /// `requested` is the version id the client asked to delete, if any.
+    fn notify_removed(&self, r: &Req, bucket: &str, key: &str, requested: Option<&str>, o: &store::DeleteOutcome) {
+        let marker_created = requested.is_none() && o.delete_marker;
+        let name = if marker_created { "ObjectRemoved:DeleteMarkerCreated" } else { "ObjectRemoved:Delete" };
+        let mut ev = self.event(&r.principal, r.client.ip, &r.rid, name, bucket, key);
+        ev.version = if marker_created { o.version_id.clone().filter(|v| v != "null") } else { requested.map(str::to_string) };
+        self.events.emit(ev);
+    }
+
+    /// MinIO-compatible ListenBucketNotification: a never-ending JSON-lines stream of events
+    /// (`?events=s3:ObjectCreated:*&prefix=...&suffix=...`), with a space every 10 seconds to
+    /// keep idle connections open.
+    fn listen(&self, r: &Req, bucket: Option<&str>) -> S3Result<Resp> {
+        let names: Vec<String> = r.query.iter().filter(|(k, _)| k == "events").map(|(_, v)| v.clone()).collect();
+        if names.is_empty() || names.iter().any(|n| !events::valid_event(n)) {
+            return Err(
+                err::InvalidArgument().with_message("Specify one or more supported events, e.g. events=s3:ObjectCreated:*")
+            );
+        }
+        if let Some(b) = bucket {
+            self.store.require_bucket(b)?;
+        }
+        let filter = events::ListenFilter {
+            bucket: bucket.map(str::to_string),
+            events: names,
+            prefix: r.q("prefix").unwrap_or("").to_string(),
+            suffix: r.q("suffix").unwrap_or("").to_string(),
+        };
+        let mut rx = self.events.subscribe();
+        let mut closing = self.events.closing();
+        let region = self.region.clone();
+        let (tx, body) = tokio::sync::mpsc::channel::<Bytes>(64);
+        tokio::spawn(async move {
+            let mut ping = tokio::time::interval(std::time::Duration::from_secs(10));
+            ping.tick().await;
+            loop {
+                let chunk = tokio::select! {
+                    ev = rx.recv() => match ev {
+                        Ok(ev) if filter.matches(&ev) => {
+                            let mut line = ev.to_json(&region, "");
+                            line.push('\n');
+                            Bytes::from(line)
+                        }
+                        Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    },
+                    _ = ping.tick() => Bytes::from_static(b" "),
+                    _ = closing.changed() => break,
+                };
+                // The client went away: stop listening.
+                if tx.send(chunk).await.is_err() {
+                    break;
+                }
+            }
+        });
+        let mut resp = Resp::ok();
+        resp.set("content-type", "application/json").set("cache-control", "no-cache");
+        resp.body = Body::Live(body);
+        Ok(resp)
+    }
+
     fn require_lock(&self, bucket: &str) -> S3Result<lock::BucketLock> {
         self.bucket_access(bucket)?.lock.ok_or_else(lock::missing_config)
     }
@@ -1741,6 +1856,7 @@ impl Server {
         set_sse_headers(&mut resp, &headers);
         if let OpOut::Object(m) = &out {
             set_version_header(&mut resp, m);
+            self.notify_created(r, "ObjectCreated:Put", bucket, key, m);
         }
         if let Some((a, v)) = &ing.checksum {
             resp.set(a.header(), v);
@@ -1986,6 +2102,7 @@ impl Server {
             }
             if let OpOut::Object(m) = &out {
                 set_version_header(&mut resp, m);
+                self.notify_created(r, "ObjectCreated:Copy", bucket, key, m);
             }
             return Ok(resp);
         }
@@ -2104,7 +2221,15 @@ impl Server {
     }
 
     /// Browser-based upload: `POST /bucket` with a multipart form (and usually a signed policy).
-    async fn post_object(&self, parts: &Parts, body: Incoming, bucket: &str, boundary: &str, peer: SocketAddr) -> S3Result<Resp> {
+    async fn post_object(
+        &self,
+        parts: &Parts,
+        body: Incoming,
+        bucket: &str,
+        boundary: &str,
+        peer: SocketAddr,
+        rid: &str,
+    ) -> S3Result<Resp> {
         let client = self.client(&parts.headers, peer);
         let mut payload = Payload::Unsigned;
         let stream = BodyStream::new(body, &mut payload);
@@ -2195,7 +2320,12 @@ impl Server {
             .submit_owning(Op::PutObject { bucket: bucket.into(), key: key.clone(), meta, inline, cond: None }, files)
             .await?;
         let version = match &out {
-            OpOut::Object(m) => m.version.clone(),
+            OpOut::Object(m) => {
+                let mut ev = self.event(&who, client.ip, rid, "ObjectCreated:Post", bucket, &key);
+                (ev.size, ev.etag, ev.version) = (m.size, m.etag.clone(), m.version.clone());
+                self.events.emit(ev);
+                m.version.clone()
+            }
             _ => None,
         };
 
@@ -2272,6 +2402,7 @@ impl Server {
         let cond = write_cond(&r.parts.headers);
         let out = self.store.submit(Op::Complete { bucket: bucket.into(), key: key.into(), upload, parts, cond }).await?;
         let OpOut::Object(meta) = out else { return Err(S3Error::internal("unexpected writer reply")) };
+        self.notify_created(r, "ObjectCreated:CompleteMultipartUpload", bucket, key, &meta);
         let host = r.header("host").unwrap_or("localhost");
         let mut x = Xml::new("CompleteMultipartUploadResult");
         x.elem("Location", format!("http://{host}/{bucket}/{}", uri_encode(key, true)))
@@ -2318,6 +2449,11 @@ impl Server {
             return Err(S3Error::internal("unexpected writer reply"));
         };
         let mut x = Xml::new("DeleteResult");
+        for ((k, requested), res) in valid.iter().zip(&results) {
+            if let Ok(o) = res {
+                self.notify_removed(r, bucket, k, requested.as_deref(), o);
+            }
+        }
         for ((k, requested), res) in valid.iter().zip(results) {
             match res {
                 Ok(_) if quiet => {}

@@ -1,0 +1,542 @@
+//! Bucket event notifications: S3-format event records delivered to webhook targets (configured
+//! per bucket with PutBucketNotificationConfiguration) and streamed to live listeners
+//! (MinIO-compatible ListenBucketNotification).
+//!
+//! Emitting is cheap when nobody listens: with no live listener and no notification rules for
+//! the bucket, `emit` returns after two atomic loads and a cache lookup.
+
+use crate::access::glob;
+use crate::error::{S3Result, err};
+use crate::store::Store;
+use crate::util::{self, iso8601, now_ms, uri_encode};
+use crate::xml::{self, Xml};
+use bytes::Bytes;
+use http_body_util::Full;
+use hyper_util::rt::TokioIo;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, RwLock};
+use std::time::Duration;
+use tokio::sync::{broadcast, mpsc, watch};
+
+const QUEUE: usize = 10_000;
+const ATTEMPTS: u32 = 5;
+const TIMEOUT: Duration = Duration::from_secs(10);
+
+/// ARN of a webhook target in notification configurations.
+pub fn target_arn(id: &str) -> String {
+    format!("arn:s3rs:webhook::{id}")
+}
+
+/// One event, as it happened.
+#[derive(Debug, Clone)]
+pub struct Event {
+    /// e.g. `ObjectCreated:Put` (without the `s3:` prefix).
+    pub name: &'static str,
+    pub bucket: String,
+    pub key: String,
+    pub size: u64,
+    pub etag: String,
+    pub version: Option<String>,
+    /// Access key of the caller (empty for anonymous and lifecycle).
+    pub principal: String,
+    pub source_ip: String,
+    pub request_id: String,
+    pub time_ms: u64,
+    pub sequencer: u64,
+}
+
+impl Event {
+    /// The S3 event record (`{"Records":[...]}` envelope included).
+    pub fn to_json(&self, region: &str, config_id: &str) -> String {
+        let mut j = String::with_capacity(640);
+        j.push_str(r#"{"Records":[{"eventVersion":"2.1","eventSource":"aws:s3","awsRegion":"#);
+        json_str(region, &mut j);
+        j.push_str(r#","eventTime":"#);
+        json_str(&iso8601(self.time_ms), &mut j);
+        j.push_str(r#","eventName":"#);
+        json_str(self.name, &mut j);
+        j.push_str(r#","userIdentity":{"principalId":"#);
+        json_str(&self.principal, &mut j);
+        j.push_str(r#"},"requestParameters":{"sourceIPAddress":"#);
+        json_str(&self.source_ip, &mut j);
+        j.push_str(r#"},"responseElements":{"x-amz-request-id":"#);
+        json_str(&self.request_id, &mut j);
+        j.push_str(r#"},"s3":{"s3SchemaVersion":"1.0","configurationId":"#);
+        json_str(config_id, &mut j);
+        j.push_str(r#","bucket":{"name":"#);
+        json_str(&self.bucket, &mut j);
+        j.push_str(r#","ownerIdentity":{"principalId":"#);
+        json_str(crate::OWNER_ID, &mut j);
+        j.push_str(r#"},"arn":"#);
+        json_str(&format!("arn:aws:s3:::{}", self.bucket), &mut j);
+        j.push_str(r#"},"object":{"key":"#);
+        // As on S3, the key is URL-encoded (spaces as '+').
+        json_str(&uri_encode(&self.key, true).replace("%20", "+"), &mut j);
+        j.push_str(&format!(r#","size":{}"#, self.size));
+        if !self.etag.is_empty() {
+            j.push_str(r#","eTag":"#);
+            json_str(self.etag.trim_matches('"'), &mut j);
+        }
+        if let Some(v) = &self.version {
+            j.push_str(r#","versionId":"#);
+            json_str(v, &mut j);
+        }
+        j.push_str(&format!(r#","sequencer":"{:016X}"}}}}}}]}}"#, self.sequencer));
+        j
+    }
+}
+
+fn json_str(s: &str, out: &mut String) {
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+}
+
+// ------------------------------------------------------------------ configuration
+
+/// One notification rule of a bucket.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Rule {
+    pub id: String,
+    pub target: String,
+    /// Event name patterns such as `s3:ObjectCreated:*`.
+    pub events: Vec<String>,
+    pub prefix: String,
+    pub suffix: String,
+}
+
+impl Rule {
+    fn matches(&self, ev: &Event) -> bool {
+        ev.key.starts_with(&self.prefix) && ev.key.ends_with(&self.suffix) && event_matches(&self.events, ev.name)
+    }
+}
+
+/// Does `name` (e.g. `ObjectCreated:Put`) match any of `patterns` (e.g. `s3:ObjectCreated:*`)?
+fn event_matches(patterns: &[String], name: &str) -> bool {
+    patterns.iter().any(|p| p.strip_prefix("s3:").is_some_and(|p| glob(p, name, false)))
+}
+
+const EVENT_TYPES: &[&str] = &[
+    "ObjectCreated:*",
+    "ObjectCreated:Put",
+    "ObjectCreated:Post",
+    "ObjectCreated:Copy",
+    "ObjectCreated:CompleteMultipartUpload",
+    "ObjectRemoved:*",
+    "ObjectRemoved:Delete",
+    "ObjectRemoved:DeleteMarkerCreated",
+    "LifecycleExpiration:*",
+    "LifecycleExpiration:Delete",
+    "LifecycleExpiration:DeleteMarkerCreated",
+];
+
+pub fn valid_event(e: &str) -> bool {
+    e.strip_prefix("s3:").is_some_and(|e| EVENT_TYPES.contains(&e))
+}
+
+/// Parse a NotificationConfiguration document; `targets` are the configured webhook ids.
+pub fn parse_config(doc: &xml::Node, targets: &[String]) -> S3Result<Vec<Rule>> {
+    if doc.name != "NotificationConfiguration" {
+        return Err(err::MalformedXML());
+    }
+    let mut rules = Vec::new();
+    for (elem, arn_elem) in
+        [("QueueConfiguration", "Queue"), ("TopicConfiguration", "Topic"), ("CloudFunctionConfiguration", "CloudFunction")]
+    {
+        for c in doc.children_named(elem) {
+            let arn = c.child_text(arn_elem).map(str::trim).ok_or_else(err::MalformedXML)?;
+            let target = arn
+                .strip_prefix("arn:s3rs:webhook::")
+                .filter(|id| targets.iter().any(|t| t == id))
+                .ok_or_else(|| {
+                    err::InvalidArgument().with_message(format!(
+                        "Unable to validate the following destination configurations: {arn} (configure webhook targets with --webhook)"
+                    ))
+                })?;
+            let events: Vec<String> = c.children_named("Event").map(|e| e.text.trim().to_string()).collect();
+            if events.is_empty() {
+                return Err(err::MalformedXML().with_message("Each configuration needs at least one Event"));
+            }
+            if let Some(bad) = events.iter().find(|e| !valid_event(e)) {
+                return Err(err::InvalidArgument().with_message(format!("The event is not supported for notifications: {bad}")));
+            }
+            let (mut prefix, mut suffix) = (String::new(), String::new());
+            if let Some(key) = c.child("Filter").and_then(|f| f.child("S3Key")) {
+                for fr in key.children_named("FilterRule") {
+                    let value = fr.child_text("Value").unwrap_or("").to_string();
+                    match fr.child_text("Name").map(|n| n.trim().to_ascii_lowercase()).as_deref() {
+                        Some("prefix") => prefix = value,
+                        Some("suffix") => suffix = value,
+                        _ => return Err(err::InvalidArgument().with_message("FilterRule Name must be prefix or suffix")),
+                    }
+                }
+            }
+            let id = c.child_text("Id").map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
+            let id = id.unwrap_or_else(|| util::id_hex(util::new_id())[..16].to_string());
+            rules.push(Rule { id, target: target.to_string(), events, prefix, suffix });
+        }
+    }
+    if rules.len() > 100 {
+        return Err(err::InvalidArgument().with_message("A bucket can have at most 100 notification configurations"));
+    }
+    Ok(rules)
+}
+
+/// Canonical XML for stored rules (returned by GetBucketNotificationConfiguration).
+pub fn config_xml(rules: &[Rule]) -> String {
+    let mut x = Xml::new("NotificationConfiguration");
+    for r in rules {
+        x.open("QueueConfiguration").elem("Id", &r.id).elem("Queue", target_arn(&r.target));
+        for e in &r.events {
+            x.elem("Event", e);
+        }
+        if !r.prefix.is_empty() || !r.suffix.is_empty() {
+            x.open("Filter").open("S3Key");
+            for (name, value) in [("prefix", &r.prefix), ("suffix", &r.suffix)] {
+                if !value.is_empty() {
+                    x.open("FilterRule").elem("Name", name).elem("Value", value).close("FilterRule");
+                }
+            }
+            x.close("S3Key").close("Filter");
+        }
+        x.close("QueueConfiguration");
+    }
+    x.finish("NotificationConfiguration")
+}
+
+// ------------------------------------------------------------------ bus
+
+/// A live listener's filter (ListenBucketNotification).
+pub struct ListenFilter {
+    pub bucket: Option<String>,
+    pub events: Vec<String>,
+    pub prefix: String,
+    pub suffix: String,
+}
+
+impl ListenFilter {
+    pub fn matches(&self, ev: &Event) -> bool {
+        self.bucket.as_ref().is_none_or(|b| *b == ev.bucket)
+            && ev.key.starts_with(&self.prefix)
+            && ev.key.ends_with(&self.suffix)
+            && event_matches(&self.events, ev.name)
+    }
+}
+
+#[derive(Default)]
+pub struct Stats {
+    pub delivered: AtomicU64,
+    pub failed: AtomicU64,
+    pub dropped: AtomicU64,
+}
+
+pub struct Bus {
+    store: Arc<Store>,
+    live: broadcast::Sender<Arc<Event>>,
+    targets: HashMap<String, mpsc::Sender<(Arc<Event>, String)>>,
+    /// Parsed notification rules per bucket; `None` cached for buckets without rules.
+    rules: RwLock<HashMap<String, Option<Arc<Vec<Rule>>>>>,
+    seq: AtomicU64,
+    pub stats: Arc<Stats>,
+    /// Set on shutdown so open listen streams end.
+    closing: watch::Sender<bool>,
+}
+
+impl Bus {
+    /// `targets` are (id, http URL); a delivery task is started for each.
+    pub fn new(store: Arc<Store>, region: String, targets: Vec<(String, Url)>, secret: Option<String>) -> Arc<Bus> {
+        let stats = Arc::new(Stats::default());
+        let mut senders = HashMap::new();
+        for (id, url) in targets {
+            let (tx, rx) = mpsc::channel(QUEUE);
+            tokio::spawn(deliver(id.clone(), url, rx, region.clone(), secret.clone(), stats.clone()));
+            senders.insert(id, tx);
+        }
+        Arc::new(Bus {
+            store,
+            live: broadcast::channel(4096).0,
+            targets: senders,
+            rules: RwLock::new(HashMap::new()),
+            seq: AtomicU64::new(now_ms() << 16),
+            stats,
+            closing: watch::channel(false).0,
+        })
+    }
+
+    pub fn target_ids(&self) -> Vec<String> {
+        self.targets.keys().cloned().collect()
+    }
+
+    /// Forget cached rules for a bucket (its notification configuration changed or it was deleted).
+    pub fn invalidate(&self, bucket: &str) {
+        self.rules.write().unwrap().remove(bucket);
+    }
+
+    fn rules_for(&self, bucket: &str) -> Option<Arc<Vec<Rule>>> {
+        if let Some(r) = self.rules.read().unwrap().get(bucket) {
+            return r.clone();
+        }
+        let rules = self
+            .store
+            .bucket_config(bucket, "notification")
+            .ok()
+            .flatten()
+            .and_then(|v| xml::parse(&String::from_utf8_lossy(&v)))
+            .and_then(|d| parse_config(&d, &self.target_ids()).ok())
+            .filter(|r| !r.is_empty())
+            .map(Arc::new);
+        let mut cache = self.rules.write().unwrap();
+        if cache.len() > 10_000 {
+            cache.clear();
+        }
+        cache.insert(bucket.to_string(), rules.clone());
+        rules
+    }
+
+    pub fn subscribe(&self) -> broadcast::Receiver<Arc<Event>> {
+        self.live.subscribe()
+    }
+
+    /// Resolves once the server starts shutting down.
+    pub fn closing(&self) -> watch::Receiver<bool> {
+        self.closing.subscribe()
+    }
+
+    pub fn shutdown(&self) {
+        self.closing.send_replace(true);
+    }
+
+    /// Publish an event to live listeners and to the webhook targets of matching rules.
+    pub fn emit(&self, mut ev: Event) {
+        let listeners = self.live.receiver_count() > 0;
+        if !listeners && self.targets.is_empty() {
+            return;
+        }
+        let rules = if self.targets.is_empty() { None } else { self.rules_for(&ev.bucket) };
+        if !listeners && rules.is_none() {
+            return;
+        }
+        ev.sequencer = self.seq.fetch_add(1, Ordering::Relaxed);
+        let ev = Arc::new(ev);
+        if listeners {
+            let _ = self.live.send(ev.clone());
+        }
+        for rule in rules.iter().flat_map(|r| r.iter()).filter(|r| r.matches(&ev)) {
+            if let Some(tx) = self.targets.get(&rule.target)
+                && tx.try_send((ev.clone(), rule.id.clone())).is_err()
+            {
+                // Full queue: the target is down or too slow. Count it rather than block writes.
+                self.stats.dropped.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+}
+
+// ------------------------------------------------------------------ webhook delivery
+
+/// A parsed `http://host[:port]/path` URL.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Url {
+    pub host: String,
+    pub port: u16,
+    /// Path and query, starting with '/'.
+    pub path: String,
+}
+
+impl Url {
+    pub fn parse(s: &str) -> Result<Url, String> {
+        if s.starts_with("https://") {
+            return Err(format!(
+                "{s}: only http:// webhooks are supported (s3rs has no TLS client); use an internal address or a local relay"
+            ));
+        }
+        let rest = s.strip_prefix("http://").ok_or_else(|| format!("{s}: webhook URLs must start with http://"))?;
+        let (authority, path) = match rest.find('/') {
+            Some(i) => (&rest[..i], &rest[i..]),
+            None => (rest, "/"),
+        };
+        if authority.is_empty() || authority.contains('@') {
+            return Err(format!("{s}: invalid host"));
+        }
+        let (host, port) = match authority.rsplit_once(':') {
+            _ if authority.starts_with('[') && authority.ends_with(']') => (authority.to_string(), 80),
+            Some((h, p)) if !h.ends_with(']') || h.starts_with('[') => {
+                (h.to_string(), p.parse::<u16>().map_err(|_| format!("{s}: invalid port"))?)
+            }
+            _ => (authority.to_string(), 80),
+        };
+        Ok(Url { host, port, path: path.to_string() })
+    }
+
+    fn host_header(&self) -> String {
+        if self.port == 80 { self.host.clone() } else { format!("{}:{}", self.host, self.port) }
+    }
+}
+
+type Sender = hyper::client::conn::http1::SendRequest<Full<Bytes>>;
+
+async fn connect(url: &Url) -> Result<Sender, String> {
+    let host = url.host.trim_start_matches('[').trim_end_matches(']');
+    let stream = tokio::time::timeout(TIMEOUT, tokio::net::TcpStream::connect((host, url.port)))
+        .await
+        .map_err(|_| "connect timed out".to_string())?
+        .map_err(|e| e.to_string())?;
+    let _ = stream.set_nodelay(true);
+    let (sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(stream)).await.map_err(|e| e.to_string())?;
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+    Ok(sender)
+}
+
+async fn post(sender: &mut Option<Sender>, url: &Url, body: &Bytes, signature: Option<&str>) -> Result<u16, String> {
+    if sender.as_ref().is_none_or(|s| s.is_closed()) {
+        *sender = Some(connect(url).await?);
+    }
+    let s = sender.as_mut().unwrap();
+    s.ready().await.map_err(|e| e.to_string())?;
+    let mut req = hyper::Request::post(url.path.as_str())
+        .header("host", url.host_header())
+        .header("content-type", "application/json")
+        .header("user-agent", concat!("s3rs/", env!("CARGO_PKG_VERSION")));
+    if let Some(sig) = signature {
+        req = req.header("x-s3rs-signature", sig);
+    }
+    let req = req.body(Full::new(body.clone())).map_err(|e| e.to_string())?;
+    match tokio::time::timeout(TIMEOUT, s.send_request(req)).await {
+        Ok(Ok(resp)) => Ok(resp.status().as_u16()),
+        Ok(Err(e)) => {
+            *sender = None;
+            Err(e.to_string())
+        }
+        Err(_) => {
+            *sender = None;
+            Err("request timed out".into())
+        }
+    }
+}
+
+/// Deliver events to one webhook, in order, retrying with backoff.
+async fn deliver(
+    id: String,
+    url: Url,
+    mut rx: mpsc::Receiver<(Arc<Event>, String)>,
+    region: String,
+    secret: Option<String>,
+    stats: Arc<Stats>,
+) {
+    let mut sender: Option<Sender> = None;
+    let mut warned_at = 0u64;
+    // After a delivery gives up, later events get a single attempt until the target answers
+    // again, so an outage doesn't make every queued event wait out the full backoff.
+    let mut down = false;
+    while let Some((ev, config_id)) = rx.recv().await {
+        let body = Bytes::from(ev.to_json(&region, &config_id));
+        let signature = secret.as_ref().map(|k| format!("sha256={}", util::hex(&crate::auth::hmac(k.as_bytes(), &body))));
+        let mut delay = Duration::from_millis(500);
+        let mut last_err = String::new();
+        let mut ok = false;
+        let attempts = if down { 1 } else { ATTEMPTS };
+        for attempt in 0..attempts {
+            match post(&mut sender, &url, &body, signature.as_deref()).await {
+                Ok(status) if (200..300).contains(&status) => {
+                    ok = true;
+                    break;
+                }
+                Ok(status) => last_err = format!("HTTP {status}"),
+                Err(e) => last_err = e,
+            }
+            if attempt + 1 < attempts {
+                tokio::time::sleep(delay).await;
+                delay *= 2;
+            }
+        }
+        down = !ok;
+        if ok {
+            stats.delivered.fetch_add(1, Ordering::Relaxed);
+        } else {
+            stats.failed.fetch_add(1, Ordering::Relaxed);
+            // At most one log line per minute per target.
+            let now = now_ms() / 60_000;
+            if now != warned_at {
+                warned_at = now;
+                eprintln!("webhook {id}: delivery failed ({last_err}); events are dropped until it is reachable again");
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn urls() {
+        assert_eq!(
+            Url::parse("http://hooks.internal:8080/s3?x=1").unwrap(),
+            Url { host: "hooks.internal".into(), port: 8080, path: "/s3?x=1".into() }
+        );
+        assert_eq!(Url::parse("http://h").unwrap().path, "/");
+        assert_eq!(Url::parse("http://[::1]:9/").unwrap().host, "[::1]");
+        assert!(Url::parse("https://h/").is_err());
+        assert!(Url::parse("ftp://h/").is_err());
+        assert!(Url::parse("http://user@h/").is_err());
+    }
+
+    #[test]
+    fn config_roundtrip_and_matching() {
+        let doc = xml::parse(
+            "<NotificationConfiguration><QueueConfiguration><Id>img</Id><Queue>arn:s3rs:webhook::hook</Queue>\
+             <Event>s3:ObjectCreated:*</Event><Filter><S3Key><FilterRule><Name>prefix</Name><Value>images/</Value></FilterRule>\
+             <FilterRule><Name>Suffix</Name><Value>.jpg</Value></FilterRule></S3Key></Filter></QueueConfiguration>\
+             <TopicConfiguration><Topic>arn:s3rs:webhook::hook</Topic><Event>s3:ObjectRemoved:Delete</Event></TopicConfiguration>\
+             </NotificationConfiguration>",
+        )
+        .unwrap();
+        let rules = parse_config(&doc, &["hook".into()]).unwrap();
+        assert_eq!(rules.len(), 2);
+        assert_eq!(parse_config(&xml::parse(&config_xml(&rules)).unwrap(), &["hook".into()]).unwrap(), rules);
+        let ev = |name, key: &str| Event {
+            name,
+            bucket: "b".into(),
+            key: key.into(),
+            size: 1,
+            etag: "\"e\"".into(),
+            version: None,
+            principal: String::new(),
+            source_ip: String::new(),
+            request_id: String::new(),
+            time_ms: 0,
+            sequencer: 1,
+        };
+        assert!(rules[0].matches(&ev("ObjectCreated:Put", "images/a.jpg")));
+        assert!(!rules[0].matches(&ev("ObjectCreated:Put", "images/a.png")));
+        assert!(!rules[0].matches(&ev("ObjectRemoved:Delete", "images/a.jpg")));
+        assert!(rules[1].matches(&ev("ObjectRemoved:Delete", "x")));
+        assert!(!rules[1].matches(&ev("ObjectRemoved:DeleteMarkerCreated", "x")));
+        // Unknown targets and events are rejected.
+        assert!(parse_config(&doc, &["other".into()]).is_err());
+        let bad = xml::parse("<NotificationConfiguration><QueueConfiguration><Queue>arn:s3rs:webhook::hook</Queue><Event>s3:Nope</Event></QueueConfiguration></NotificationConfiguration>").unwrap();
+        assert!(parse_config(&bad, &["hook".into()]).is_err());
+        // The record is valid JSON with an encoded key.
+        let j = ev("ObjectCreated:Put", "a b/ü\"x").to_json("us-east-1", "img");
+        let parsed = crate::access::parse_json(&j).expect("valid json");
+        let obj = parsed
+            .get("Records")
+            .and_then(|r| if let crate::access::Json::Arr(a) = r { a.first().cloned() } else { None })
+            .unwrap();
+        let key = obj.get("s3").and_then(|s| s.get("object")).and_then(|o| o.get("key")).cloned();
+        assert_eq!(key, Some(crate::access::Json::Str("a+b/%C3%BC%22x".into())));
+    }
+}

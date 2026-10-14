@@ -21,7 +21,7 @@ pub fn unhex(s: &str) -> Option<Vec<u8>> {
     }
     let b = s.as_bytes();
     let mut out = Vec::with_capacity(b.len() / 2);
-    for pair in b.chunks_exact(2) {
+    for pair in b.as_chunks::<2>().0 {
         out.push((hex_val(pair[0])? << 4) | hex_val(pair[1])?);
     }
     Some(out)

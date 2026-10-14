@@ -8,6 +8,7 @@ use crate::error::{S3Error, S3Result, err};
 use crate::iam;
 use crate::io::{self, BodyStream, Data, Expect};
 use crate::lock;
+use crate::ops::{self, BucketOp, ObjectOp};
 use crate::store::meta::{ChecksumAlgo, ObjectMeta, PartMeta, Storage, UploadMeta};
 use crate::store::{self, Op, OpOut, Store, WriteCond, norm_etag};
 use crate::util::{self, base64, http_date, iso8601, now_ms, unbase64, uri_decode, uri_encode};
@@ -91,86 +92,8 @@ struct Client {
 }
 
 impl Req {
-    /// The IAM action a request needs (`None`: checked per object by the handler, as for
-    /// DeleteObjects). Bucket-level when `has_key` is false.
-    fn action(&self, has_key: bool) -> Option<&'static str> {
-        let m = &self.parts.method;
-        let versioned = self.q("versionId").is_some_and(|v| !v.is_empty());
-        let pick = |plain: &'static str, version: &'static str| if versioned { version } else { plain };
-        if has_key {
-            return Some(match *m {
-                Method::GET | Method::HEAD if self.has("uploadId") => "s3:ListMultipartUploadParts",
-                Method::GET | Method::HEAD if self.has("acl") => pick("s3:GetObjectAcl", "s3:GetObjectVersionAcl"),
-                Method::GET | Method::HEAD if self.has("tagging") => pick("s3:GetObjectTagging", "s3:GetObjectVersionTagging"),
-                Method::GET | Method::HEAD if self.has("retention") => "s3:GetObjectRetention",
-                Method::GET | Method::HEAD if self.has("legal-hold") => "s3:GetObjectLegalHold",
-                Method::GET | Method::HEAD if self.has("attributes") => {
-                    pick("s3:GetObjectAttributes", "s3:GetObjectVersionAttributes")
-                }
-                Method::GET | Method::HEAD => pick("s3:GetObject", "s3:GetObjectVersion"),
-                Method::PUT if self.has("acl") => pick("s3:PutObjectAcl", "s3:PutObjectVersionAcl"),
-                Method::PUT if self.has("tagging") => pick("s3:PutObjectTagging", "s3:PutObjectVersionTagging"),
-                Method::PUT if self.has("retention") => "s3:PutObjectRetention",
-                Method::PUT if self.has("legal-hold") => "s3:PutObjectLegalHold",
-                Method::POST if self.has("restore") => "s3:RestoreObject",
-                Method::POST if self.has("select") => "s3:GetObject",
-                Method::DELETE if self.has("uploadId") => "s3:AbortMultipartUpload",
-                Method::DELETE if self.has("tagging") => pick("s3:DeleteObjectTagging", "s3:DeleteObjectVersionTagging"),
-                Method::DELETE => pick("s3:DeleteObject", "s3:DeleteObjectVersion"),
-                // PUT (including copies and parts) and multipart create / complete.
-                _ => "s3:PutObject",
-            });
-        }
-        const BUCKET_SUBS: &[(&str, &str, &str)] = &[
-            // (subresource, GET action, PUT / DELETE action)
-            ("acl", "s3:GetBucketAcl", "s3:PutBucketAcl"),
-            ("policy", "s3:GetBucketPolicy", "s3:PutBucketPolicy"),
-            ("policyStatus", "s3:GetBucketPolicyStatus", "s3:PutBucketPolicy"),
-            ("cors", "s3:GetBucketCORS", "s3:PutBucketCORS"),
-            ("tagging", "s3:GetBucketTagging", "s3:PutBucketTagging"),
-            ("lifecycle", "s3:GetLifecycleConfiguration", "s3:PutLifecycleConfiguration"),
-            ("encryption", "s3:GetEncryptionConfiguration", "s3:PutEncryptionConfiguration"),
-            ("versioning", "s3:GetBucketVersioning", "s3:PutBucketVersioning"),
-            ("object-lock", "s3:GetBucketObjectLockConfiguration", "s3:PutBucketObjectLockConfiguration"),
-            ("website", "s3:GetBucketWebsite", "s3:PutBucketWebsite"),
-            ("logging", "s3:GetBucketLogging", "s3:PutBucketLogging"),
-            ("notification", "s3:GetBucketNotification", "s3:PutBucketNotification"),
-            ("replication", "s3:GetReplicationConfiguration", "s3:PutReplicationConfiguration"),
-            ("accelerate", "s3:GetAccelerateConfiguration", "s3:PutAccelerateConfiguration"),
-            ("requestPayment", "s3:GetBucketRequestPayment", "s3:PutBucketRequestPayment"),
-            ("ownershipControls", "s3:GetBucketOwnershipControls", "s3:PutBucketOwnershipControls"),
-            ("publicAccessBlock", "s3:GetBucketPublicAccessBlock", "s3:PutBucketPublicAccessBlock"),
-            ("analytics", "s3:GetAnalyticsConfiguration", "s3:PutAnalyticsConfiguration"),
-            ("metrics", "s3:GetMetricsConfiguration", "s3:PutMetricsConfiguration"),
-            ("inventory", "s3:GetInventoryConfiguration", "s3:PutInventoryConfiguration"),
-            ("intelligent-tiering", "s3:GetIntelligentTieringConfiguration", "s3:PutIntelligentTieringConfiguration"),
-            ("location", "s3:GetBucketLocation", "s3:GetBucketLocation"),
-            ("uploads", "s3:ListBucketMultipartUploads", "s3:ListBucketMultipartUploads"),
-            ("versions", "s3:ListBucketVersions", "s3:ListBucketVersions"),
-        ];
-        if *m == Method::POST && self.has("delete") {
-            return None;
-        }
-        if let Some((sub, get, put)) = BUCKET_SUBS.iter().find(|(sub, _, _)| self.has(sub)) {
-            return Some(match *m {
-                Method::GET | Method::HEAD => get,
-                Method::DELETE if *sub == "policy" => "s3:DeleteBucketPolicy",
-                Method::DELETE if *sub == "website" => "s3:DeleteBucketWebsite",
-                _ => put,
-            });
-        }
-        Some(match *m {
-            Method::PUT => "s3:CreateBucket",
-            Method::DELETE => "s3:DeleteBucket",
-            _ => "s3:ListBucket",
-        })
-    }
-
     fn q(&self, name: &str) -> Option<&str> {
         self.query.iter().find(|(k, _)| k == name).map(|(_, v)| v.as_str())
-    }
-    fn has(&self, name: &str) -> bool {
-        self.query.iter().any(|(k, _)| k == name)
     }
     fn header(&self, name: &str) -> Option<&str> {
         header(&self.parts.headers, name)
@@ -453,7 +376,16 @@ impl Server {
         let policy = self
             .store
             .bucket_config(bucket, "policy")?
-            .and_then(|v| iam::Policy::parse(&String::from_utf8_lossy(&v), iam::Kind::Bucket, Some(bucket)).ok());
+            .map(|v| {
+                iam::Policy::parse(&String::from_utf8_lossy(&v), iam::Kind::Bucket, Some(bucket)).unwrap_or_else(|e| {
+                    // Fail closed: a policy we can no longer read may have contained Denies.
+                    eprintln!(
+                        "warning: bucket {bucket}: stored policy is invalid ({}); denying all access except policy management until it is replaced",
+                        e.message
+                    );
+                    iam::Policy::lockdown(bucket)
+                })
+            });
         let cors = self
             .store
             .bucket_config(bucket, "cors")?
@@ -567,14 +499,19 @@ impl Server {
         if !self.behind_proxy {
             return Client { ip: peer.ip(), secure: false };
         }
-        // The proxy appends the address it saw, so the last entry is the one it vouches for.
-        let ip = header(headers, "x-forwarded-for")
-            .and_then(|v| v.rsplit(',').next())
-            .and_then(|v| v.trim().parse::<IpAddr>().ok())
-            .unwrap_or(peer.ip());
-        let secure = header(headers, "x-forwarded-proto")
-            .and_then(|v| v.split(',').next())
-            .is_some_and(|p| p.trim().eq_ignore_ascii_case("https"));
+        // The proxy appends what it saw, so the last entry (across all header lines) is the one
+        // it vouches for; anything before it came from the client.
+        let last = |name: &str| {
+            headers
+                .get_all(name)
+                .iter()
+                .next_back()
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.rsplit(',').next())
+                .map(str::trim)
+        };
+        let ip = last("x-forwarded-for").and_then(|v| v.parse::<IpAddr>().ok()).unwrap_or(peer.ip());
+        let secure = last("x-forwarded-proto").is_some_and(|p| p.eq_ignore_ascii_case("https"));
         Client { ip, secure }
     }
 
@@ -620,6 +557,9 @@ impl Server {
             Principal::Everyone => Ok(()),
             Principal::Anonymous => {
                 let Some(b) = bucket else { return Err(err::AccessDenied()) };
+                if !ops::anonymous_may(action) {
+                    return Err(err::AccessDenied());
+                }
                 // Unknown buckets look the same as forbidden ones to anonymous callers.
                 let access = self.bucket_access(b).map_err(|_| err::AccessDenied())?;
                 if access.allows_anonymous(action, &resource(), ctx) { Ok(()) } else { Err(err::AccessDenied()) }
@@ -952,18 +892,26 @@ impl Server {
         let client = self.client(&parts.headers, peer);
         let mut r = Req { parts, query, payload, body, principal, client, auth_type };
         let m = r.parts.method.clone();
+        // One classification decides both what is authorized and what runs.
+        let op = match (&bucket, &key) {
+            (None, _) => None,
+            (Some(_), None) => Some(Err(ops::classify_bucket(&m, &r.query)?)),
+            (Some(_), Some(_)) => Some(Ok(ops::classify_object(&m, &r.query, r.header("x-amz-copy-source").is_some())?)),
+        };
         {
             let ctx = self.req_ctx(&r);
             let (b, k) = (bucket.as_deref(), key.as_deref());
-            if bucket.is_none() {
-                self.authorize(&r.principal, "s3:ListAllMyBuckets", None, None, &ctx)?;
-            } else if let Some(action) = r.action(key.is_some()) {
+            let versioned = r.q("versionId").is_some_and(|v| !v.is_empty());
+            let action = match op {
+                None => Some("s3:ListAllMyBuckets"),
+                Some(Err(bop)) => bop.action(),
+                Some(Ok(oop)) => oop.action(versioned),
+            };
+            if let Some(action) = action {
                 self.authorize(&r.principal, action, b, k, &ctx)?;
             }
             // Uploads that set retention, a legal hold or tags also need those permissions.
-            let creates =
-                key.is_some() && ((m == Method::PUT && action_is_plain_put(&r)) || (m == Method::POST && r.has("uploads")));
-            if creates {
+            if matches!(op, Some(Ok(oop)) if oop.creates_object()) {
                 let h = &r.parts.headers;
                 if h.contains_key(lock::MODE) || h.contains_key(lock::UNTIL) {
                     self.authorize(&r.principal, "s3:PutObjectRetention", b, k, &ctx)?;
@@ -983,41 +931,19 @@ impl Server {
                 _ => Err(err::MethodNotAllowed()),
             };
         };
-        match key {
-            None => self.bucket_op(&mut r, m, &bucket).await,
-            Some(key) => {
+        match (key, op) {
+            (None, Some(Err(bop))) => self.bucket_op(&mut r, bop, &bucket).await,
+            (Some(key), Some(Ok(oop))) => {
                 check_key(&key)?;
-                self.object_op(&mut r, m, &bucket, &key).await
+                self.object_op(&mut r, oop, &bucket, &key).await
             }
+            _ => Err(S3Error::internal("request classification mismatch")),
         }
     }
 
-    async fn bucket_op(&self, r: &mut Req, m: Method, bucket: &str) -> S3Result<Resp> {
-        const CONFIG_SUBRESOURCES: &[&str] = &[
-            "acl",
-            "policy",
-            "cors",
-            "lifecycle",
-            "encryption",
-            "tagging",
-            "website",
-            "logging",
-            "notification",
-            "replication",
-            "object-lock",
-            "accelerate",
-            "requestPayment",
-            "ownershipControls",
-            "policyStatus",
-            "publicAccessBlock",
-            "analytics",
-            "metrics",
-            "inventory",
-            "intelligent-tiering",
-        ];
-        let sub = CONFIG_SUBRESOURCES.iter().find(|s| r.has(s)).copied();
-        match m {
-            Method::GET if r.has("location") => {
+    async fn bucket_op(&self, r: &mut Req, op: BucketOp, bucket: &str) -> S3Result<Resp> {
+        match op {
+            BucketOp::GetLocation => {
                 self.store.require_bucket(bucket)?;
                 let mut x = Xml(String::from("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"));
                 x.0.push_str(&format!("<LocationConstraint xmlns=\"{}\">", xml::NS));
@@ -1027,7 +953,7 @@ impl Server {
                 x.0.push_str("</LocationConstraint>");
                 Ok(Resp::xml(x.0))
             }
-            Method::GET if r.has("versioning") => {
+            BucketOp::GetConfig("versioning") => {
                 let mut x = Xml::new("VersioningConfiguration");
                 match self.store.versioning(bucket)? {
                     store::Versioning::Enabled => x.elem("Status", "Enabled"),
@@ -1036,11 +962,11 @@ impl Server {
                 };
                 Ok(Resp::xml(x.finish("VersioningConfiguration")))
             }
-            Method::GET if r.has("uploads") => self.list_uploads(r, bucket),
-            Method::GET if r.has("versions") => self.list_versions(r, bucket),
-            Method::GET if sub.is_some() => {
+            BucketOp::ListUploads => self.list_uploads(r, bucket),
+            BucketOp::ListVersions => self.list_versions(r, bucket),
+            BucketOp::GetConfig(sub) => {
                 self.store.require_bucket(bucket)?;
-                match sub.unwrap() {
+                match sub {
                     "acl" => Ok(Resp::xml(acl_doc(self.bucket_access(bucket)?.acl))),
                     "policy" => {
                         let doc = self.store.bucket_config(bucket, "policy")?.ok_or_else(err::NoSuchBucketPolicy)?;
@@ -1096,14 +1022,14 @@ impl Server {
                     _ => Err(err::NotImplemented()),
                 }
             }
-            Method::GET => self.list_objects(r, bucket),
-            Method::HEAD => {
+            BucketOp::ListObjects => self.list_objects(r, bucket),
+            BucketOp::Head => {
                 self.store.require_bucket(bucket)?;
                 let mut resp = Resp::ok();
                 resp.set("x-amz-bucket-region", &self.region);
                 Ok(resp)
             }
-            Method::PUT if sub == Some("acl") => {
+            BucketOp::PutConfig("acl") => {
                 self.store.require_bucket(bucket)?;
                 let acl = match r.header("x-amz-acl") {
                     Some(a) => CannedAcl::parse(a)?,
@@ -1113,26 +1039,26 @@ impl Server {
                 self.set_bucket_config(bucket, "acl", value).await?;
                 Ok(Resp::ok())
             }
-            Method::PUT if sub == Some("policy") => {
+            BucketOp::PutConfig("policy") => {
                 let body = self.read_body(r, 20 * 1024).await?;
                 iam::Policy::parse(&String::from_utf8_lossy(&body), iam::Kind::Bucket, Some(bucket))?;
                 self.set_bucket_config(bucket, "policy", Some(body.to_vec())).await?;
                 Ok(Resp::new(StatusCode::NO_CONTENT))
             }
-            Method::PUT if sub == Some("cors") => {
+            BucketOp::PutConfig("cors") => {
                 let body = self.read_body(r, MAX_XML_BODY).await?;
                 let doc = xml::parse(&String::from_utf8_lossy(&body)).ok_or_else(err::MalformedXML)?;
                 access::parse_cors(&doc)?;
                 self.set_bucket_config(bucket, "cors", Some(body.to_vec())).await?;
                 Ok(Resp::ok())
             }
-            Method::PUT if sub == Some("tagging") => {
+            BucketOp::PutConfig("tagging") => {
                 let doc = self.read_xml(r).await?;
                 let tags = access::parse_tagging_xml(&doc, 50)?;
                 self.set_bucket_config(bucket, "tagging", Some(access::tagging_xml(&tags).into_bytes())).await?;
                 Ok(Resp::new(StatusCode::NO_CONTENT))
             }
-            Method::PUT if sub == Some("encryption") => {
+            BucketOp::PutConfig("encryption") => {
                 let doc = self.read_xml(r).await?;
                 let alg = (doc.name == "ServerSideEncryptionConfiguration")
                     .then(|| doc.child("Rule")?.child("ApplyServerSideEncryptionByDefault")?.child_text("SSEAlgorithm"))
@@ -1154,26 +1080,26 @@ impl Server {
                     .await?;
                 Ok(Resp::ok())
             }
-            Method::PUT if sub == Some("lifecycle") => {
+            BucketOp::PutConfig("lifecycle") => {
                 let body = self.read_body(r, MAX_XML_BODY).await?;
                 let doc = xml::parse(&String::from_utf8_lossy(&body)).ok_or_else(err::MalformedXML)?;
                 crate::lifecycle::parse(&doc)?;
                 self.set_bucket_config(bucket, "lifecycle", Some(body.to_vec())).await?;
                 Ok(Resp::ok())
             }
-            Method::PUT if sub == Some("object-lock") => {
+            BucketOp::PutConfig("object-lock") => {
                 let cfg = lock::BucketLock::parse_xml(&self.read_xml(r).await?)?;
                 self.set_bucket_config(bucket, "object-lock", Some(cfg.to_xml().into_bytes())).await?;
                 Ok(Resp::ok())
             }
-            Method::PUT if sub == Some("website") => {
+            BucketOp::PutConfig("website") => {
                 let body = self.read_body(r, MAX_XML_BODY).await?;
                 let doc = xml::parse(&String::from_utf8_lossy(&body)).ok_or_else(err::MalformedXML)?;
                 crate::website::Config::parse(&doc)?;
                 self.set_bucket_config(bucket, "website", Some(body.to_vec())).await?;
                 Ok(Resp::ok())
             }
-            Method::PUT if r.has("versioning") => {
+            BucketOp::PutConfig("versioning") => {
                 let doc = self.read_xml(r).await?;
                 if doc.name != "VersioningConfiguration" {
                     return Err(err::MalformedXML());
@@ -1194,8 +1120,8 @@ impl Server {
                 self.set_bucket_config(bucket, "versioning", Some(status.to_vec())).await?;
                 Ok(Resp::ok())
             }
-            Method::PUT if sub.is_some() => Err(err::NotImplemented()),
-            Method::PUT => {
+            BucketOp::PutConfig(_) => Err(err::NotImplemented()),
+            BucketOp::Create => {
                 if !valid_bucket_name(bucket) {
                     return Err(err::InvalidBucketName());
                 }
@@ -1217,30 +1143,27 @@ impl Server {
                 resp.set("location", &format!("/{bucket}"));
                 Ok(resp)
             }
-            Method::DELETE if matches!(sub, Some("policy" | "cors" | "tagging" | "lifecycle" | "encryption" | "website")) => {
-                let kind = sub.unwrap();
+            BucketOp::DeleteConfig(kind @ ("policy" | "cors" | "tagging" | "lifecycle" | "encryption" | "website")) => {
                 let kind: &'static str = store::CONFIG_KINDS.iter().find(|k| **k == kind).unwrap();
                 self.set_bucket_config(bucket, kind, None).await?;
                 Ok(Resp::new(StatusCode::NO_CONTENT))
             }
-            Method::DELETE if sub.is_some() => {
+            BucketOp::DeleteConfig(_) => {
                 self.store.require_bucket(bucket)?;
                 Ok(Resp::new(StatusCode::NO_CONTENT))
             }
-            Method::DELETE => {
+            BucketOp::Delete => {
                 let r = self.store.submit(Op::DeleteBucket(bucket.to_string())).await;
                 self.invalidate_access(bucket);
                 r?;
                 Ok(Resp::new(StatusCode::NO_CONTENT))
             }
-            Method::POST if r.has("delete") => self.delete_objects(r, bucket).await,
-            _ => Err(err::MethodNotAllowed()),
+            BucketOp::DeleteObjects => self.delete_objects(r, bucket).await,
         }
     }
 
-    async fn object_op(&self, r: &mut Req, m: Method, bucket: &str, key: &str) -> S3Result<Resp> {
-        const UNSUPPORTED: &[&str] = &["torrent", "restore", "select", "attributes", "renameObject"];
-        if UNSUPPORTED.iter().any(|s| r.has(s)) {
+    async fn object_op(&self, r: &mut Req, op: ObjectOp, bucket: &str, key: &str) -> S3Result<Resp> {
+        if op == ObjectOp::Unsupported {
             return Err(err::NotImplemented());
         }
         let version = r.q("versionId").filter(|v| !v.is_empty()).map(str::to_string);
@@ -1250,26 +1173,26 @@ impl Server {
             return Err(err::InvalidArgument().with_message("Invalid version id specified"));
         }
         let vref = version.as_deref();
-        match m {
-            Method::GET if r.has("uploadId") => self.list_parts(r, bucket, key),
-            Method::GET if r.has("acl") => {
+        match op {
+            ObjectOp::ListParts => self.list_parts(r, bucket, key),
+            ObjectOp::GetAcl => {
                 self.lookup(bucket, key, vref)?;
                 Ok(Resp::xml(acl_doc(CannedAcl::Private)))
             }
-            Method::GET if r.has("tagging") => {
+            ObjectOp::GetTagging => {
                 let (meta, _) = self.lookup(bucket, key, vref)?;
                 let mut resp = Resp::xml(access::tagging_xml(&meta.tags));
                 set_version_header(&mut resp, &meta);
                 Ok(resp)
             }
-            Method::GET if r.has("retention") || r.has("legal-hold") => {
+            ObjectOp::GetRetention | ObjectOp::GetLegalHold => {
                 self.require_lock(bucket)?;
                 let (meta, _) = self.lookup(bucket, key, vref)?;
                 if meta.delete_marker {
                     return Err(err::MethodNotAllowed());
                 }
                 let state = lock::State::of(&meta.headers);
-                let doc = if r.has("retention") {
+                let doc = if op == ObjectOp::GetRetention {
                     let ret = state.retention.ok_or_else(err::NoSuchObjectLockConfiguration)?;
                     let mut x = Xml::new("Retention");
                     x.elem("Mode", ret.mode.as_str()).elem("RetainUntilDate", iso8601(ret.until * 1000));
@@ -1282,8 +1205,8 @@ impl Server {
                 };
                 Ok(Resp::xml(doc))
             }
-            Method::GET | Method::HEAD => {
-                let mut resp = self.get_object(r, bucket, key, m == Method::HEAD).await?;
+            ObjectOp::Get | ObjectOp::Head => {
+                let mut resp = self.get_object(r, bucket, key, op == ObjectOp::Head).await?;
                 if self.console {
                     // Stored HTML/SVG must not run as the console's origin (where a signed-in
                     // console keeps its credentials): render it in an opaque, sandboxed origin.
@@ -1291,12 +1214,12 @@ impl Server {
                 }
                 Ok(resp)
             }
-            Method::PUT if r.has("partNumber") && r.has("uploadId") => self.upload_part(r, bucket, key).await,
-            Method::PUT if r.has("acl") => {
+            ObjectOp::UploadPart | ObjectOp::UploadPartCopy => self.upload_part(r, bucket, key).await,
+            ObjectOp::PutAcl => {
                 self.lookup(bucket, key, vref)?;
                 Ok(Resp::ok())
             }
-            Method::PUT if r.has("tagging") => {
+            ObjectOp::PutTagging => {
                 let doc = self.read_xml(r).await?;
                 let tags = access::parse_tagging_xml(&doc, 10)?;
                 self.store
@@ -1308,9 +1231,9 @@ impl Server {
                 }
                 Ok(resp)
             }
-            Method::PUT if r.has("retention") || r.has("legal-hold") => {
+            ObjectOp::PutRetention | ObjectOp::PutLegalHold => {
                 let doc = self.read_xml(r).await?;
-                let (retention, legal_hold) = if r.has("retention") {
+                let (retention, legal_hold) = if op == ObjectOp::PutRetention {
                     if doc.name != "Retention" {
                         return Err(err::MalformedXML());
                     }
@@ -1342,22 +1265,22 @@ impl Server {
                 }
                 Ok(resp)
             }
-            Method::PUT if r.header("x-amz-copy-source").is_some() => self.copy_object(r, bucket, key).await,
-            Method::PUT => self.put_object(r, bucket, key).await,
-            Method::POST if r.has("uploads") => self.create_upload(r, bucket, key).await,
-            Method::POST if r.has("uploadId") => self.complete_upload(r, bucket, key).await,
-            Method::DELETE if r.has("uploadId") => {
+            ObjectOp::Copy => self.copy_object(r, bucket, key).await,
+            ObjectOp::Put => self.put_object(r, bucket, key).await,
+            ObjectOp::CreateUpload => self.create_upload(r, bucket, key).await,
+            ObjectOp::CompleteUpload => self.complete_upload(r, bucket, key).await,
+            ObjectOp::AbortUpload => {
                 let upload = parse_upload_id(r)?;
                 self.store.submit(Op::Abort { bucket: bucket.into(), key: key.into(), upload }).await?;
                 Ok(Resp::new(StatusCode::NO_CONTENT))
             }
-            Method::DELETE if r.has("tagging") => {
+            ObjectOp::DeleteTagging => {
                 self.store
                     .submit(Op::SetObjectTags { bucket: bucket.into(), key: key.into(), version: version.clone(), tags: vec![] })
                     .await?;
                 Ok(Resp::new(StatusCode::NO_CONTENT))
             }
-            Method::DELETE => {
+            ObjectOp::Delete => {
                 let OpOut::Deleted(mut res) = self
                     .store
                     .submit(Op::DeleteObjects {
@@ -1379,7 +1302,7 @@ impl Server {
                 }
                 Ok(resp)
             }
-            _ => Err(err::MethodNotAllowed()),
+            ObjectOp::Unsupported => Err(err::NotImplemented()),
         }
     }
 
@@ -2196,27 +2119,20 @@ impl Server {
         }
         check_key(&key)?;
 
+        // A signed policy identifies the uploader; an unsigned form is anonymous.
+        let who = match (&self.auth, f.get("policy")) {
+            (None, _) => Principal::Everyone,
+            (Some(a), Some(policy)) => a.verify_post_policy(f, policy)?,
+            (Some(_), None) => Principal::Anonymous,
+        };
+        let ctx = self.ctx(&who, &parts.headers, &[], client, "POST");
+        self.authorize(&who, "s3:PutObject", Some(bucket), Some(&key), &ctx)?;
+        if f.contains_key("tagging") {
+            self.authorize(&who, "s3:PutObjectTagging", Some(bucket), Some(&key), &ctx)?;
+        }
         let range = match f.get("policy") {
-            Some(policy) => {
-                if let Some(a) = &self.auth {
-                    let p = a.verify_post_policy(f, policy)?;
-                    let ctx = self.ctx(&p, &parts.headers, &[], client, "POST");
-                    self.authorize(&p, "s3:PutObject", Some(bucket), Some(&key), &ctx)?;
-                }
-                crate::post::PostPolicy::parse(policy)?.check(f, bucket)?
-            }
-            None => {
-                // Unsigned form: allowed only when the bucket accepts anonymous uploads.
-                if self.auth.is_some() {
-                    let access = self.bucket_access(bucket).map_err(|_| err::AccessDenied())?;
-                    let anon = Principal::Anonymous;
-                    let ctx = self.ctx(&anon, &parts.headers, &[], client, "POST");
-                    if !access.allows_anonymous("s3:PutObject", &format!("arn:aws:s3:::{bucket}/{key}"), &ctx) {
-                        return Err(err::AccessDenied());
-                    }
-                }
-                None
-            }
+            Some(policy) => crate::post::PostPolicy::parse(policy)?.check(f, bucket)?,
+            None => None,
         };
         self.store.require_bucket(bucket)?;
 
@@ -2476,11 +2392,6 @@ fn inheritable(h: &[(String, String)]) -> Vec<(String, String)> {
 
 fn r_has_auth_header(parts: &Parts) -> bool {
     parts.headers.contains_key(hyper::header::AUTHORIZATION)
-}
-
-/// A plain object PUT or copy (not a subresource or a multipart part).
-fn action_is_plain_put(r: &Req) -> bool {
-    !["acl", "tagging", "retention", "legal-hold", "partNumber", "uploadId"].iter().any(|s| r.has(s))
 }
 
 fn has_lock_headers(h: &HeaderMap) -> bool {

@@ -12,6 +12,7 @@ mod io;
 mod lifecycle;
 mod lock;
 mod metrics;
+mod ops;
 mod post;
 mod s3;
 mod store;
@@ -413,15 +414,20 @@ async fn serve(cfg: Config, store: Arc<store::Store>, auth: Option<auth::Auth>) 
             let Ok(mut hup) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()) else { return };
             while hup.recv().await.is_some() {
                 match collect_credentials(&cfg) {
-                    Ok(creds) if !creds.is_empty() => {
+                    Ok(creds) => {
                         let n = creds.len();
                         if let Some(a) = &server.auth {
                             a.replace(creds);
                         }
-                        eprintln!("reloaded {n} access key(s)");
+                        if n == 0 {
+                            eprintln!("reloaded: NO access keys are configured now; every signed request will be refused");
+                        } else {
+                            eprintln!("reloaded {n} access key(s)");
+                        }
                     }
-                    Ok(_) => eprintln!("reload skipped: no access keys configured"),
-                    Err(e) => eprintln!("reload failed, keeping the current keys: {e}"),
+                    // Keeping the old keys can keep a key alive that the edit meant to remove,
+                    // so say so loudly.
+                    Err(e) => eprintln!("RELOAD FAILED, still using the previous keys (including any you removed): {e}"),
                 }
             }
         });

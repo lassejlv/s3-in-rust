@@ -6,7 +6,7 @@
 //! `ForAllValues:` set qualifiers). Policy variables such as `${aws:username}` work in resources
 //! and condition values. Evaluation follows AWS: an explicit Deny wins over any Allow.
 
-use crate::access::{Json, glob, parse_json};
+use crate::access::{Json, Pattern, parse_json};
 use crate::error::{S3Error, S3Result};
 use crate::util::parse_iso8601;
 use hyper::StatusCode;
@@ -89,13 +89,14 @@ impl Op {
         )
     }
 
-    /// Does one request value match one policy value (ignoring negation)?
-    fn test(self, actual: &str, expected: &str) -> bool {
+    /// Does one request value match one policy value (ignoring negation)? `pattern` is the
+    /// compiled form of `expected` for the `*Like` operators.
+    fn test(self, actual: &str, expected: &str, pattern: Option<&Pattern>) -> bool {
         use Op::*;
         match self {
             StringEquals | StringNotEquals => actual == expected,
             StringEqualsIgnoreCase | StringNotEqualsIgnoreCase => actual.eq_ignore_ascii_case(expected),
-            StringLike | StringNotLike => glob(expected, actual, false),
+            StringLike | StringNotLike => pattern.is_some_and(|p| p.matches(actual)),
             NumericEquals
             | NumericNotEquals
             | NumericLessThan
@@ -138,6 +139,17 @@ fn date(s: &str) -> Option<u64> {
     parse_iso8601(s).or_else(|| s.parse().ok())
 }
 
+/// Is this a valid address or CIDR block?
+fn valid_cidr(cidr: &str) -> bool {
+    let (net, bits) = match cidr.trim().split_once('/') {
+        Some((n, b)) => (n, Some(b)),
+        None => (cidr.trim(), None),
+    };
+    let Ok(net) = net.parse::<IpAddr>() else { return false };
+    let max = if net.is_ipv4() { 32 } else { 128 };
+    bits.is_none_or(|b| b.parse::<u32>().is_ok_and(|b| b <= max))
+}
+
 /// Is `ip` inside `cidr` (`10.0.0.0/8`, `2001:db8::/32`, or a single address)?
 fn ip_in(ip: &str, cidr: &str) -> bool {
     let Ok(ip) = ip.parse::<IpAddr>() else { return false };
@@ -176,15 +188,23 @@ struct Condition {
     values: Vec<String>,
 }
 
+/// A resource pattern: compiled up front unless it contains policy variables.
+#[derive(Debug, Clone)]
+enum ResourcePattern {
+    Fixed(Pattern),
+    Templated(String),
+}
+
 #[derive(Debug, Clone)]
 struct Statement {
     allow: bool,
     /// `None` for identity policies (no Principal element).
     principals: Option<Principals>,
     not_principal: bool,
-    actions: Vec<String>,
+    /// Lowercased (actions match case-insensitively).
+    actions: Vec<Pattern>,
     not_action: bool,
-    resources: Vec<String>,
+    resources: Vec<ResourcePattern>,
     not_resource: bool,
     conditions: Vec<Condition>,
 }
@@ -216,6 +236,34 @@ pub struct Ctx<'a> {
     /// Unix seconds.
     pub now: u64,
 }
+
+/// Condition keys (lowercase) that requests can provide; policies using others are rejected,
+/// since a condition on a key we never set would silently never match.
+const KNOWN_KEYS: &[&str] = &[
+    "aws:sourceip",
+    "aws:securetransport",
+    "aws:username",
+    "aws:userid",
+    "aws:principaltype",
+    "aws:useragent",
+    "aws:referer",
+    "aws:currenttime",
+    "aws:epochtime",
+    "s3:authtype",
+    "s3:prefix",
+    "s3:delimiter",
+    "s3:max-keys",
+    "s3:versionid",
+    "s3:x-amz-acl",
+    "s3:x-amz-server-side-encryption",
+    "s3:x-amz-copy-source",
+    "s3:x-amz-metadata-directive",
+    "s3:x-amz-storage-class",
+    "s3:object-lock-mode",
+    "s3:object-lock-legal-hold",
+    "s3:object-lock-retain-until-date",
+    "s3:requestobjecttagkeys",
+];
 
 impl Ctx<'_> {
     /// Values of a condition key in this request (keys are case-insensitive).
@@ -256,30 +304,38 @@ impl Ctx<'_> {
         }
     }
 
-    /// Expand `${aws:username}`-style variables (and `${*}`, `${?}`, `${$}`); `None` when a
-    /// variable has no value in this request (the containing element then cannot match).
-    fn expand(&self, s: &str) -> Option<String> {
-        if !s.contains("${") {
-            return Some(s.to_string());
-        }
-        let mut out = String::with_capacity(s.len());
+    /// Expand `${aws:username}`-style variables (and `${*}`, `${?}`, `${$}`, which stand for
+    /// those literal characters) into pieces of (text, literal). Substituted text is literal:
+    /// it never acts as a wildcard. `None` when a variable has no value in this request (the
+    /// containing element then cannot match).
+    fn expand(&self, s: &str) -> Option<Vec<(String, bool)>> {
+        let mut out = Vec::new();
         let mut rest = s;
         while let Some(i) = rest.find("${") {
-            out.push_str(&rest[..i]);
+            out.push((rest[..i].to_string(), false));
             let after = &rest[i + 2..];
             let Some(end) = after.find('}') else {
-                out.push_str(&rest[i..]);
+                out.push((rest[i..].to_string(), false));
                 return Some(out);
             };
             let name = &after[..end];
             match name {
-                "*" | "?" | "$" => out.push_str(name),
-                _ => out.push_str(&self.value(name)?.into_iter().next()?),
+                "*" | "?" | "$" => out.push((name.to_string(), true)),
+                _ => out.push((self.value(name)?.into_iter().next()?, true)),
             }
             rest = &after[end + 1..];
         }
-        out.push_str(rest);
+        out.push((rest.to_string(), false));
         Some(out)
+    }
+
+    fn expand_text(&self, s: &str) -> Option<String> {
+        Some(self.expand(s)?.into_iter().map(|(t, _)| t).collect())
+    }
+
+    fn expand_pattern(&self, s: &str) -> Option<Pattern> {
+        let pieces = self.expand(s)?;
+        Some(Pattern::from_pieces(&pieces.iter().map(|(t, l)| (t.as_str(), *l)).collect::<Vec<_>>()))
     }
 }
 
@@ -350,14 +406,15 @@ impl Policy {
                 (Kind::Bucket, None, Some(p)) => (Some(parse_principal(p)?), true),
                 (Kind::Bucket, _, _) => return Err(malformed("Each statement needs exactly one of Principal or NotPrincipal")),
             };
-            let (actions, not_action) = one_of(st, "Action", "NotAction")?;
-            for a in &actions {
+            let (action_names, not_action) = one_of(st, "Action", "NotAction")?;
+            for a in &action_names {
                 if !(a == "*" || a.to_ascii_lowercase().starts_with("s3:")) {
                     return Err(malformed(format!("Policy has an invalid action: {a}")));
                 }
             }
-            let (resources, not_resource) = one_of(st, "Resource", "NotResource")?;
-            for r in &resources {
+            let actions = action_names.iter().map(|a| Pattern::new(&a.to_ascii_lowercase())).collect();
+            let (resource_names, not_resource) = one_of(st, "Resource", "NotResource")?;
+            for r in &resource_names {
                 if !(r == "*" || r.starts_with("arn:aws:s3:::")) {
                     return Err(malformed(format!("Policy has an invalid resource: {r}")));
                 }
@@ -371,6 +428,10 @@ impl Policy {
                     }
                 }
             }
+            let resources = resource_names
+                .into_iter()
+                .map(|r| if r.contains("${") { ResourcePattern::Templated(r) } else { ResourcePattern::Fixed(Pattern::new(&r)) })
+                .collect();
             let conditions = match st.get("Condition") {
                 None => Vec::new(),
                 Some(c) => parse_conditions(c)?,
@@ -389,6 +450,15 @@ impl Policy {
         Ok(Policy { statements })
     }
 
+    /// A bucket policy that denies everything except managing the bucket policy itself (used
+    /// when a stored policy can no longer be parsed, so access fails closed).
+    pub fn lockdown(bucket: &str) -> Policy {
+        let doc = format!(
+            r#"{{"Statement":{{"Effect":"Deny","Principal":"*","NotAction":["s3:GetBucketPolicy","s3:PutBucketPolicy","s3:DeleteBucketPolicy"],"Resource":["arn:aws:s3:::{bucket}","arn:aws:s3:::{bucket}/*"]}}}}"#
+        );
+        Policy::parse(&doc, Kind::Bucket, Some(bucket)).expect("lockdown policy is valid")
+    }
+
     /// Evaluate for one request: `action` like `s3:GetObject`, `resource` an S3 ARN.
     pub fn evaluate(&self, action: &str, resource: &str, ctx: &Ctx) -> Decision {
         let mut allowed = false;
@@ -404,11 +474,19 @@ impl Policy {
         if allowed { Decision::Allow } else { Decision::NotApplicable }
     }
 
-    /// Whether any statement grants access to everyone without conditions.
+    /// Whether any statement grants access to everyone: `Principal: "*"` (or a `NotPrincipal`,
+    /// which includes anonymous callers) without a condition that pins down who or where the
+    /// caller is.
     pub fn is_public(&self) -> bool {
-        self.statements
-            .iter()
-            .any(|s| s.allow && !s.not_principal && matches!(s.principals, Some(Principals::Anyone)) && s.conditions.is_empty())
+        self.statements.iter().any(|s| {
+            let everyone = match (&s.principals, s.not_principal) {
+                (Some(Principals::Anyone), false) => true,
+                // NotPrincipal "*" excludes everyone; any other NotPrincipal includes anonymous.
+                (Some(Principals::Users(_)), true) => true,
+                _ => false,
+            };
+            s.allow && everyone && !s.conditions.iter().any(Condition::restricts_caller)
+        })
     }
 }
 
@@ -454,7 +532,15 @@ fn parse_conditions(c: &Json) -> S3Result<Vec<Condition>> {
         let op = Op::parse(base).ok_or_else(|| malformed(format!("Unknown condition operator {name}")))?;
         let Json::Obj(keys) = body else { return Err(malformed(format!("Invalid condition block {name}"))) };
         for (key, vals) in keys {
+            if !KNOWN_KEYS.contains(&key.to_ascii_lowercase().as_str()) {
+                return Err(malformed(format!("Unsupported condition key {key}")));
+            }
             let values = strings(vals).filter(|v| !v.is_empty()).ok_or_else(|| malformed(format!("Invalid values for {key}")))?;
+            if matches!(op, Op::IpAddress | Op::NotIpAddress)
+                && let Some(bad) = values.iter().find(|v| !valid_cidr(v))
+            {
+                return Err(malformed(format!("Invalid IP address or CIDR block {bad}")));
+            }
             out.push(Condition { op, set, if_exists, key: key.clone(), values });
         }
     }
@@ -474,11 +560,15 @@ impl Statement {
                 return false;
             }
         }
-        if self.actions.iter().any(|a| glob(a, action, true)) == self.not_action {
+        let action = action.to_ascii_lowercase();
+        if self.actions.iter().any(|a| a.matches(&action)) == self.not_action {
             return false;
         }
         // A resource with an unresolvable variable matches nothing.
-        let res_hit = self.resources.iter().any(|r| ctx.expand(r).is_some_and(|r| glob(&r, resource, false)));
+        let res_hit = self.resources.iter().any(|r| match r {
+            ResourcePattern::Fixed(p) => p.matches(resource),
+            ResourcePattern::Templated(t) => ctx.expand_pattern(t).is_some_and(|p| p.matches(resource)),
+        });
         if res_hit == self.not_resource {
             return false;
         }
@@ -487,6 +577,15 @@ impl Statement {
 }
 
 impl Condition {
+    /// Conditions that limit access to specific callers or networks.
+    fn restricts_caller(&self) -> bool {
+        let key = self.key.to_ascii_lowercase();
+        !self.op.negated()
+            && !self.if_exists
+            && self.op != Op::Null
+            && matches!(key.as_str(), "aws:sourceip" | "aws:username" | "aws:userid")
+    }
+
     fn holds(&self, ctx: &Ctx) -> bool {
         let actual = ctx.value(&self.key);
         if self.op == Op::Null {
@@ -497,8 +596,13 @@ impl Condition {
         let Some(actual) = actual else {
             return self.if_exists || self.op.negated() || self.set == SetQualifier::ForAllValues;
         };
-        let expected: Vec<String> = self.values.iter().filter_map(|v| ctx.expand(v)).collect();
-        let matches_one = |a: &str| expected.iter().any(|e| self.op.test(a, e));
+        let like = matches!(self.op, Op::StringLike | Op::StringNotLike);
+        let expected: Vec<(String, Option<Pattern>)> = self
+            .values
+            .iter()
+            .filter_map(|v| Some((ctx.expand_text(v)?, if like { Some(ctx.expand_pattern(v)?) } else { None })))
+            .collect();
+        let matches_one = |a: &str| expected.iter().any(|(e, p)| self.op.test(a, e, p.as_ref()));
         let hit = match self.set {
             SetQualifier::Single | SetQualifier::ForAnyValue => actual.iter().any(|a| matches_one(a)),
             SetQualifier::ForAllValues => actual.iter().all(|a| matches_one(a)),
@@ -643,6 +747,38 @@ mod tests {
             r#"{"Statement":{"Sid":"x","Effect":"Allow","Principal":"*","Action":"s3:*","Resource":"arn:aws:s3:::b*"}}"#,
             Kind::Bucket
         ));
+    }
+
+    #[test]
+    fn review_regressions() {
+        let h = HeaderMap::new();
+        let c = ctx(Some("u"), "1.2.3.4", &h, &[]);
+        let bucket = |doc: &str| Policy::parse(doc, Kind::Bucket, Some("b"));
+        // Unknown condition keys and malformed CIDRs are rejected, not silently ignored.
+        assert!(bucket(r#"{"Statement":{"Effect":"Deny","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::b/*","Condition":{"StringEquals":{"s3:ExistingObjectTag/class":"secret"}}}}"#).is_err());
+        assert!(bucket(r#"{"Statement":{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::b/*","Condition":{"IpAddress":{"aws:SourceIp":"10.0.0.0/abc"}}}}"#).is_err());
+        assert!(bucket(r#"{"Statement":{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::b/*","Condition":{"IpAddress":{"aws:SourceIp":"10.0.0.0/33"}}}}"#).is_err());
+        // ${*} is a literal '*', and substituted values never act as wildcards.
+        let p = bucket(
+            r#"{"Statement":{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::b/public-${*}"}}"#,
+        )
+        .unwrap();
+        assert_eq!(p.evaluate("s3:GetObject", "arn:aws:s3:::b/public-secret", &c), Decision::NotApplicable);
+        assert_eq!(p.evaluate("s3:GetObject", "arn:aws:s3:::b/public-*", &c), Decision::Allow);
+        let star = ctx(Some("*"), "1.2.3.4", &h, &[]);
+        let home = bucket(r#"{"Statement":{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::b/${aws:username}/*"}}"#).unwrap();
+        assert_eq!(home.evaluate("s3:GetObject", "arn:aws:s3:::b/alice/x", &star), Decision::NotApplicable);
+        // PolicyStatus: NotPrincipal Allow and non-restricting conditions are public.
+        let np = bucket(r#"{"Statement":{"Effect":"Allow","NotPrincipal":{"AWS":"bob"},"Action":"s3:GetObject","Resource":"arn:aws:s3:::b/*"}}"#).unwrap();
+        assert!(np.is_public());
+        let tls = bucket(r#"{"Statement":{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::b/*","Condition":{"Bool":{"aws:SecureTransport":"false"}}}}"#).unwrap();
+        assert!(tls.is_public());
+        let ip = bucket(r#"{"Statement":{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::b/*","Condition":{"IpAddress":{"aws:SourceIp":"10.0.0.0/8"}}}}"#).unwrap();
+        assert!(!ip.is_public());
+        // The lockdown policy (for unreadable stored policies) only allows policy management.
+        let lock = Policy::lockdown("b");
+        assert_eq!(lock.evaluate("s3:GetObject", "arn:aws:s3:::b/x", &c), Decision::Deny);
+        assert_eq!(lock.evaluate("s3:PutBucketPolicy", "arn:aws:s3:::b", &c), Decision::NotApplicable);
     }
 
     #[test]

@@ -179,35 +179,132 @@ impl JsonParser<'_> {
 
 // ------------------------------------------------------------------ wildcard matching
 
+/// A compiled wildcard pattern: `*` matches any run of characters, `?` exactly one.
+///
+/// Matching splits the pattern at `*` and finds each literal segment with a substring search,
+/// so even hostile patterns (from bucket policies) cost roughly linear time. Text added as a
+/// literal piece (e.g. a policy variable's value) never acts as a wildcard.
+#[derive(Debug, Clone)]
+pub struct Pattern {
+    segs: Vec<Seg>,
+    lead: bool,
+    trail: bool,
+    /// The pattern consists of `*`s only (matches everything).
+    any: bool,
+}
+
+#[derive(Debug, Clone)]
+struct Seg {
+    /// `None` is `?`.
+    chars: Vec<Option<char>>,
+    /// The segment as a string when it has no `?` (searched with `str::find`).
+    plain: Option<String>,
+}
+
+impl Pattern {
+    pub fn new(p: &str) -> Pattern {
+        Pattern::from_pieces(&[(p, false)])
+    }
+
+    /// Build from pieces of (text, literal): literal pieces match only themselves.
+    pub fn from_pieces(pieces: &[(&str, bool)]) -> Pattern {
+        let (mut segs, mut cur, mut lead, mut trail, mut stars, mut empty) = (Vec::new(), Vec::new(), false, false, 0usize, true);
+        let flush = |cur: &mut Vec<Option<char>>, segs: &mut Vec<Seg>| {
+            if !cur.is_empty() {
+                let plain = cur.iter().copied().collect::<Option<String>>();
+                segs.push(Seg { chars: std::mem::take(cur), plain });
+            }
+        };
+        for (text, literal) in pieces {
+            for c in text.chars() {
+                if !*literal && c == '*' {
+                    if empty {
+                        lead = true;
+                    }
+                    flush(&mut cur, &mut segs);
+                    trail = true;
+                    stars += 1;
+                } else {
+                    cur.push(if !*literal && c == '?' { None } else { Some(c) });
+                    trail = false;
+                }
+                empty = false;
+            }
+        }
+        flush(&mut cur, &mut segs);
+        Pattern { any: stars > 0 && segs.is_empty(), segs, lead, trail }
+    }
+
+    pub fn matches(&self, s: &str) -> bool {
+        if self.any {
+            return true;
+        }
+        if self.segs.is_empty() {
+            return s.is_empty();
+        }
+        let n = self.segs.len();
+        let mut pos = 0;
+        for (i, seg) in self.segs.iter().enumerate() {
+            let (first, last) = (i == 0, i == n - 1);
+            if first && !self.lead {
+                let Some(end) = seg.match_at(s, 0) else { return false };
+                if last && !self.trail {
+                    return end == s.len();
+                }
+                pos = end;
+                continue;
+            }
+            if last && !self.trail {
+                // Must end exactly at the end of the input.
+                let Some(start) = nth_char_from_end(s, seg.chars.len()) else { return false };
+                return start >= pos && seg.match_at(s, start) == Some(s.len());
+            }
+            let Some(end) = seg.find(s, pos) else { return false };
+            pos = end;
+        }
+        true
+    }
+}
+
+impl Seg {
+    /// End of a match starting at byte `pos`.
+    fn match_at(&self, s: &str, pos: usize) -> Option<usize> {
+        let mut it = s[pos..].char_indices();
+        let mut end = pos;
+        for want in &self.chars {
+            let (i, c) = it.next()?;
+            if want.is_some_and(|w| w != c) {
+                return None;
+            }
+            end = pos + i + c.len_utf8();
+        }
+        Some(end)
+    }
+
+    /// End of the leftmost match at or after byte `from`.
+    fn find(&self, s: &str, from: usize) -> Option<usize> {
+        if let Some(p) = &self.plain {
+            return s[from..].find(p.as_str()).map(|i| from + i + p.len());
+        }
+        s[from..].char_indices().find_map(|(i, _)| self.match_at(s, from + i))
+    }
+}
+
+/// Byte index where the last `n` characters of `s` start.
+fn nth_char_from_end(s: &str, n: usize) -> Option<usize> {
+    if n == 0 {
+        return Some(s.len());
+    }
+    s.char_indices().rev().nth(n - 1).map(|(i, _)| i)
+}
+
 /// Glob match supporting `*` (any run) and `?` (any single char).
 pub fn glob(pattern: &str, s: &str, case_insensitive: bool) -> bool {
-    let (p, t): (Vec<char>, Vec<char>) = if case_insensitive {
-        (pattern.to_lowercase().chars().collect(), s.to_lowercase().chars().collect())
+    if case_insensitive {
+        Pattern::new(&pattern.to_lowercase()).matches(&s.to_lowercase())
     } else {
-        (pattern.chars().collect(), s.chars().collect())
-    };
-    let (mut pi, mut ti) = (0, 0);
-    let (mut star, mut mark) = (None, 0);
-    while ti < t.len() {
-        if pi < p.len() && (p[pi] == '?' || p[pi] == t[ti]) {
-            pi += 1;
-            ti += 1;
-        } else if pi < p.len() && p[pi] == '*' {
-            star = Some(pi);
-            mark = ti;
-            pi += 1;
-        } else if let Some(sp) = star {
-            pi = sp + 1;
-            mark += 1;
-            ti = mark;
-        } else {
-            return false;
-        }
+        Pattern::new(pattern).matches(s)
     }
-    while pi < p.len() && p[pi] == '*' {
-        pi += 1;
-    }
-    pi == p.len()
 }
 
 // ------------------------------------------------------------------ CORS
@@ -437,6 +534,22 @@ mod tests {
         assert!(glob("a?c", "abc", false));
         assert!(!glob("a?c", "abbc", false));
         assert!(glob("*", "", false));
+        assert!(glob("", "", false) && !glob("", "a", false));
+        assert!(glob("a*b*c", "aXbYbZc", false) && !glob("a*b*c", "aXbYbZ", false));
+        assert!(glob("*ab", "aab", false) && glob("ab*ab", "abab", false) && !glob("ab*ab", "aba", false));
+        assert!(glob("*?", "x", false) && !glob("*?", "", false) && glob("?*?", "ü✓", false));
+        assert!(glob("**a**", "xxaxx", false) && glob("é*", "éclair", false));
+        // Literal pieces never act as wildcards.
+        let p = Pattern::from_pieces(&[("files/", false), ("*", true), ("/*", false)]);
+        assert!(p.matches("files/*/x") && !p.matches("files/any/x"));
+        // Pathological patterns stay fast.
+        let evil = format!("*{}b", "a".repeat(500));
+        let input = "a".repeat(5000);
+        let t = std::time::Instant::now();
+        for _ in 0..1000 {
+            assert!(!glob(&evil, &input, false));
+        }
+        assert!(t.elapsed() < std::time::Duration::from_secs(2), "{:?}", t.elapsed());
     }
 
     #[test]

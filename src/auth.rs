@@ -121,6 +121,9 @@ pub struct Auth {
     /// Replaced as a whole on reload; requests keep the credential they authenticated with.
     creds: RwLock<Arc<HashMap<String, Arc<Credential>>>>,
     key_cache: Mutex<HashMap<String, [u8; 32]>>,
+    /// Bumped on every reload and part of the signing-key cache key, so a key derived from an
+    /// old secret by a request racing the reload is never served afterwards.
+    generation: std::sync::atomic::AtomicU64,
 }
 
 /// Whether a request carries any authentication (header or presigned query).
@@ -172,7 +175,11 @@ pub fn payload_mode(parts: &Parts) -> S3Result<Payload> {
 
 impl Auth {
     pub fn new(creds: Vec<Credential>) -> Self {
-        let auth = Auth { creds: RwLock::new(Arc::new(HashMap::new())), key_cache: Mutex::new(HashMap::new()) };
+        let auth = Auth {
+            creds: RwLock::new(Arc::new(HashMap::new())),
+            key_cache: Mutex::new(HashMap::new()),
+            generation: std::sync::atomic::AtomicU64::new(0),
+        };
         auth.replace(creds);
         auth
     }
@@ -181,6 +188,7 @@ impl Auth {
     pub fn replace(&self, creds: Vec<Credential>) {
         let map = creds.into_iter().map(|c| (c.access_key.clone(), Arc::new(c))).collect();
         *self.creds.write().unwrap() = Arc::new(map);
+        self.generation.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         self.key_cache.lock().unwrap().clear();
     }
 
@@ -196,9 +204,10 @@ impl Auth {
     }
 
     fn signing_key(&self, access_key: &str, date: &str, region: &str, service: &str) -> S3Result<[u8; 32]> {
+        let generation = self.generation.load(std::sync::atomic::Ordering::SeqCst);
         let cred = self.credential(access_key)?;
         let secret = &cred.secret;
-        let cache_key = format!("{access_key}/{date}/{region}/{service}");
+        let cache_key = format!("{generation}/{access_key}/{date}/{region}/{service}");
         if let Some(k) = self.key_cache.lock().unwrap().get(&cache_key) {
             return Ok(*k);
         }

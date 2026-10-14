@@ -119,7 +119,8 @@ alice:al1c3:policy=policies/home.json  # only what the IAM-style policy allows
 A key restricted to some buckets only sees those buckets in ListBuckets. It cannot create other
 buckets, cannot copy from other buckets, and cannot sign form uploads to other buckets. Send the
 server `SIGHUP` to reload the credentials file and policies without a restart. If the new file is
-invalid, the current keys stay in place.
+invalid, the server logs `RELOAD FAILED` and keeps the previous keys, including any you meant to
+remove. A valid but empty file revokes every key in it.
 
 **Per-key policies** use IAM's JSON format. Paths are relative to the credentials file. For example,
 this policy gives every key using it a private home prefix:
@@ -160,7 +161,9 @@ Evaluation follows AWS:
 1. An explicit `Deny` in the key's policy or the bucket policy always wins, even for full-access keys.
 2. Otherwise a key with a policy needs an `Allow` from its own policy or from the bucket policy.
 3. Keys without a policy are allowed, within their `ro` and bucket limits.
-4. Anonymous callers need an ACL grant or an `Allow` in the bucket policy.
+4. Anonymous callers need an ACL grant or an `Allow` in the bucket policy, and only for object
+   operations and listings: managing the bucket itself (its policy, ACL, configuration, creating or
+   deleting it) always needs a key, as on S3.
 
 Every request is checked against its IAM action, such as `s3:GetObject`, `s3:GetObjectVersion`,
 `s3:PutBucketPolicy` or `s3:ListBucketVersions`. Some operations need more than one action:
@@ -181,8 +184,14 @@ Supported policy elements:
   `s3:x-amz-server-side-encryption`, `s3:x-amz-copy-source`, `s3:x-amz-metadata-directive`,
   `s3:object-lock-*` and `s3:RequestObjectTagKeys`.
 - Policy variables such as `${aws:username}` work in resources and condition values.
-- Unknown operators are rejected with `MalformedPolicy`, so a policy never silently means less
-  than it says.
+- Unknown operators and condition keys, and malformed CIDR blocks, are rejected with
+  `MalformedPolicy`, so a policy never silently means less than it says. If a stored policy stops
+  parsing (e.g. after an upgrade), the bucket fails closed: everything except managing the policy
+  is denied until it is replaced.
+
+Requests that name more than one subresource (such as `?versions&acl`) are rejected, as are
+methods a subresource doesn't support. Every request maps to exactly one operation, which decides
+both the permission that is checked and the code that runs.
 
 Behind a reverse proxy (Railway, Fly, nginx), pass `--behind-proxy` so `aws:SourceIp` and
 `aws:SecureTransport` use the client's address and scheme from the proxy's `X-Forwarded-For`

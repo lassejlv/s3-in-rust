@@ -1119,6 +1119,9 @@ def t_user_policies():
         expect_error("AccessDenied", lambda: u.create_bucket(Bucket="policy-new-bucket"))
         expect_error("AccessDenied", lambda: u.get_bucket_versioning(Bucket=home))
         assert any(b["Name"] == home for b in u.list_buckets()["Buckets"])
+        # Tags / legal holds need their own permission, also through odd query strings.
+        expect_error("AccessDenied", lambda: u.put_object(Bucket=home, Key=f"{ak}/t.txt", Body=b"t", Tagging="a=b"))
+        assert u._endpoint.http_session.send(_signed_request(u, "PUT", f"/{home}/{ak}/t.txt?partNumber=1").prepare()).status_code == 400
         # The copy source needs read access too.
         expect_error("AccessDenied", lambda: u.copy_object(Bucket=home, Key=f"{ak}/stolen", CopySource={"Bucket": home, "Key": "bob/secret.txt"}))
         # DeleteObjects authorizes each key on its own.
@@ -1157,6 +1160,57 @@ def t_user_policies():
             for o in s3.list_objects_v2(Bucket=b).get("Contents", []):
                 s3.delete_object(Bucket=b, Key=o["Key"])
             s3.delete_bucket(Bucket=b)
+
+
+def t_authz_regressions():
+    """Requests that once authorized one action but ran another."""
+    if not RO_AK:
+        print("        (skipped: S3RS_RO_ACCESS_KEY not set)")
+        return
+    ro = boto3.client("s3", endpoint_url=ENDPOINT, aws_access_key_id=RO_AK, aws_secret_access_key=RO_SK, region_name="us-east-1",
+                      config=Config(s3={"addressing_style": "path"}, retries={"max_attempts": 1}))
+    signed = lambda c, method, path: c._endpoint.http_session.send(  # noqa: E731
+        _signed_request(c, method, path).prepare())
+    rb = B + "-authz"
+    # A read-only key can't create or delete buckets through read-only subresources.
+    for q in ("location", "uploads", "versions"):
+        assert signed(ro, "PUT", f"/{rb}?{q}").status_code in (403, 405)
+    assert rb not in [b["Name"] for b in s3.list_buckets()["Buckets"]]
+    s3.create_bucket(Bucket=rb)
+    for q in ("location", "uploads", "versions", "versioning", "acl"):
+        assert signed(ro, "DELETE", f"/{rb}?{q}").status_code in (403, 405), q
+        assert signed(s3, "DELETE", f"/{rb}?{q}").status_code == 405, q
+    assert rb in [b["Name"] for b in s3.list_buckets()["Buckets"]]
+    # Anonymous callers on a public bucket can't delete it either.
+    s3.put_bucket_acl(Bucket=rb, ACL="public-read-write")
+    assert http("DELETE", f"/{rb}?location")[0] in (403, 405)
+    assert http("DELETE", f"/{rb}")[0] == 403
+    # Ambiguous requests are refused instead of being authorized as one thing and run as another.
+    assert http("GET", f"/{rb}?versions&acl")[0] == 400
+    s3.put_object(Bucket=rb, Key="k", Body=b"x", Metadata={"owner": "ceo"})
+    assert http("HEAD", f"/{rb}/k?acl")[0] == 405
+    assert signed(s3, "PUT", f"/{rb}/k?partNumber=1").status_code == 400
+    assert signed(s3, "PUT", f"/{rb}/k?uploadId=x").status_code == 400
+    # Even a policy granting s3:* never lets anonymous callers manage the bucket.
+    s3.put_bucket_acl(Bucket=rb, ACL="private")
+    s3.put_bucket_policy(Bucket=rb, Policy=json.dumps({"Statement": [{"Effect": "Allow", "Principal": "*", "Action": "s3:*",
+                                                                      "Resource": [f"arn:aws:s3:::{rb}", f"arn:aws:s3:::{rb}/*"]}]}))
+    assert http("GET", f"/{rb}/k")[0] == 200
+    assert http("PUT", f"/{rb}?policy", data=b'{"Statement":[]}')[0] == 403
+    assert http("GET", f"/{rb}?policy")[0] == 403
+    assert http("PUT", f"/{rb}?acl", headers={"x-amz-acl": "public-read-write"})[0] == 403
+    s3.delete_bucket_policy(Bucket=rb)
+    s3.delete_object(Bucket=rb, Key="k")
+    s3.delete_bucket(Bucket=rb)
+
+
+def _signed_request(c, method, path):
+    """A botocore-signed raw request (for URLs boto3 has no operation for)."""
+    from botocore.auth import S3SigV4Auth
+    from botocore.awsrequest import AWSRequest
+    req = AWSRequest(method=method, url=f"{ENDPOINT}{path}", data=b"")
+    S3SigV4Auth(c._request_signer._credentials.get_frozen_credentials(), "s3", "us-east-1").add_auth(req)
+    return req
 
 
 def t_overwrite():

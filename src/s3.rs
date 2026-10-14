@@ -65,6 +65,7 @@ struct Req {
     query: Vec<(String, String)>,
     payload: Payload,
     body: BodyStream,
+    principal: Principal,
 }
 
 impl Req {
@@ -597,13 +598,18 @@ impl Server {
         };
         let query = parse_query(raw_query);
         let body = BodyStream::new(body, &mut payload);
-        let mut r = Req { parts, query, payload, body };
+        let mut r = Req { parts, query, payload, body, principal: principal.clone() };
         let m = r.parts.method.clone();
-        match principal {
-            Principal::Everyone | Principal::User { read_only: false } => {}
-            Principal::User { read_only: true } => {
-                if !matches!(m, Method::GET | Method::HEAD) {
+        match &principal {
+            Principal::Everyone => {}
+            Principal::User(c) => {
+                if c.read_only && !matches!(m, Method::GET | Method::HEAD) {
                     return Err(err::AccessDenied().with_message("This access key is read-only"));
+                }
+                if let Some(b) = &bucket
+                    && !c.can_access(b)
+                {
+                    return Err(err::AccessDenied().with_message("This access key may not use this bucket"));
                 }
             }
             Principal::Anonymous => self.authorize_anonymous(&r, bucket.as_deref(), key.as_deref())?,
@@ -611,7 +617,7 @@ impl Server {
 
         let Some(bucket) = bucket else {
             return match m {
-                Method::GET => self.list_buckets(),
+                Method::GET => self.list_buckets(&r.principal),
                 _ => Err(err::MethodNotAllowed()),
             };
         };
@@ -922,10 +928,10 @@ impl Server {
 
     // -------------------------------------------------------------- listing
 
-    fn list_buckets(&self) -> S3Result<Resp> {
+    fn list_buckets(&self, principal: &Principal) -> S3Result<Resp> {
         let mut x = Xml::new("ListAllMyBucketsResult");
         x.owner("Owner").open("Buckets");
-        for (name, created) in self.store.list_buckets()? {
+        for (name, created) in self.store.list_buckets()?.into_iter().filter(|(n, _)| principal.can_access(n)) {
             x.open("Bucket")
                 .elem("Name", &name)
                 .elem("CreationDate", iso8601(created))
@@ -1429,6 +1435,9 @@ impl Server {
         match path.split_once('/') {
             Some((b, k)) if !b.is_empty() && !k.is_empty() => {
                 check_key(k)?;
+                if !r.principal.can_access(b) {
+                    return Err(err::AccessDenied().with_message("This access key may not use the copy source bucket"));
+                }
                 Ok((b.to_string(), k.to_string(), version))
             }
             _ => {
@@ -1665,10 +1674,14 @@ impl Server {
 
         let range = match f.get("policy") {
             Some(policy) => {
-                if let Some(a) = &self.auth
-                    && a.verify_post_policy(f, policy)? == (Principal::User { read_only: true })
-                {
-                    return Err(err::AccessDenied().with_message("This access key is read-only"));
+                if let Some(a) = &self.auth {
+                    let p = a.verify_post_policy(f, policy)?;
+                    if p.read_only() {
+                        return Err(err::AccessDenied().with_message("This access key is read-only"));
+                    }
+                    if !p.can_access(bucket) {
+                        return Err(err::AccessDenied().with_message("This access key may not use this bucket"));
+                    }
                 }
                 crate::post::PostPolicy::parse(policy)?.check(f, bucket)?
             }

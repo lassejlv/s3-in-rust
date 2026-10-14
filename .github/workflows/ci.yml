@@ -40,7 +40,7 @@ jobs:
       - run: cargo build --release
       - name: Start s3rs
         run: |
-          printf 'rokey:rosecret:ro\n' > /tmp/creds
+          printf 'rokey:rosecret:ro\nscoped:scopedsecret:rw:scoped-*,shared-scope\n' > /tmp/creds
           # Fast lifecycle sweeps (1s) with 2-second "days" so expiration can be tested.
           S3RS_LIFECYCLE_DAY_SECS=2 ./target/release/s3rs -d /tmp/s3rs-data -l 127.0.0.1:9000 \
             --access-key testkey --secret-key testsecret --credentials-file /tmp/creds \
@@ -50,6 +50,8 @@ jobs:
         env:
           S3RS_RO_ACCESS_KEY: rokey
           S3RS_RO_SECRET_KEY: rosecret
+          S3RS_SCOPED_ACCESS_KEY: scoped
+          S3RS_SCOPED_SECRET_KEY: scopedsecret
           S3RS_FAST_LIFECYCLE: "1"
           S3RS_ENCRYPTION: "1"
           S3RS_DATA_DIR: /tmp/s3rs-data

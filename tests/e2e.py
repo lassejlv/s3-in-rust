@@ -809,6 +809,32 @@ def t_encryption():
     s3.delete_bucket(Bucket=eb)
 
 
+def t_scoped_key():
+    # Needs a credential `scoped:scopedsecret:rw:scoped-*,shared-scope` (see --credentials-file).
+    ak, sk = os.environ.get("S3RS_SCOPED_ACCESS_KEY"), os.environ.get("S3RS_SCOPED_SECRET_KEY")
+    if not ak:
+        print("        (skipped: S3RS_SCOPED_ACCESS_KEY not set)")
+        return
+    sc = boto3.client("s3", endpoint_url=ENDPOINT, aws_access_key_id=ak, aws_secret_access_key=sk, region_name="us-east-1",
+                      config=Config(retries={"max_attempts": 1}, s3={"addressing_style": "path"}))
+    mine = "scoped-" + uuid.uuid4().hex[:8]
+    sc.create_bucket(Bucket=mine)
+    sc.put_object(Bucket=mine, Key="k", Body=b"mine")
+    assert sc.get_object(Bucket=mine, Key="k")["Body"].read() == b"mine"
+    names = [b["Name"] for b in sc.list_buckets()["Buckets"]]
+    assert mine in names and B not in names, names
+    expect_error("AccessDenied", lambda: sc.create_bucket(Bucket="other-" + uuid.uuid4().hex[:8]))
+    expect_error("AccessDenied", lambda: sc.get_object(Bucket=B, Key="hello.txt"))
+    expect_error("AccessDenied", lambda: sc.list_objects_v2(Bucket=B))
+    expect_error("AccessDenied", lambda: sc.copy_object(Bucket=mine, Key="stolen", CopySource={"Bucket": B, "Key": "hello.txt"}))
+    post = sc.generate_presigned_post(B, "x", ExpiresIn=60)
+    assert _form_post(post["url"], post["fields"], b"x")[0] == 403
+    # The full-access key still sees everything.
+    assert mine in [b["Name"] for b in s3.list_buckets()["Buckets"]]
+    sc.delete_object(Bucket=mine, Key="k")
+    sc.delete_bucket(Bucket=mine)
+
+
 def t_overwrite():
     s3.put_object(Bucket=B, Key="ow", Body=b"x" * 300_000)
     s3.put_object(Bucket=B, Key="ow", Body=b"small")

@@ -6,7 +6,7 @@ use hmac::{KeyInit, Mac};
 use hyper::http::request::Parts;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 type HmacSha256 = hmac::Hmac<Sha256>;
 
@@ -79,25 +79,47 @@ impl ChunkSigner {
     }
 }
 
-/// One access key: its secret and whether it may only read.
+/// One access key: its secret, whether it may only read, and which buckets it may use.
+#[derive(Debug, PartialEq, Eq)]
 pub struct Credential {
+    pub access_key: String,
     pub secret: String,
     pub read_only: bool,
+    /// Bucket name patterns (`*` wildcards) this key is limited to; `None` = all buckets.
+    pub buckets: Option<Vec<String>>,
+}
+
+impl Credential {
+    pub fn can_access(&self, bucket: &str) -> bool {
+        self.buckets.as_ref().is_none_or(|pats| pats.iter().any(|p| crate::access::glob(p, bucket, false)))
+    }
 }
 
 /// Who made a request.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Principal {
     Anonymous,
-    User {
-        read_only: bool,
-    },
+    User(Arc<Credential>),
     /// Authentication is disabled server-wide (`--anonymous`).
     Everyone,
 }
 
+impl Principal {
+    /// Whether this caller may use `bucket` at all (anonymous access is decided separately).
+    pub fn can_access(&self, bucket: &str) -> bool {
+        match self {
+            Principal::User(c) => c.can_access(bucket),
+            _ => true,
+        }
+    }
+
+    pub fn read_only(&self) -> bool {
+        matches!(self, Principal::User(c) if c.read_only)
+    }
+}
+
 pub struct Auth {
-    creds: HashMap<String, Credential>,
+    creds: HashMap<String, Arc<Credential>>,
     key_cache: Mutex<HashMap<String, [u8; 32]>>,
 }
 
@@ -149,16 +171,20 @@ pub fn payload_mode(parts: &Parts) -> S3Result<Payload> {
 }
 
 impl Auth {
-    pub fn new(creds: HashMap<String, Credential>) -> Self {
+    pub fn new(creds: Vec<Credential>) -> Self {
+        let creds = creds.into_iter().map(|c| (c.access_key.clone(), Arc::new(c))).collect();
         Auth { creds, key_cache: Mutex::new(HashMap::new()) }
     }
 
     fn credential(&self, access_key: &str) -> S3Result<&Credential> {
-        self.creds.get(access_key).ok_or_else(err::InvalidAccessKeyId)
+        self.creds.get(access_key).map(|c| c.as_ref()).ok_or_else(err::InvalidAccessKeyId)
     }
 
     fn principal(&self, access_key: &str) -> Principal {
-        Principal::User { read_only: self.creds.get(access_key).is_some_and(|c| c.read_only) }
+        match self.creds.get(access_key) {
+            Some(c) => Principal::User(c.clone()),
+            None => Principal::Anonymous,
+        }
     }
 
     fn signing_key(&self, access_key: &str, date: &str, region: &str, service: &str) -> S3Result<[u8; 32]> {
@@ -580,12 +606,24 @@ mod tests {
     use super::*;
 
     fn doc_auth() -> Auth {
-        let mut m = HashMap::new();
-        m.insert(
-            "AKIAIOSFODNN7EXAMPLE".to_string(),
-            Credential { secret: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".into(), read_only: false },
-        );
-        Auth::new(m)
+        Auth::new(vec![Credential {
+            access_key: "AKIAIOSFODNN7EXAMPLE".into(),
+            secret: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".into(),
+            read_only: false,
+            buckets: None,
+        }])
+    }
+
+    #[test]
+    fn bucket_scoping() {
+        let c = Credential {
+            access_key: "k".into(),
+            secret: "s".into(),
+            read_only: false,
+            buckets: Some(vec!["team-a-*".into(), "shared".into()]),
+        };
+        assert!(c.can_access("team-a-logs") && c.can_access("shared"));
+        assert!(!c.can_access("team-b") && !c.can_access("shared2"));
     }
 
     /// Example from the AWS SigV4 documentation ("GET Object" with a Range header).

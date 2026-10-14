@@ -18,7 +18,6 @@ mod xml;
 use hyper::service::service_fn;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto;
-use std::collections::HashMap;
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -42,7 +41,8 @@ OPTIONS (each also settable through the environment variable shown):
     -d, --data-dir <PATH>        Data directory                  [S3RS_DATA_DIR, default ./data]
         --access-key <KEY>       Access key id                   [S3RS_ACCESS_KEY]
         --secret-key <SECRET>    Secret access key               [S3RS_SECRET_KEY]
-        --credentials-file <P>   Extra keys, one `access_key:secret_key[:ro]` per line
+        --credentials-file <P>   Extra keys, one `access_key:secret_key[:ro|rw[:buckets]]` per
+                                 line; buckets is a comma-separated list of name patterns
                                                                  [S3RS_CREDENTIALS_FILE]
         --anonymous              Disable authentication (only for trusted networks)
         --cors-origins <LIST>    Comma-separated origins allowed by default for buckets
@@ -176,15 +176,16 @@ fn split_list(s: &str) -> Vec<String> {
     s.split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect()
 }
 
-/// Parse a credentials file: `access_key:secret_key[:ro|:rw]` per line, `#` comments.
-fn load_credentials(path: &std::path::Path, into: &mut HashMap<String, auth::Credential>) -> Result<(), String> {
+/// Parse a credentials file, one key per line (`#` starts a comment):
+/// `access_key:secret_key[:ro|rw[:bucket-pattern,bucket-pattern...]]`.
+fn load_credentials(path: &std::path::Path, into: &mut Vec<auth::Credential>) -> Result<(), String> {
     let text = std::fs::read_to_string(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
     for (n, line) in text.lines().enumerate() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        let mut f = line.splitn(3, ':');
+        let mut f = line.splitn(4, ':');
         let (Some(ak), Some(sk)) = (f.next(), f.next()) else {
             return Err(format!("{}:{}: expected access_key:secret_key[:ro]", path.display(), n + 1));
         };
@@ -197,7 +198,11 @@ fn load_credentials(path: &std::path::Path, into: &mut HashMap<String, auth::Cre
         if ak.is_empty() || sk.is_empty() {
             return Err(format!("{}:{}: empty access key or secret", path.display(), n + 1));
         }
-        into.insert(ak.to_string(), auth::Credential { secret: sk.to_string(), read_only });
+        let buckets = f.next().map(split_list).filter(|b| !b.is_empty());
+        if into.iter().any(|c| c.access_key == ak) {
+            return Err(format!("{}:{}: duplicate access key `{ak}`", path.display(), n + 1));
+        }
+        into.push(auth::Credential { access_key: ak.to_string(), secret: sk.to_string(), read_only, buckets });
     }
     Ok(())
 }
@@ -210,10 +215,10 @@ fn main() {
             std::process::exit(2);
         }
     };
-    let mut creds = HashMap::new();
+    let mut creds = Vec::new();
     match (&cfg.access_key, &cfg.secret_key) {
         (Some(a), Some(s)) => {
-            creds.insert(a.clone(), auth::Credential { secret: s.clone(), read_only: false });
+            creds.push(auth::Credential { access_key: a.clone(), secret: s.clone(), read_only: false, buckets: None });
         }
         (None, None) => {}
         _ => {

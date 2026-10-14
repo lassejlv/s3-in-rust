@@ -50,7 +50,7 @@ Each flag can also be set with the environment variable shown.
 | `-d, --data-dir` | `S3RS_DATA_DIR` | `./data` | Storage directory |
 | `--access-key` | `S3RS_ACCESS_KEY` | | Access key ID |
 | `--secret-key` | `S3RS_SECRET_KEY` | | Secret access key |
-| `--credentials-file` | `S3RS_CREDENTIALS_FILE` | | More keys, one `access_key:secret_key[:ro]` per line. `ro` keys can only read. |
+| `--credentials-file` | `S3RS_CREDENTIALS_FILE` | | More keys, one `access_key:secret_key[:ro\|rw[:bucket-patterns]]` per line (see [Access control](#access-control)) |
 | `--anonymous` | | off | Turns off authentication. Use it only on trusted networks. |
 | `--cors-origins` | `S3RS_CORS_ORIGINS` | | Comma-separated origins (e.g. `*`) allowed for buckets that have no CORS configuration of their own |
 | `--metrics-token` | `S3RS_METRICS_TOKEN` | | Requires `Authorization: Bearer <token>` on `/_metrics` |
@@ -77,8 +77,19 @@ crashes, the next start scans the store before serving and removes orphaned data
 
 ## Access control
 
-Authenticated requests have full access. Requests made with a `ro` key from `--credentials-file`
-can only read. ACLs and bucket policies control what **anonymous** requests may do:
+Authenticated keys have full access unless the credentials file restricts them:
+
+```text
+# access_key:secret_key[:ro|rw[:bucket-patterns]]
+admin:s3cr3t
+reporting:r3p0rt:ro                    # read-only, all buckets
+team-a:t34m4:rw:team-a-*,shared-assets # read-write, only matching buckets
+```
+
+A key restricted to some buckets only sees those buckets in ListBuckets. It cannot create other
+buckets, cannot copy from other buckets, and cannot sign form uploads to other buckets.
+
+ACLs and bucket policies control what **anonymous** requests may do:
 
 ```bash
 # Public read: anyone can GET objects and list the bucket
@@ -280,7 +291,8 @@ round-trip and the minio-go suite on every push.
 
 ## Limitations and notes
 
-- Keys are either read-write or read-only for every bucket. There are no per-user IAM policies.
+- Per-key permissions are limited to read-only or read-write, optionally for a set of buckets.
+  There are no per-user IAM policies.
 - Each object can be at most 5 GiB on a single PUT. A multipart upload can have up to 10,000 parts of
   5 GiB each, the same limits as S3.
 - Only one `s3rs` process can use a data directory at a time.

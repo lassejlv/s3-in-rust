@@ -1298,6 +1298,7 @@ impl Server {
         expect.encrypt = enc.as_ref().map(|(k, _)| k.clone());
         let body = std::mem::replace(&mut r.body, BodyStream::empty());
         let ing = io::ingest(&self.store, body, expect).await?;
+        let etag = etag_of(ing.md5, enc.as_ref().map(|(k, _)| k));
         let mut headers = stored_headers(&r.parts.headers);
         headers.extend(enc.map(|(_, h)| h).unwrap_or_default());
         self.metrics.add_bytes_in(ing.size);
@@ -1305,7 +1306,7 @@ impl Server {
         let meta = ObjectMeta {
             size: ing.size,
             mtime_ms: now_ms(),
-            etag: ing.etag(),
+            etag: etag.clone(),
             headers: headers.clone(),
             checksum: ing.checksum.clone(),
             storage,
@@ -1318,7 +1319,7 @@ impl Server {
         let out =
             self.store.submit_owning(Op::PutObject { bucket: bucket.into(), key: key.into(), meta, inline, cond }, files).await?;
         let mut resp = Resp::ok();
-        resp.set("etag", &ing.etag());
+        resp.set("etag", &etag);
         set_sse_headers(&mut resp, &headers);
         if let OpOut::Object(m) = &out {
             set_version_header(&mut resp, m);
@@ -1333,6 +1334,9 @@ impl Server {
         let h = &r.parts.headers;
         for attempt in 0..3 {
             let (meta, inline) = self.lookup(bucket, key, r.q("versionId").filter(|v| !v.is_empty()))?;
+            // SSE-C: the key is required before anything about the object (even its ETag via
+            // conditional headers) is revealed.
+            let key = self.read_key(&meta.headers, h, "x-amz-")?;
             let mut resp = Resp::ok();
             resp.set("etag", &meta.etag).set("last-modified", &http_date(meta.mtime_ms)).set("accept-ranges", "bytes");
             set_version_header(&mut resp, &meta);
@@ -1402,7 +1406,6 @@ impl Server {
                 }
             };
             resp.set("content-length", &len.to_string());
-            let key = self.read_key(&meta.headers, h, "x-amz-")?;
             if head {
                 return Ok(resp);
             }
@@ -1452,25 +1455,34 @@ impl Server {
         let dest_versioned = self.bucket_access(bucket)?.versioning == store::Versioning::Enabled;
         let replace = r.header("x-amz-metadata-directive").is_some_and(|d| d.eq_ignore_ascii_case("REPLACE"));
         let replace_tags = r.header("x-amz-tagging-directive").is_some_and(|d| d.eq_ignore_ascii_case("REPLACE"));
-        let dst_enc = self.write_encryption(&r.parts.headers, bucket, None)?;
-        let dst_key = dst_enc.as_ref().map(|(k, _)| k.clone());
+        let requested_enc = self.write_encryption(&r.parts.headers, bucket, None)?;
+        let explicit_enc = r.header(SSE).is_some() || r.header(SSE_C_ALG).is_some();
         let _ = r.body.read_all(MAX_XML_BODY).await?;
         for attempt in 0..3 {
             let (src, inline) = self.lookup(&sb, &sk, sv.as_deref())?;
-            check_copy_conditions(&r.parts.headers, &src)?;
             let src_key = self.read_key(&src.headers, &r.parts.headers, "x-amz-copy-source-")?;
+            check_copy_conditions(&r.parts.headers, &src)?;
+            // Copies of SSE-S3 objects stay encrypted unless the request chooses otherwise.
+            let dst_enc = match &requested_enc {
+                Some(e) => Some(e.clone()),
+                None if src_key.as_ref().is_some_and(|k| k.kind == KeyKind::Master) => {
+                    Some((self.master()?, vec![(SSE.to_string(), "AES256".to_string())]))
+                }
+                None => None,
+            };
+            let dst_key = dst_enc.as_ref().map(|(k, _)| k.clone());
             // Stored bytes can be shared only when they are readable with the destination's key.
             let same_key = match (&src_key, &dst_key) {
                 (None, None) => true,
                 (Some(a), Some(b)) => a.same(b),
                 _ => false,
             };
-            if sb == bucket && sk == key && !replace && sv.is_none() {
+            if sb == bucket && sk == key && !replace && sv.is_none() && !explicit_enc {
                 return Err(err::InvalidRequest().with_message(
                     "This copy request is illegal because it is trying to copy an object to itself without changing the object's metadata, storage class, website redirect location or encryption attributes.",
                 ));
             }
-            let (storage, files) = match &src.storage {
+            let (storage, files, new_md5) = match &src.storage {
                 // Re-encrypting, or versioned buckets (which keep small objects in files): write
                 // a new data file from the plaintext.
                 Storage::Inline(_) | Storage::Segments(_)
@@ -1484,12 +1496,12 @@ impl Server {
                     .await
                     .map_err(S3Error::internal)?;
                     match res {
-                        Ok((id, _)) => (Storage::Segments(vec![(id, size)]), vec![id]),
+                        Ok((id, md5)) => (Storage::Segments(vec![(id, size)]), vec![id], Some(md5)),
                         Err(e) if e.kind() == std::io::ErrorKind::NotFound && attempt < 2 => continue,
                         Err(e) => return Err(e.into()),
                     }
                 }
-                Storage::Inline(_) => (Storage::Inline(util::new_id()), vec![]),
+                Storage::Inline(_) => (Storage::Inline(util::new_id()), vec![], None),
                 Storage::Segments(segs) => {
                     let (st, segs) = (self.store.clone(), segs.clone());
                     match tokio::task::spawn_blocking(move || io::link_segments_blocking(&st, &segs))
@@ -1498,7 +1510,7 @@ impl Server {
                     {
                         Ok(new) => {
                             let files = new.iter().map(|(id, _)| *id).collect();
-                            (Storage::Segments(new), files)
+                            (Storage::Segments(new), files, None)
                         }
                         Err(e) if e.kind() == std::io::ErrorKind::NotFound && attempt < 2 => continue,
                         Err(e) => return Err(e.into()),
@@ -1511,7 +1523,11 @@ impl Server {
             let meta = ObjectMeta {
                 size: src.size,
                 mtime_ms: now_ms(),
-                etag: src.etag.clone(),
+                // Re-encrypted copies get an ETag for their own key (it differs for SSE-C).
+                etag: match new_md5 {
+                    Some(md5) => etag_of(md5, dst_key.as_ref()),
+                    None => src.etag.clone(),
+                },
                 headers,
                 checksum: src.checksum.clone(),
                 storage,
@@ -1527,7 +1543,11 @@ impl Server {
                 .submit_owning(Op::PutObject { bucket: bucket.into(), key: key.into(), meta, inline, cond }, files)
                 .await?;
             let mut x = Xml::new("CopyObjectResult");
-            x.elem("LastModified", iso8601(mtime)).elem("ETag", &src.etag);
+            let new_etag = match &out {
+                OpOut::Object(m) => m.etag.clone(),
+                _ => src.etag.clone(),
+            };
+            x.elem("LastModified", iso8601(mtime)).elem("ETag", &new_etag);
             if let Some((a, v)) = &src.checksum {
                 let tag = match a {
                     ChecksumAlgo::Crc32 => "ChecksumCRC32",
@@ -1582,15 +1602,18 @@ impl Server {
             return self.upload_part_copy(r, bucket, key, upload, part, part_key, &u.headers).await;
         }
         let mut expect = self.expect(r, MAX_PART_SIZE, false)?;
+        let expect_key = part_key.clone();
         expect.encrypt = part_key;
         let body = std::mem::replace(&mut r.body, BodyStream::empty());
         let ing = io::ingest(&self.store, body, expect).await?;
         self.metrics.add_bytes_in(ing.size);
         let Data::File(file) = ing.data else { return Err(S3Error::internal("part stored inline")) };
-        let meta = PartMeta { size: ing.size, md5: ing.md5, mtime_ms: now_ms(), file };
+        // For SSE-C uploads the part ETag is keyed (it must not reveal the plaintext MD5).
+        let part_digest = crypt::etag_digest(expect_key.as_ref(), ing.md5);
+        let meta = PartMeta { size: ing.size, md5: part_digest, mtime_ms: now_ms(), file };
         self.store.submit_owning(Op::PutPart { upload, bucket: bucket.into(), key: key.into(), part, meta }, vec![file]).await?;
         let mut resp = Resp::ok();
-        resp.set("etag", &format!("\"{}\"", util::hex(&ing.md5)));
+        resp.set("etag", &format!("\"{}\"", util::hex(&part_digest)));
         set_sse_headers(&mut resp, &u.headers);
         if let Some((a, v)) = &ing.checksum {
             resp.set(a.header(), v);
@@ -1613,6 +1636,7 @@ impl Server {
         let _ = r.body.read_all(MAX_XML_BODY).await?;
         for attempt in 0..3 {
             let (src, inline) = self.lookup(&sb, &sk, sv.as_deref())?;
+            let src_key = self.read_key(&src.headers, &r.parts.headers, "x-amz-copy-source-")?;
             check_copy_conditions(&r.parts.headers, &src)?;
             let (start, len) = match r.header("x-amz-copy-source-range") {
                 None => (0, src.size),
@@ -1631,7 +1655,6 @@ impl Server {
             if len > MAX_PART_SIZE {
                 return Err(err::EntityTooLarge());
             }
-            let src_key = self.read_key(&src.headers, &r.parts.headers, "x-amz-copy-source-")?;
             let (st, src2, dk) = (self.store.clone(), src.clone(), part_key.clone());
             let res = tokio::task::spawn_blocking(move || {
                 io::copy_range_blocking(&st, &src2, inline.as_ref(), start, len, src_key.as_ref(), dk.as_ref())
@@ -1643,6 +1666,7 @@ impl Server {
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound && attempt < 2 => continue,
                 Err(e) => return Err(e.into()),
             };
+            let md5 = crypt::etag_digest(part_key.as_ref(), md5);
             let meta = PartMeta { size: len, md5, mtime_ms: now_ms(), file };
             let mtime = meta.mtime_ms;
             self.store
@@ -1914,6 +1938,11 @@ type Encryption = Option<(WrapKey, Vec<(String, String)>)>;
 const SSE: &str = "x-amz-server-side-encryption";
 const SSE_C_ALG: &str = "x-amz-server-side-encryption-customer-algorithm";
 const SSE_C_MD5: &str = "x-amz-server-side-encryption-customer-key-md5";
+
+/// Quoted ETag for an object with this plaintext MD5 (keyed for SSE-C; see crypt::etag_digest).
+fn etag_of(md5: [u8; 16], key: Option<&WrapKey>) -> String {
+    format!("\"{}\"", util::hex(&crypt::etag_digest(key, md5)))
+}
 
 fn without_sse(h: &[(String, String)]) -> Vec<(String, String)> {
     h.iter().filter(|(k, _)| !k.starts_with(SSE)).cloned().collect()

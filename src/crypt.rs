@@ -238,6 +238,19 @@ pub fn decrypt_range(wrap: &WrapKey, blob: &[u8], start: u64, len: u64, total: u
     Ok(out)
 }
 
+/// The digest used as an object's ETag. SSE-C objects must not expose the plaintext MD5 to
+/// callers without the key (as on S3, their ETag is not the MD5), so it is keyed with the
+/// customer key. Plain and SSE-S3 objects keep the MD5, matching S3.
+pub fn etag_digest(key: Option<&WrapKey>, md5: [u8; 16]) -> [u8; 16] {
+    match key {
+        Some(k) if k.kind == KeyKind::Customer => {
+            let mac = crate::auth::hmac(&k.key, &[b"s3rs-etag:".as_slice(), &md5].concat());
+            mac[..16].try_into().unwrap()
+        }
+        _ => md5,
+    }
+}
+
 /// Parse a base64 256-bit key (and optionally check its base64 MD5), as SSE-C headers carry.
 pub fn parse_customer_key(key_b64: &str, md5_b64: Option<&str>) -> S3Result<[u8; 32]> {
     let key = crate::util::unbase64(key_b64)

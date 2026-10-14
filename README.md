@@ -155,8 +155,12 @@ How it works:
 - Data is encrypted in 64 KiB AES-256-GCM chunks. The last chunk is authenticated as last, so
   truncation, tampering and wrong keys are detected.
 - Range reads decrypt only the chunks they overlap.
-- ETags and checksums are computed on the plaintext, so clients see the same values as without
-  encryption.
+- Checksums are computed on the plaintext. Plain and SSE-S3 objects use the plaintext MD5 as
+  their ETag, as S3 does. SSE-C ETags (and part ETags) are keyed with the customer key, so
+  nobody without the key can learn or confirm the plaintext MD5. Requests on SSE-C objects need
+  the key before any condition (`If-Match` and so on) is evaluated.
+- Copying an SSE-S3 object keeps it encrypted unless the request asks for something else, and an
+  object's encryption can be changed in place by copying it onto itself.
 - Copies and UploadPartCopy decrypt with the source's key (`x-amz-copy-source-server-side-encryption-customer-*`
   for SSE-C sources) and re-encrypt for the destination. When the source and destination keys
   match, a copy just shares the stored bytes.
@@ -165,6 +169,11 @@ How it works:
 Costs on the benchmark machine: 1 MiB GETs run at about 2.4 GiB/s instead of 4.4 GiB/s, and
 small objects lose under 10%. **Keep the master key safe:** without it, SSE-S3 objects cannot be
 read. The key is not stored in the data directory.
+
+Threat model: encryption protects data at rest against someone who can read the disk or backups.
+Encrypted files are not bound to a particular object. Someone with *write* access to the data
+directory could swap or roll back whole files between objects encrypted under the same key, and
+the server would not notice.
 
 ## Versioning
 

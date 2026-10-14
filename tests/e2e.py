@@ -767,6 +767,14 @@ def t_encryption():
     expect_error("400", lambda: s3.head_object(Bucket=eb, Key="ssec/obj"))
     g = s3.get_object(Bucket=eb, Key="ssec/obj", **ck)
     assert g["Body"].read() == data and g["SSECustomerKeyMD5"]
+    # The ETag of an SSE-C object must not reveal the plaintext MD5, and conditional requests
+    # must not work without the key.
+    plain_md5 = '"%s"' % hashlib.md5(data).hexdigest()
+    assert g["ETag"] != plain_md5 and r["ETag"] == g["ETag"]
+    listed = {o["Key"]: o["ETag"] for o in s3.list_objects_v2(Bucket=eb, Prefix="ssec/")["Contents"]}
+    assert listed["ssec/obj"] != plain_md5
+    expect_error("400", lambda: s3.head_object(Bucket=eb, Key="ssec/obj", IfNoneMatch="*"))
+    expect_error("400", lambda: s3.head_object(Bucket=eb, Key="ssec/obj", IfMatch=plain_md5))
     assert s3.get_object(Bucket=eb, Key="ssec/obj", Range="bytes=70000-70009", **ck)["Body"].read() == data[70000:70010]
     assert s3.head_object(Bucket=eb, Key="ssec/obj", **ck)["ContentLength"] == len(data)
 
@@ -774,6 +782,7 @@ def t_encryption():
     uid = s3.create_multipart_upload(Bucket=eb, Key="ssec/mp", **ck)["UploadId"]
     p1 = os.urandom(5 * MB)
     e1 = s3.upload_part(Bucket=eb, Key="ssec/mp", UploadId=uid, PartNumber=1, Body=p1, **ck)["ETag"]
+    assert e1 != '"%s"' % hashlib.md5(p1).hexdigest()
     expect_error("InvalidRequest", lambda: s3.upload_part(Bucket=eb, Key="ssec/mp", UploadId=uid, PartNumber=2, Body=b"x"))
     e2 = s3.upload_part_copy(Bucket=eb, Key="ssec/mp", UploadId=uid, PartNumber=2, CopySource={"Bucket": eb, "Key": "sse/big"},
                              CopySourceRange="bytes=0-999", **ck)["CopyPartResult"]["ETag"]
@@ -795,6 +804,19 @@ def t_encryption():
     assert s3.get_object(Bucket=eb, Key="copy/ssec2", SSECustomerAlgorithm="AES256", SSECustomerKey=other)["Body"].read() == data
     s3.copy_object(Bucket=eb, Key="copy/sse-small", CopySource={"Bucket": eb, "Key": "sse/small"}, ServerSideEncryption="AES256")
     assert s3.get_object(Bucket=eb, Key="copy/sse-small")["Body"].read() == small
+    # Copying an SSE-S3 object without encryption headers keeps it encrypted (as S3 does today).
+    c = s3.copy_object(Bucket=eb, Key="copy/kept", CopySource={"Bucket": eb, "Key": "sse/big"})
+    assert c["ServerSideEncryption"] == "AES256"
+    assert s3.head_object(Bucket=eb, Key="copy/kept")["ServerSideEncryption"] == "AES256"
+    if data_dir:
+        assert not on_disk_contains(b"PLAINTEXT-MARKER-BIG")
+    # Changing an object's encryption in place is allowed.
+    s3.copy_object(Bucket=eb, Key="copy/plain", CopySource={"Bucket": eb, "Key": "copy/plain"}, ServerSideEncryption="AES256")
+    assert s3.head_object(Bucket=eb, Key="copy/plain")["ServerSideEncryption"] == "AES256"
+    assert s3.get_object(Bucket=eb, Key="copy/plain")["Body"].read() == data
+    # A copy that re-encrypts with SSE-C gets a keyed ETag, not the plaintext MD5.
+    c = s3.copy_object(Bucket=eb, Key="copy/to-ssec", CopySource={"Bucket": eb, "Key": "copy/plain"}, **ck)
+    assert c["CopyObjectResult"]["ETag"] != plain_md5
 
     # Form upload with SSE.
     post = s3.generate_presigned_post(eb, "form/enc", Fields={"x-amz-server-side-encryption": "AES256"},

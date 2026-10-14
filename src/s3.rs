@@ -73,6 +73,8 @@ pub struct Server {
     console: bool,
     behind_proxy: bool,
     pub events: Arc<events::Bus>,
+    /// Weak self-reference, for background tasks that must re-check permissions.
+    me: std::sync::OnceLock<std::sync::Weak<Server>>,
     req_counter: AtomicU64,
     rid_base: u64,
 }
@@ -365,9 +367,15 @@ impl Server {
             console: opts.console,
             behind_proxy: opts.behind_proxy,
             events: opts.events,
+            me: std::sync::OnceLock::new(),
             req_counter: AtomicU64::new(1),
             rid_base: util::new_id() as u64,
         }
+    }
+
+    /// Must be called once after the server is wrapped in an `Arc`.
+    pub fn set_self(self: &Arc<Self>) {
+        let _ = self.me.set(Arc::downgrade(self));
     }
 
     /// Access settings for a bucket (cached). Errors with NoSuchBucket.
@@ -1625,15 +1633,21 @@ impl Server {
         ev.size = m.size;
         ev.etag = m.etag.clone();
         ev.version = m.version.clone();
+        ev.sequencer = m.seq;
         self.events.emit(ev);
     }
 
     /// `requested` is the version id the client asked to delete, if any.
     fn notify_removed(&self, r: &Req, bucket: &str, key: &str, requested: Option<&str>, o: &store::DeleteOutcome) {
+        // Deleting a missing key or version succeeds but changes nothing: no event.
+        if !o.removed {
+            return;
+        }
         let marker_created = requested.is_none() && o.delete_marker;
         let name = if marker_created { "ObjectRemoved:DeleteMarkerCreated" } else { "ObjectRemoved:Delete" };
         let mut ev = self.event(&r.principal, r.client.ip, &r.rid, name, bucket, key);
         ev.version = if marker_created { o.version_id.clone().filter(|v| v != "null") } else { requested.map(str::to_string) };
+        ev.sequencer = o.seq;
         self.events.emit(ev);
     }
 
@@ -1656,9 +1670,31 @@ impl Server {
             prefix: r.q("prefix").unwrap_or("").to_string(),
             suffix: r.q("suffix").unwrap_or("").to_string(),
         };
+        let server =
+            self.me.get().and_then(std::sync::Weak::upgrade).ok_or_else(|| S3Error::internal("server not initialized"))?;
         let mut rx = self.events.subscribe();
         let mut closing = self.events.closing();
         let region = self.region.clone();
+        // Every event is re-authorized for the subscriber (its bucket limits, policies and
+        // bucket policies, which may change while the stream is open); decisions are cached
+        // per bucket for a few seconds.
+        let (principal, headers, query, client, auth_type) =
+            (r.principal.clone(), r.parts.headers.clone(), r.query.clone(), r.client, r.auth_type);
+        let mut allowed: HashMap<String, (bool, Instant)> = HashMap::new();
+        let mut may_see = move |bucket: &str| -> bool {
+            if let Some((ok, at)) = allowed.get(bucket)
+                && at.elapsed() < std::time::Duration::from_secs(5)
+            {
+                return *ok;
+            }
+            let ctx = server.ctx(&principal, &headers, &query, client, auth_type);
+            let ok = server.authorize(&principal, "s3:ListenBucketNotification", Some(bucket), None, &ctx).is_ok();
+            if allowed.len() > 10_000 {
+                allowed.clear();
+            }
+            allowed.insert(bucket.to_string(), (ok, Instant::now()));
+            ok
+        };
         let (tx, body) = tokio::sync::mpsc::channel::<Bytes>(64);
         tokio::spawn(async move {
             let mut ping = tokio::time::interval(std::time::Duration::from_secs(10));
@@ -1666,7 +1702,7 @@ impl Server {
             loop {
                 let chunk = tokio::select! {
                     ev = rx.recv() => match ev {
-                        Ok(ev) if filter.matches(&ev) => {
+                        Ok(ev) if filter.matches(&ev) && may_see(&ev.bucket) => {
                             let mut line = ev.to_json(&region, "");
                             line.push('\n');
                             Bytes::from(line)
@@ -1675,7 +1711,7 @@ impl Server {
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                     },
                     _ = ping.tick() => Bytes::from_static(b" "),
-                    _ = closing.changed() => break,
+                    _ = closing.wait_for(|v| *v) => break,
                 };
                 // The client went away: stop listening.
                 if tx.send(chunk).await.is_err() {
@@ -2322,7 +2358,7 @@ impl Server {
         let version = match &out {
             OpOut::Object(m) => {
                 let mut ev = self.event(&who, client.ip, rid, "ObjectCreated:Post", bucket, &key);
-                (ev.size, ev.etag, ev.version) = (m.size, m.etag.clone(), m.version.clone());
+                (ev.size, ev.etag, ev.version, ev.sequencer) = (m.size, m.etag.clone(), m.version.clone(), m.seq);
                 self.events.emit(ev);
                 m.version.clone()
             }

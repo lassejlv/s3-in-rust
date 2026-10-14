@@ -145,10 +145,7 @@ fn parse_args() -> Result<Config, String> {
         metrics_token: env("S3RS_METRICS_TOKEN"),
         console: !env_flag("S3RS_NO_CONSOLE")?,
         behind_proxy: env_flag("S3RS_BEHIND_PROXY")?,
-        webhooks: env("S3RS_WEBHOOKS")
-            .map(|v| split_list(&v).iter().map(|w| parse_webhook(w)).collect())
-            .transpose()?
-            .unwrap_or_default(),
+        webhooks: env("S3RS_WEBHOOKS").map(|v| parse_webhooks(&v)).transpose()?.unwrap_or_default(),
         webhook_secret: env("S3RS_WEBHOOK_SECRET"),
         encryption_key: env("S3RS_ENCRYPTION_KEY")
             .map(|k| parse_key(&k))
@@ -227,6 +224,19 @@ fn parse_args() -> Result<Config, String> {
         }
     }
     Ok(c)
+}
+
+/// `S3RS_WEBHOOKS`: comma-separated `id=url` entries with unique ids.
+fn parse_webhooks(v: &str) -> Result<Vec<(String, events::Url)>, String> {
+    let mut out: Vec<(String, events::Url)> = Vec::new();
+    for w in split_list(v) {
+        let w = parse_webhook(&w)?;
+        if out.iter().any(|(id, _)| *id == w.0) {
+            return Err(format!("S3RS_WEBHOOKS: duplicate id `{}`", w.0));
+        }
+        out.push(w);
+    }
+    Ok(out)
 }
 
 /// `id=http://host[:port]/path`
@@ -401,6 +411,7 @@ async fn serve(cfg: Config, store: Arc<store::Store>, auth: Option<auth::Auth>) 
         events: events::Bus::new(store.clone(), cfg.region.clone(), cfg.webhooks.clone(), cfg.webhook_secret.clone()),
     };
     let server = Arc::new(s3::Server::new(store.clone(), auth, opts));
+    server.set_self();
     if cfg.lifecycle_interval > 0 {
         tokio::spawn(lifecycle::run(
             store.clone(),

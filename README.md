@@ -372,7 +372,15 @@ for all buckets) is MinIO's ListenBucketNotification API. It is a signed request
 connection open and sends one JSON event per line, plus a space every 10 seconds to keep idle
 connections alive. MinIO clients use it directly, e.g. `ListenBucketNotification` in minio-go or
 `mc watch`. It needs the `s3:ListenBucketNotification` (or, for all buckets,
-`s3:ListenNotification`) permission.
+`s3:ListenNotification`) permission. Every event is checked against the subscriber's access to
+that event's bucket (its bucket limits, its policy and the bucket policy), so a stream for all
+buckets only carries events the caller could otherwise see.
+
+Each record's `sequencer` follows the order in which changes were committed, so for a given key the
+event with the highest sequencer describes its latest state, even when concurrent writes deliver
+events out of order. Deletes that remove nothing (a missing key or version) emit no event. If a
+webhook target is removed from the server's configuration, bucket rules that point to it are
+skipped with a warning, and the bucket's other rules keep working.
 
 ## Browser uploads (POST policy)
 

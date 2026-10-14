@@ -1271,6 +1271,22 @@ def t_notifications():
         names = sorted([next_event()["s3"]["object"]["key"], next_event()["s3"]["object"]["key"]])
         assert names == ["img/a+b.jpg", "img/copy.jpg"], names
         assert got.empty(), "unexpected extra events"
+        # Deleting something that doesn't exist changes nothing, so it emits nothing.
+        s3.delete_object(Bucket=nb, Key="img/never-existed.jpg")
+        s3.delete_objects(Bucket=nb, Delete={"Objects": [{"Key": "img/also-missing"}]})
+        s3.put_object(Bucket=nb, Key="img/after.jpg", Body=b"x")
+        assert next_event()["eventName"] == "ObjectCreated:Put"
+        s3.delete_object(Bucket=nb, Key="img/after.jpg")
+        assert next_event()["eventName"] == "ObjectRemoved:Delete"
+        # Sequencers follow commit order: the highest one belongs to the object that won.
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(16) as pool:
+            list(pool.map(lambda i: s3.put_object(Bucket=nb, Key="img/race", Body=f"v{i}".encode()), range(16)))
+        evs = [next_event() for _ in range(16)]
+        winner = max(evs, key=lambda e: int(e["s3"]["object"]["sequencer"], 16))
+        assert winner["s3"]["object"]["eTag"] == s3.head_object(Bucket=nb, Key="img/race")["ETag"].strip('"'), winner
+        s3.delete_object(Bucket=nb, Key="img/race")
+        next_event()
 
         # Live stream (MinIO ListenBucketNotification): signed GET ?events=..., JSON lines.
         import http.client
@@ -1288,6 +1304,30 @@ def t_notifications():
         rec = json.loads(line)["Records"][0]
         assert rec["eventName"] == "ObjectCreated:Put" and rec["s3"]["object"]["key"] == "live/x.txt", rec
         conn.close()
+        # The all-buckets stream only shows a bucket-scoped key events from its own buckets.
+        sak, ssk = os.environ.get("S3RS_SCOPED_ACCESS_KEY"), os.environ.get("S3RS_SCOPED_SECRET_KEY")
+        if sak:
+            sc = boto3.client("s3", endpoint_url=ENDPOINT, aws_access_key_id=sak, aws_secret_access_key=ssk, region_name="us-east-1",
+                              config=Config(s3={"addressing_style": "path"}, retries={"max_attempts": 1}))
+            s3.create_bucket(Bucket="scoped-events")
+            req = _signed_request(sc, "GET", "/?events=s3%3AObjectCreated%3A%2A")
+            conn = http.client.HTTPConnection(*hostport.split(":"), timeout=10)
+            conn.request("GET", "/?events=s3%3AObjectCreated%3A%2A", headers=dict(req.headers.items()))
+            resp = conn.getresponse()
+            assert resp.status == 200, resp.status
+
+            def writes():
+                s3.put_object(Bucket=nb, Key="live/secret.txt", Body=b"not for scoped")
+                s3.put_object(Bucket="scoped-events", Key="visible.txt", Body=b"ok")
+            threading.Timer(0.3, writes).start()
+            line = b""
+            while not line.strip():
+                line = resp.readline()
+            rec = json.loads(line)["Records"][0]
+            assert rec["s3"]["bucket"]["name"] == "scoped-events", rec
+            conn.close()
+            s3.delete_object(Bucket="scoped-events", Key="visible.txt")
+            s3.delete_bucket(Bucket="scoped-events")
         while not got.empty():
             got.get()
         # Lifecycle expirations are events too (needs a fast-sweeping server).

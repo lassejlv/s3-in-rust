@@ -147,6 +147,31 @@ pub fn valid_event(e: &str) -> bool {
 
 /// Parse a NotificationConfiguration document; `targets` are the configured webhook ids.
 pub fn parse_config(doc: &xml::Node, targets: &[String]) -> S3Result<Vec<Rule>> {
+    parse_rules(doc, targets, true)
+}
+
+/// Parse a stored configuration: rules whose target no longer exists (removed from the
+/// server's --webhook list) are skipped with a warning instead of disabling the others.
+pub fn load_config(bucket: &str, doc: &xml::Node, targets: &[String]) -> Vec<Rule> {
+    match parse_rules(doc, targets, false) {
+        Ok(rules) => {
+            let n = doc.children.len();
+            if rules.len() < n {
+                eprintln!(
+                    "warning: bucket {bucket}: {} notification rule(s) refer to webhook targets that are not configured and are ignored",
+                    n - rules.len()
+                );
+            }
+            rules
+        }
+        Err(e) => {
+            eprintln!("warning: bucket {bucket}: stored notification configuration is invalid: {}", e.message);
+            Vec::new()
+        }
+    }
+}
+
+fn parse_rules(doc: &xml::Node, targets: &[String], strict: bool) -> S3Result<Vec<Rule>> {
     if doc.name != "NotificationConfiguration" {
         return Err(err::MalformedXML());
     }
@@ -156,10 +181,11 @@ pub fn parse_config(doc: &xml::Node, targets: &[String]) -> S3Result<Vec<Rule>> 
     {
         for c in doc.children_named(elem) {
             let arn = c.child_text(arn_elem).map(str::trim).ok_or_else(err::MalformedXML)?;
-            let target = arn
-                .strip_prefix("arn:s3rs:webhook::")
-                .filter(|id| targets.iter().any(|t| t == id))
-                .ok_or_else(|| {
+            let known = arn.strip_prefix("arn:s3rs:webhook::").filter(|id| targets.iter().any(|t| t == id));
+            if known.is_none() && !strict {
+                continue;
+            }
+            let target = known.ok_or_else(|| {
                     err::InvalidArgument().with_message(format!(
                         "Unable to validate the following destination configurations: {arn} (configure webhook targets with --webhook)"
                     ))
@@ -268,7 +294,7 @@ impl Bus {
             live: broadcast::channel(4096).0,
             targets: senders,
             rules: RwLock::new(HashMap::new()),
-            seq: AtomicU64::new(now_ms() << 16),
+            seq: AtomicU64::new(now_ms() << 20),
             stats,
             closing: watch::channel(false).0,
         })
@@ -293,7 +319,7 @@ impl Bus {
             .ok()
             .flatten()
             .and_then(|v| xml::parse(&String::from_utf8_lossy(&v)))
-            .and_then(|d| parse_config(&d, &self.target_ids()).ok())
+            .map(|d| load_config(bucket, &d, &self.target_ids()))
             .filter(|r| !r.is_empty())
             .map(Arc::new);
         let mut cache = self.rules.write().unwrap();
@@ -327,7 +353,10 @@ impl Bus {
         if !listeners && rules.is_none() {
             return;
         }
-        ev.sequencer = self.seq.fetch_add(1, Ordering::Relaxed);
+        // Events carry the writer's commit order; the counter only covers events without one.
+        if ev.sequencer == 0 {
+            ev.sequencer = self.seq.fetch_add(1, Ordering::Relaxed);
+        }
         let ev = Arc::new(ev);
         if listeners {
             let _ = self.live.send(ev.clone());
@@ -366,16 +395,32 @@ impl Url {
             Some(i) => (&rest[..i], &rest[i..]),
             None => (rest, "/"),
         };
-        if authority.is_empty() || authority.contains('@') {
-            return Err(format!("{s}: invalid host"));
-        }
-        let (host, port) = match authority.rsplit_once(':') {
-            _ if authority.starts_with('[') && authority.ends_with(']') => (authority.to_string(), 80),
-            Some((h, p)) if !h.ends_with(']') || h.starts_with('[') => {
-                (h.to_string(), p.parse::<u16>().map_err(|_| format!("{s}: invalid port"))?)
+        let bad = |what: &str| format!("{s}: invalid {what}");
+        let (host, port) = if let Some(rest) = authority.strip_prefix('[') {
+            // [ipv6] or [ipv6]:port
+            let (addr, after) = rest.split_once(']').ok_or_else(|| bad("host"))?;
+            addr.parse::<std::net::Ipv6Addr>().map_err(|_| bad("IPv6 address"))?;
+            let port = match after {
+                "" => 80,
+                p => p.strip_prefix(':').and_then(|p| p.parse::<u16>().ok()).ok_or_else(|| bad("port"))?,
+            };
+            (format!("[{addr}]"), port)
+        } else {
+            let (h, p) = match authority.split_once(':') {
+                Some((h, p)) => (h, p.parse::<u16>().map_err(|_| bad("port"))?),
+                None => (authority, 80),
+            };
+            if h.is_empty() || !h.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-') {
+                return Err(bad("host"));
             }
-            _ => (authority.to_string(), 80),
+            (h.to_string(), p)
         };
+        if port == 0 {
+            return Err(bad("port"));
+        }
+        if path.contains('#') || path.parse::<hyper::http::uri::PathAndQuery>().is_err() {
+            return Err(bad("path"));
+        }
         Ok(Url { host, port, path: path.to_string() })
     }
 
@@ -492,6 +537,18 @@ mod tests {
         assert!(Url::parse("https://h/").is_err());
         assert!(Url::parse("ftp://h/").is_err());
         assert!(Url::parse("http://user@h/").is_err());
+        for bad in [
+            "http://:80/",
+            "http://h:80:90/",
+            "http://[::1/x",
+            "http://h:0/",
+            "http://h/a b",
+            "http://h/a\r\nX: y",
+            "http://h/#f",
+        ] {
+            assert!(Url::parse(bad).is_err(), "{bad:?}");
+        }
+        assert_eq!(Url::parse("http://[::1]/x").unwrap().port, 80);
     }
 
     #[test]
@@ -525,8 +582,16 @@ mod tests {
         assert!(!rules[0].matches(&ev("ObjectRemoved:Delete", "images/a.jpg")));
         assert!(rules[1].matches(&ev("ObjectRemoved:Delete", "x")));
         assert!(!rules[1].matches(&ev("ObjectRemoved:DeleteMarkerCreated", "x")));
-        // Unknown targets and events are rejected.
+        // Unknown targets and events are rejected when configuring...
         assert!(parse_config(&doc, &["other".into()]).is_err());
+        // ...but a stored configuration keeps the rules whose target still exists.
+        let mixed = xml::parse(
+            "<NotificationConfiguration><QueueConfiguration><Id>a</Id><Queue>arn:s3rs:webhook::gone</Queue><Event>s3:ObjectCreated:*</Event></QueueConfiguration>\
+             <QueueConfiguration><Id>b</Id><Queue>arn:s3rs:webhook::hook</Queue><Event>s3:ObjectCreated:*</Event></QueueConfiguration></NotificationConfiguration>",
+        )
+        .unwrap();
+        let kept = load_config("bkt", &mixed, &["hook".into()]);
+        assert_eq!(kept.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(), ["b"]);
         let bad = xml::parse("<NotificationConfiguration><QueueConfiguration><Queue>arn:s3rs:webhook::hook</Queue><Event>s3:Nope</Event></QueueConfiguration></NotificationConfiguration>").unwrap();
         assert!(parse_config(&bad, &["hook".into()]).is_err());
         // The record is valid JSON with an encoded key.

@@ -175,11 +175,11 @@ pub async fn sweep(store: &Arc<Store>, day_secs: u64, events: Option<&crate::eve
                 size: r.size,
                 etag: r.etag.clone(),
                 version: r.version.clone(),
-                principal: String::new(),
+                principal: "s3.amazonaws.com".to_string(),
                 source_ip: String::new(),
                 request_id: String::new(),
                 time_ms: util::now_ms(),
-                sequencer: 0,
+                sequencer: r.seq,
             });
         }
     };

@@ -71,6 +71,17 @@ pub struct DeleteOutcome {
     /// Version id that was removed, or of the delete marker that was created.
     pub version_id: Option<String>,
     pub delete_marker: bool,
+    /// Something was actually removed or a delete marker was created (deleting a missing key
+    /// or version succeeds without changing anything).
+    pub removed: bool,
+    /// Commit order of the change (for event sequencers); 0 when nothing changed.
+    pub seq: u64,
+}
+
+/// The next write sequence number (monotonic across the whole store).
+fn next_seq(last: &mut u64) -> u64 {
+    *last = (*last + 1).max(now_ms() << 20);
+    *last
 }
 
 fn ver_prefix(bucket: &str, key: &str) -> Vec<u8> {
@@ -240,6 +251,8 @@ pub struct Removed {
     pub marker_created: bool,
     pub size: u64,
     pub etag: String,
+    /// Commit order of the removal.
+    pub seq: u64,
 }
 
 struct Job {
@@ -1241,8 +1254,10 @@ fn delete_current(
 ) -> S3Result<DeleteOutcome> {
     let state = versioning_state(tx, bucket)?;
     if state == Versioning::Unversioned {
+        let existed = get_meta(tx, &obj_key(bucket, key))?.is_some();
         retire_current(tx, state, bucket, key, garbage)?;
-        return Ok(DeleteOutcome::default());
+        let seq = if existed { next_seq(last_seq) } else { 0 };
+        return Ok(DeleteOutcome { removed: existed, seq, ..Default::default() });
     }
     let current = get_meta(tx, &obj_key(bucket, key))?;
     let seq = alloc_seq(tx, last_seq, bucket, key, current.as_ref())?;
@@ -1264,7 +1279,7 @@ fn delete_current(
         delete_marker: true,
     };
     tx.versions.insert(ver_key(bucket, key, seq).as_slice(), marker.encode().as_slice())?;
-    Ok(DeleteOutcome { version_id: Some(version.unwrap_or_else(|| "null".into())), delete_marker: true })
+    Ok(DeleteOutcome { version_id: Some(version.unwrap_or_else(|| "null".into())), delete_marker: true, removed: true, seq })
 }
 
 /// If a key has no current version, make its newest noncurrent entry current, unless that
@@ -1331,7 +1346,7 @@ fn delete_version(
     if !valid_version_id(vid) {
         return Err(err::InvalidArgument().with_message("Invalid version id specified"));
     }
-    let mut out = DeleteOutcome { version_id: Some(vid.to_string()), delete_marker: false };
+    let mut out = DeleteOutcome { version_id: Some(vid.to_string()), ..Default::default() };
     if let Some((in_objects, k, m)) = find_version(tx, bucket, key, vid)? {
         lock::State::of(&m.headers).check_delete(now_ms() / 1000, bypass)?;
         if in_objects {
@@ -1340,6 +1355,7 @@ fn delete_version(
             tx.versions.remove(k.as_slice())?;
         }
         out.delete_marker = m.delete_marker;
+        out.removed = true;
         release(tx, &m, garbage)?;
         promote(tx, bucket, key)?;
     }
@@ -1441,7 +1457,8 @@ fn apply(tx: &mut Tables, op: Op, garbage: &mut Vec<u128>, last_seq: &mut u64) -
                     let o = delete_current(tx, last_seq, &bucket, &key, garbage)?;
                     let marker = o.delete_marker;
                     let version = if marker { o.version_id.filter(|v| v != "null") } else { m.version.clone() };
-                    out.push(Removed { key, version, marker_created: marker, size: m.size, etag: m.etag });
+                    let (size, etag) = if marker { (0, String::new()) } else { (m.size, m.etag) };
+                    out.push(Removed { key, version, marker_created: marker, size, etag, seq: o.seq });
                 }
             }
             Ok(OpOut::Removed(out))
@@ -1453,7 +1470,12 @@ fn apply(tx: &mut Tables, op: Op, garbage: &mut Vec<u128>, last_seq: &mut u64) -
             let mut out = Vec::with_capacity(items.len());
             for (key, version) in items {
                 let r = check_key_chars(&key).and_then(|_| match version {
-                    Some(v) => delete_version(tx, &bucket, &key, &v, bypass, garbage),
+                    Some(v) => delete_version(tx, &bucket, &key, &v, bypass, garbage).map(|mut o| {
+                        if o.removed {
+                            o.seq = next_seq(last_seq);
+                        }
+                        o
+                    }),
                     None => delete_current(tx, last_seq, &bucket, &key, garbage),
                 });
                 if let Err(e) = &r
@@ -1578,12 +1600,14 @@ fn apply(tx: &mut Tables, op: Op, garbage: &mut Vec<u128>, last_seq: &mut u64) -
                     tx.versions.remove(vk.as_slice())?;
                     release(tx, &m, garbage)?;
                     promote(tx, &bucket, &key)?;
+                    let seq = next_seq(last_seq);
                     out.push(Removed {
                         key,
                         version: m.version.clone(),
                         marker_created: false,
                         size: m.size,
                         etag: m.etag.clone(),
+                        seq,
                     });
                 }
             }

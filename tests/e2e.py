@@ -1084,6 +1084,11 @@ def t_console():
     st, _, body = http("GET", "/", headers={"Accept": "text/html,application/xhtml+xml"})
     assert st == 200 and b"s3rs console" in body, st
     assert http("GET", "/")[0] == 403
+    # Objects fetched from the API origin are sandboxed, so stored HTML can't act as the console.
+    s3.put_object(Bucket=B, Key="page.html", Body=b"<script>1</script>", ContentType="text/html")
+    h = s3.get_object(Bucket=B, Key="page.html")["ResponseMetadata"]["HTTPHeaders"]
+    assert h["content-security-policy"].startswith("sandbox") and h["x-content-type-options"] == "nosniff", h
+    s3.delete_object(Bucket=B, Key="page.html")
 
 
 def t_overwrite():

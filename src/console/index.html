@@ -12,10 +12,11 @@
 <div id="login" class="login hidden">
   <form id="login-form" class="card login-card" autocomplete="on">
     <h1><span class="logo">s3rs</span> console</h1>
-    <p class="muted">Sign in with an access key. Requests are signed in your browser; the secret never leaves this tab.</p>
+    <p class="muted">Sign in with an access key. Requests are signed in your browser; the secret key is never sent to the server.</p>
     <label>Access key <input id="ak" name="username" autocomplete="username" required></label>
     <label>Secret key <input id="sk" name="password" type="password" autocomplete="current-password" required></label>
     <label>Region <input id="region" required></label>
+    <label class="radio"><input type="checkbox" id="remember"> Stay signed in while this tab is open</label>
     <button class="primary" type="submit">Sign in</button>
     <p id="login-error" class="error" role="alert"></p>
   </form>

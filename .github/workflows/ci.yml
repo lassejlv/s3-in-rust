@@ -87,6 +87,7 @@ jobs:
       - name: web console (Playwright)
         env:
           S3RS_CONSOLE_URL: http://localhost:9000
+          LANG: C.UTF-8  # non-ASCII download names need a UTF-8 locale in Chromium
           S3RS_ACCESS_KEY: testkey
           S3RS_SECRET_KEY: testsecret
         run: |

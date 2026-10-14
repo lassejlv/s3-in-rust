@@ -55,9 +55,15 @@ key. From the console you can:
 
 The console is three static files compiled into the binary. Every request is signed with SigV4
 inside the browser tab, so the server keeps no sessions and the console can do nothing an S3
-client with the same key couldn't. The key is kept in `sessionStorage` and forgotten when the tab
-closes. Signing needs a secure context, so use HTTPS or `localhost`. The pages are served with a
-strict Content-Security-Policy and refuse to be framed. Turn the console off with `--no-console`.
+client with the same key couldn't. Signing needs a secure context, so use HTTPS or `localhost`. The pages are served with a
+strict Content-Security-Policy and refuse to be framed. The key stays in the page's memory unless you
+tick "Stay signed in", which keeps it in `sessionStorage` until the tab closes.
+
+The console shares its origin with the S3 API, so while it is enabled, objects downloaded from the
+API endpoint are sent with `Content-Security-Policy: sandbox`. HTML or SVG stored in a bucket then
+renders in an isolated origin and can't read the console's storage. Serve websites from the
+[website endpoint](#static-websites), which is a separate origin. Turn the console off with
+`--no-console`.
 
 ## Configuration
 

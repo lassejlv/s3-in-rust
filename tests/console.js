@@ -31,6 +31,7 @@ const shot = (page, name) => (out ? page.screenshot({ path: `${out}/${name}.png`
 
   step('login');
   await page.fill('#sk', SK);
+  await page.check('#remember');
   await page.click('#login-form button[type=submit]');
   await page.waitForSelector('#app:not(.hidden)');
 
@@ -84,6 +85,38 @@ const shot = (page, name) => (out ? page.screenshot({ path: `${out}/${name}.png`
   const [dl] = await Promise.all([page.waitForEvent('download'), page.click('#details button:has-text("Download")')]);
   console.log('  downloaded as', dl.suggestedFilename());
 
+  step('double refresh shows no duplicates');
+  const before = await page.locator('#rows tr').count();
+  await page.click('#refresh'); await page.click('#refresh'); await page.click('#refresh');
+  await page.waitForTimeout(500);
+  const after = await page.locator('#rows tr').count();
+  if (before !== after) throw new Error(`rows changed from ${before} to ${after} after repeated refresh`);
+
+  step('non-ASCII download name');
+  await page.setInputFiles('#upload-input', [{ name: 'ünïcode ✓.txt', mimeType: 'text/plain', buffer: Buffer.from('u') }]);
+  await page.waitForSelector('tr:has-text("ünïcode ✓.txt")', { timeout: 10000 });
+  const [dl2] = await Promise.all([page.waitForEvent('download'), page.click('tr:has-text("ünïcode ✓.txt") button:has-text("Download")')]);
+  if (dl2.suggestedFilename() !== 'ünïcode ✓.txt') throw new Error('download name: ' + dl2.suggestedFilename());
+
+  step('stored HTML cannot read the console session');
+  await page.setInputFiles('#upload-input', [{ name: 'evil.html', mimeType: 'text/html',
+    buffer: Buffer.from('<script>let v; try { v = sessionStorage.getItem("s3rs-console"); } catch (e) { v = "blocked"; } document.title = "RESULT:" + v;</script>') }]);
+  await page.waitForSelector('tr:has-text("evil.html")', { timeout: 10000 });
+  await page.click('tr:has-text("evil.html") button:has-text("Share")');
+  await page.click('#modal-ok');
+  await page.waitForSelector('#modal .share-url');
+  const evilUrl = await page.inputValue('#modal .share-url');
+  await page.click('#modal-ok');
+  const consoleUrl = page.url();
+  await page.goto(evilUrl);
+  await page.waitForFunction(() => document.title.startsWith('RESULT:'));
+  const title = await page.title();
+  if (title.includes(SK)) throw new Error('stored HTML read the secret: ' + title);
+  console.log('  stored HTML saw:', title);
+  await page.goto(consoleUrl);
+  await page.waitForSelector('#app:not(.hidden)');
+  await page.waitForSelector('tr:has-text("evil.html")');
+
   step('settings: public read + website');
   await page.click('#settings');
   await page.waitForSelector('#f-acl');
@@ -96,7 +129,7 @@ const shot = (page, name) => (out ? page.screenshot({ path: `${out}/${name}.png`
   if (anon.status !== 200) throw new Error('public read not applied');
 
   step('delete selected (folder + files)');
-  await page.click('#details-close');
+  if (await page.isVisible('#details')) await page.click('#details-close');
   await page.check('#select-all');
   await page.click('#delete-selected');
   await page.click('#modal-ok');

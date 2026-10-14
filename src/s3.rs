@@ -575,6 +575,7 @@ impl Server {
             .set("x-content-type-options", "nosniff")
             // Share links carry signatures; never leak them (or page URLs) in Referer headers.
             .set("referrer-policy", "no-referrer");
+        r.set("content-length", &body.len().to_string());
         if parts.method == Method::GET {
             r.body = Body::full(body);
         }
@@ -1116,7 +1117,15 @@ impl Server {
                 };
                 Ok(Resp::xml(doc))
             }
-            Method::GET | Method::HEAD => self.get_object(r, bucket, key, m == Method::HEAD).await,
+            Method::GET | Method::HEAD => {
+                let mut resp = self.get_object(r, bucket, key, m == Method::HEAD).await?;
+                if self.console {
+                    // Stored HTML/SVG must not run as the console's origin (where a signed-in
+                    // console keeps its credentials): render it in an opaque, sandboxed origin.
+                    resp.set("content-security-policy", crate::console::OBJECT_CSP).set("x-content-type-options", "nosniff");
+                }
+                Ok(resp)
+            }
             Method::PUT if r.has("partNumber") && r.has("uploadId") => self.upload_part(r, bucket, key).await,
             Method::PUT if r.has("acl") => {
                 self.lookup(bucket, key, vref)?;

@@ -11,6 +11,11 @@ const APP_CSS: &str = include_str!("console/app.css");
 pub const CSP: &str = "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' blob: data:; \
                        connect-src 'self'; form-action 'none'; frame-ancestors 'none'; base-uri 'none'";
 
+/// Sent with objects downloaded from the API endpoint while the console is enabled: documents
+/// (HTML, SVG, ...) still render and may run scripts, but in a unique opaque origin that cannot
+/// read the console's storage or make same-origin requests.
+pub const OBJECT_CSP: &str = "sandbox allow-scripts allow-forms allow-popups allow-modals allow-downloads";
+
 /// (content type, body) of a console asset; `path` is the request path.
 pub fn asset(path: &str, region: &str) -> Option<(&'static str, String)> {
     match path {

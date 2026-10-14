@@ -243,12 +243,20 @@ function objectPath(key) {
   return `/${state.bucket}/${key}`;
 }
 
+// Browsers remove "." and ".." path segments from URLs, so such keys can't be read from here.
+function browserReachable(key) {
+  return !key.split("/").some((s) => s === "." || s === "..");
+}
+
 // ------------------------------------------------------------------ login
 
-async function login(ak, sk, region) {
+async function login(ak, sk, region, remember) {
   S3.ak = ak; S3.sk = sk; S3.region = region; S3.keyCache.clear();
   state.buckets = await S3.listBuckets();
-  try { sessionStorage.setItem("s3rs-console", JSON.stringify({ ak, sk, region })); } catch (_) { /* private mode */ }
+  // By default the key lives only in this page's memory; reloading signs out.
+  if (remember) {
+    try { sessionStorage.setItem("s3rs-console", JSON.stringify({ ak, sk, region })); } catch (_) { /* private mode */ }
+  }
   $("login").classList.add("hidden");
   $("app").classList.remove("hidden");
   $("whoami").textContent = `${ak} @ ${location.host}`;
@@ -333,17 +341,23 @@ function renderCrumbs() {
   $("crumbs").replaceChildren(...crumbs);
 }
 
+let listSeq = 0;
+
 async function loadList(append) {
   renderCrumbs();
-  if (!append) { state.items = []; state.token = null; state.selected.clear(); }
+  // Only the latest listing request may update the view (navigation can overtake a slow one).
+  const seq = ++listSeq;
   const filter = $("search").value;
   try {
     const page = await S3.list(state.bucket, state.prefix + filter, append ? state.token : null);
+    if (seq !== listSeq) return;
+    if (!append) { state.items = []; state.selected.clear(); }
     state.token = page.next;
     state.items.push(...page.prefixes.map((p) => ({ key: p, folder: true })));
     state.items.push(...page.objects.filter((o) => o.key !== state.prefix).map((o) => ({ ...o, folder: false })));
     renderRows();
   } catch (e) {
+    if (seq !== listSeq) return;
     toast(e.message, true);
     if (e.code === "NoSuchBucket") { await refreshBuckets(); $("browser").classList.add("hidden"); $("empty-state").classList.remove("hidden"); }
   }
@@ -363,6 +377,15 @@ function renderRows() {
         el("td", { class: "name" }, el("span", { class: "icon" }, "▸"), el("a", { onclick: () => openBucket(state.bucket, it.key) }, name)),
         el("td", { class: "num" }, ""), el("td", { class: "hide-sm" }, ""),
         el("td", { class: "actions" }, el("button", { class: "ghost small danger", onclick: () => deleteKeys([it.key]) }, "Delete")));
+    }
+    if (!browserReachable(it.key)) {
+      return el("tr", {},
+        el("td", { class: "check" }, check),
+        el("td", { class: "name", title: "Keys with \".\" or \"..\" path segments can't be opened from a browser; use an S3 client." },
+          el("span", { class: "icon" }, "·"), name, el("span", { class: "muted" }, " (not reachable from a browser)")),
+        el("td", { class: "num" }, formatSize(it.size)),
+        el("td", { class: "hide-sm muted" }, formatDate(it.modified)),
+        el("td", { class: "actions" }));
     }
     return el("tr", {},
       el("td", { class: "check" }, check),
@@ -414,7 +437,11 @@ async function newFolder() {
 
 async function download(key) {
   try {
-    const url = await S3.presign(objectPath(key), 300, { "response-content-disposition": `attachment; filename="${baseName(key).replace(/["\\]/g, "_")}"` });
+    // ASCII fallback plus RFC 5987 filename* so non-ASCII names survive.
+    const name = baseName(key);
+    const ascii = name.replace(/[^\x20-\x7e]|["\\]/g, "_");
+    const disposition = `attachment; filename="${ascii}"; filename*=UTF-8''${uriEncode(name)}`;
+    const url = await S3.presign(objectPath(key), 300, { "response-content-disposition": disposition });
     el("a", { href: url, download: baseName(key) }).click();
   } catch (e) { toast(e.message, true); }
 }
@@ -427,7 +454,8 @@ async function share(key) {
       el("option", { value: "604800" }, "7 days (maximum)"))),
   ], "Create link", () => Number($("f-exp").value));
   if (!choice) return;
-  const url = await S3.presign(objectPath(key), choice);
+  let url;
+  try { url = await S3.presign(objectPath(key), choice); } catch (e) { toast(e.message, true); return; }
   try { await navigator.clipboard.writeText(url); toast("Link copied to the clipboard"); } catch (_) { /* fall through */ }
   await prompt("Share link", [el("input", { class: "share-url", value: url, readonly: true, onfocus: (e) => e.target.select() })], "Done", () => true);
 }
@@ -650,7 +678,7 @@ document.addEventListener("DOMContentLoaded", () => {
     ev.preventDefault();
     $("login-error").textContent = "";
     try {
-      await login($("ak").value.trim(), $("sk").value, $("region").value.trim());
+      await login($("ak").value.trim(), $("sk").value, $("region").value.trim(), $("remember").checked);
     } catch (e) {
       $("login-error").textContent = e.code === "InvalidAccessKeyId" || e.code === "SignatureDoesNotMatch" ? "Wrong access key or secret key." : e.message;
     }
@@ -685,7 +713,7 @@ document.addEventListener("DOMContentLoaded", () => {
   let saved = null;
   try { saved = JSON.parse(sessionStorage.getItem("s3rs-console") || "null"); } catch (_) { /* ignore */ }
   if (saved) {
-    login(saved.ak, saved.sk, saved.region).catch(() => $("login").classList.remove("hidden"));
+    login(saved.ak, saved.sk, saved.region, true).catch(() => $("login").classList.remove("hidden"));
   } else {
     $("login").classList.remove("hidden");
   }

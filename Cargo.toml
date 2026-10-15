@@ -17,6 +17,7 @@ http-body-util = "0.1.5"
 httpdate = "1.0.3"
 hyper = { version = "1.12.0", features = ["server", "client", "http1", "http2"] }
 hyper-util = { version = "0.1.21", features = ["tokio", "server", "http1", "http2", "server-auto", "server-graceful"] }
+libc = "0.2.190"
 md-5 = "0.11.0"
 memchr = "2.8.3"
 percent-encoding = "2.3.2"

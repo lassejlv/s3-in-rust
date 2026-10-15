@@ -123,6 +123,11 @@ impl Metrics {
                 let _ = writeln!(o, "s3rs_bucket_bytes{{bucket=\"{b}\"}} {bytes}");
             }
         }
+        let free = store.space.free();
+        if free != u64::MAX {
+            let _ = writeln!(o, "# TYPE s3rs_disk_free_bytes gauge\ns3rs_disk_free_bytes {free}");
+        }
+        let _ = writeln!(o, "# TYPE s3rs_disk_reserve_bytes gauge\ns3rs_disk_reserve_bytes {}", store.space.reserve());
         if let Ok(b) = store.list_buckets() {
             let _ = writeln!(o, "# TYPE s3rs_buckets gauge\ns3rs_buckets {}", b.len());
         }

@@ -32,7 +32,11 @@ impl fmt::Display for S3Error {
 
 impl From<std::io::Error> for S3Error {
     fn from(e: std::io::Error) -> Self {
-        S3Error::internal(e)
+        use std::io::ErrorKind;
+        match e.kind() {
+            ErrorKind::StorageFull | ErrorKind::QuotaExceeded => crate::store::space::storage_full(),
+            _ => S3Error::internal(e),
+        }
     }
 }
 

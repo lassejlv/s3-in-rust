@@ -91,6 +91,9 @@ OPTIONS (each also settable through the environment variable shown):
         --inline-threshold <N>   Objects up to N bytes are stored inside the metadata DB
                                                                  [S3RS_INLINE_THRESHOLD, default 65536]
         --cache-mb <N>           Metadata cache size in MiB      [S3RS_CACHE_MB, default 256]
+        --min-free-space <SIZE>  Refuse uploads when the data disk's free space would drop below
+                                 SIZE (e.g. 512M, 2G; 0 = off) [S3RS_MIN_FREE_SPACE,
+                                 default 2% of the disk, 16M..256M]
         --no-fsync               Do not fsync data or metadata (faster, less durable)
                                                                  [S3RS_NO_FSYNC=1]
         --lifecycle-interval <S> Seconds between lifecycle sweeps [S3RS_LIFECYCLE_INTERVAL, default 3600]
@@ -123,6 +126,7 @@ struct Config {
     website_domain: Option<String>,
     inline_threshold: usize,
     cache_mb: usize,
+    min_free: Option<u64>,
     fsync: bool,
     verbose: bool,
     lifecycle_interval: u64,
@@ -176,6 +180,10 @@ fn parse_args() -> Result<Config, String> {
             .map_or(Ok(65536), |v| v.parse())
             .map_err(|e| format!("S3RS_INLINE_THRESHOLD: {e}"))?,
         cache_mb: env("S3RS_CACHE_MB").map_or(Ok(256), |v| v.parse()).map_err(|e| format!("S3RS_CACHE_MB: {e}"))?,
+        min_free: env("S3RS_MIN_FREE_SPACE")
+            .map(|v| parse_size(&v))
+            .transpose()
+            .map_err(|e| format!("S3RS_MIN_FREE_SPACE: {e}"))?,
         fsync: !env_flag("S3RS_NO_FSYNC")?,
         verbose: env_flag("S3RS_VERBOSE")?,
         lifecycle_interval: env("S3RS_LIFECYCLE_INTERVAL")
@@ -229,6 +237,7 @@ fn parse_args() -> Result<Config, String> {
             "--website-domain" => c.website_domain = Some(val()?.to_ascii_lowercase()),
             "--inline-threshold" => c.inline_threshold = val()?.parse().map_err(|e| format!("--inline-threshold: {e}"))?,
             "--cache-mb" => c.cache_mb = val()?.parse().map_err(|e| format!("--cache-mb: {e}"))?,
+            "--min-free-space" => c.min_free = Some(parse_size(&val()?).map_err(|e| format!("--min-free-space: {e}"))?),
             "--no-fsync" => c.fsync = false,
             "--lifecycle-interval" => c.lifecycle_interval = val()?.parse().map_err(|e| format!("--lifecycle-interval: {e}"))?,
             "-v" | "--verbose" => c.verbose = true,
@@ -240,6 +249,25 @@ fn parse_args() -> Result<Config, String> {
         }
     }
     Ok(c)
+}
+
+/// A size in bytes, optionally with a K/M/G/T suffix (powers of 1024), e.g. `512M`.
+fn parse_size(v: &str) -> Result<u64, String> {
+    let v = v.trim();
+    let (num, mult) = match v.char_indices().last() {
+        Some((i, c)) if c.is_ascii_alphabetic() => {
+            let shift = match c.to_ascii_uppercase() {
+                'K' => 10,
+                'M' => 20,
+                'G' => 30,
+                'T' => 40,
+                _ => return Err(format!("`{v}`: unknown size suffix (use K, M, G or T)")),
+            };
+            (&v[..i], 1u64 << shift)
+        }
+        _ => (v, 1),
+    };
+    num.trim().parse::<u64>().ok().and_then(|n| n.checked_mul(mult)).ok_or_else(|| format!("`{v}` is not a valid size"))
 }
 
 /// `S3RS_WEBHOOKS`: comma-separated `id=url` entries with unique ids.
@@ -497,6 +525,7 @@ fn main() {
         fsync: cfg.fsync,
         inline_threshold: cfg.inline_threshold,
         cache_bytes: cfg.cache_mb * 1024 * 1024,
+        min_free: cfg.min_free,
     }) {
         Ok(s) => s,
         Err(e) => {
@@ -585,6 +614,10 @@ async fn serve(
             (true, true) => "all objects (SSE-S3 default)",
         }
     );
+    let reserve = store.space.reserve();
+    if reserve > 0 {
+        eprintln!("uploads are refused when the data disk has less than {} MiB free", reserve >> 20);
+    }
     if cfg.console {
         eprintln!("s3rs web console on {scheme}://{}/_console/", cfg.listen);
     }

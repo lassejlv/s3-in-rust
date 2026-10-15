@@ -599,6 +599,7 @@ dependencies = [
  "httpdate",
  "hyper",
  "hyper-util",
+ "libc",
  "md-5",
  "memchr",
  "percent-encoding",

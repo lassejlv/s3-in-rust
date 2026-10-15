@@ -99,6 +99,7 @@ Each flag can also be set with the environment variable shown (switches take `1`
 | `--website-domain` | `S3RS_WEBSITE_DOMAIN` | | On the website endpoint, `<bucket>.<domain>` serves that bucket |
 | `--inline-threshold` | `S3RS_INLINE_THRESHOLD` | `65536` | Objects up to this many bytes are stored inside the metadata DB |
 | `--cache-mb` | `S3RS_CACHE_MB` | `256` | Metadata cache size |
+| `--min-free-space` | `S3RS_MIN_FREE_SPACE` | 2% of the disk (16M–256M) | Refuses uploads when the data disk's free space would drop below this (e.g. `512M`, `2G`; `0` turns it off). See [Disk space](#disk-space). |
 | `--no-fsync` | `S3RS_NO_FSYNC` | off | Skips fsync. Faster, but a power loss can lose up to ~1s of acknowledged writes. |
 | `-v, --verbose` | `S3RS_VERBOSE` | off | Logs every request |
 
@@ -113,6 +114,27 @@ Connections that stay silent are closed: a new connection must send its first re
 seconds, and every request's headers (including the next request on a kept-alive connection) must
 arrive within 30 seconds. HTTP/2 connections are pinged every 30 seconds and closed if the peer
 doesn't answer.
+
+### Disk space
+
+A full disk must never take the metadata database down with it, because deleting data is how you
+recover from one. So s3rs keeps a free-space reserve on the data disk (`--min-free-space`, by
+default 2% of the disk, between 16 MiB and 256 MiB):
+
+- Uploads, parts and copies are refused with `507 StorageFull` when they would eat into the
+  reserve. The check runs before any data is received and again every 8 MiB while it arrives.
+  Deletes and other metadata changes are always allowed.
+- The data directory also holds a ballast file (0.5% of the disk, 8–64 MiB). If the disk fills up
+  anyway, for example because another process wrote to it, the server deletes the ballast so
+  pending writes and deletes can still commit. Uploads stay refused until there is room to
+  recreate it.
+- If the database still hits an I/O error, the server reopens it in place and recovers without a
+  restart once space is available.
+- `/_metrics` exports `s3rs_disk_free_bytes` and `s3rs_disk_reserve_bytes`. Alert well before the
+  first reaches the second.
+
+CI fills a 100 MB filesystem through the server, with and without the reserve
+(`tests/diskfull.py`).
 
 On `SIGTERM` or Ctrl-C the server stops accepting connections and waits up to 30 seconds for
 in-flight requests to finish. It then flushes metadata and records a clean shutdown. If a run
@@ -595,7 +617,12 @@ cd tests/minio-go && S3RS_ACCESS_KEY=testkey S3RS_SECRET_KEY=testsecret go run .
 
 CI (`.github/workflows/ci.yml`) runs fmt, clippy, the unit tests, the boto3 suite, an AWS CLI sync
 round-trip, the minio-go suite and a Playwright test of the web console (`tests/console.js`) on
-every push. A second job builds with `--features tls` and runs the boto3 and minio-go suites over
+every push. It also runs two durability tests:
+- `tests/crash.py` SIGKILLs the server repeatedly during concurrent writes. It checks that every
+  acknowledged write survives and that `fsck --deep` passes afterwards.
+- `tests/diskfull.py` fills a small filesystem through the server (see [Disk space](#disk-space)).
+
+A second job builds with `--features tls` and runs the boto3 and minio-go suites over
 HTTPS, with an `https://` webhook, using a throwaway CA from `tests/tls/gen-certs.sh`.
 
 ## Limitations and notes

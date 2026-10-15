@@ -9,6 +9,7 @@
 
 pub mod fsck;
 pub mod meta;
+pub mod space;
 
 use crate::error::{S3Error, S3Result, err};
 use crate::lock;
@@ -171,29 +172,105 @@ pub fn valid_version_id(vid: &str) -> bool {
 pub const MIN_PART_SIZE: u64 = 5 * 1024 * 1024;
 const MAX_BATCH: usize = 1024;
 
-macro_rules! internal_from {
+/// redb errors are internal errors, except a full disk, which clients should see as such.
+macro_rules! redb_from {
     ($($t:ty),*) => {$(
         impl From<$t> for S3Error {
-            fn from(e: $t) -> Self { S3Error::internal(e) }
+            fn from(e: $t) -> Self {
+                match redb::Error::from(e) {
+                    redb::Error::Io(io) => S3Error::from(io),
+                    e => S3Error::internal(e),
+                }
+            }
         }
     )*};
 }
-internal_from!(redb::Error, redb::DatabaseError, redb::TransactionError, redb::TableError, redb::StorageError, redb::CommitError);
+redb_from!(redb::Error, redb::DatabaseError, redb::TransactionError, redb::TableError, redb::StorageError, redb::CommitError);
 
 pub struct StoreConfig {
     pub root: PathBuf,
     pub fsync: bool,
     pub inline_threshold: usize,
     pub cache_bytes: usize,
+    /// Free space (bytes) to keep on the data filesystem; None picks a default.
+    pub min_free: Option<u64>,
 }
 
 pub struct Store {
     root: PathBuf,
     pub fsync: bool,
     pub inline_threshold: usize,
-    db: Arc<Database>,
+    db: Arc<DbCell>,
     writer: mpsc::Sender<Job>,
     deleter: mpsc::Sender<Gc>,
+    /// Free-space reserve for uploads.
+    pub space: Arc<space::Space>,
+}
+
+/// The metadata database. If an I/O error (typically a full disk) poisons it, the writer
+/// reopens it in place, so the server recovers without a restart once the cause is gone.
+struct DbCell {
+    path: PathBuf,
+    cache_bytes: usize,
+    db: std::sync::RwLock<Option<Arc<Database>>>,
+}
+
+impl DbCell {
+    fn get(&self) -> S3Result<Arc<Database>> {
+        self.db
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+            .ok_or_else(|| S3Error::internal("the metadata database is being reopened after an I/O error"))
+    }
+
+    /// Close and reopen the database. Waits for in-flight reads that still hold the old handle.
+    fn reopen(&self) -> S3Result<()> {
+        let mut slot = self.db.write().unwrap_or_else(|e| e.into_inner());
+        let deadline = Instant::now() + Duration::from_secs(30);
+        if let Some(mut old) = slot.take() {
+            loop {
+                match Arc::try_unwrap(old) {
+                    Ok(db) => {
+                        drop(db);
+                        break;
+                    }
+                    Err(still_shared) if Instant::now() < deadline => {
+                        old = still_shared;
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(still_shared) => {
+                        *slot = Some(still_shared);
+                        return Err(S3Error::internal("cannot reopen the metadata database: still in use"));
+                    }
+                }
+            }
+        }
+        // Read transactions that outlive their handle keep the file locked for a moment.
+        loop {
+            match Database::builder().set_cache_size(self.cache_bytes).create(&self.path) {
+                Ok(db) => {
+                    *slot = Some(Arc::new(db));
+                    return Ok(());
+                }
+                Err(redb::DatabaseError::DatabaseAlreadyOpen) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+    }
+}
+
+/// Has an earlier I/O error left the database unusable until it is reopened?
+fn poisoned(db: &Database) -> bool {
+    match db.begin_write() {
+        Ok(txn) => {
+            let _ = txn.abort();
+            false
+        }
+        Err(e) => matches!(redb::Error::from(e), redb::Error::PreviousIo),
+    }
 }
 
 /// What an upload is for (see `Store::quota_allows`).
@@ -217,6 +294,7 @@ pub enum WriteCond {
     Matches(String),
 }
 
+#[derive(Clone)]
 pub enum Op {
     CreateBucket(String),
     DeleteBucket(String),
@@ -434,10 +512,19 @@ impl Store {
                 Err(e) => eprintln!("recovery: orphan scan failed: {e}"),
             }
         }
-        let db = Arc::new(db);
+        let db = Arc::new(DbCell {
+            path: root.join("meta.redb"),
+            cache_bytes: cfg.cache_bytes,
+            db: std::sync::RwLock::new(Some(Arc::new(db))),
+        });
+        let space = Arc::new(space::Space::new(&root, cfg.min_free));
+        if let Err(e) = space.restore_ballast() {
+            eprintln!("warning: cannot create the ballast file: {e}");
+        }
 
         let (del_tx, del_rx) = mpsc::channel::<Gc>();
         let del_root = root.clone();
+        let gc_space = space.clone();
         std::thread::Builder::new().name("s3rs-gc".into()).spawn(move || {
             for msg in del_rx {
                 let ids = match msg {
@@ -454,6 +541,10 @@ impl Store {
                         eprintln!("gc: failed to remove {}: {e}", util::id_hex(id));
                     }
                 }
+                // Deletes free space: put the ballast back once there is room.
+                if !gc_space.ballast.present() && matches!(gc_space.restore_ballast(), Ok(true)) {
+                    eprintln!("disk space recovered: recreated the ballast file");
+                }
             }
         })?;
 
@@ -461,9 +552,20 @@ impl Store {
         let wdb = db.clone();
         let wdel = del_tx.clone();
         let durable = cfg.fsync;
-        std::thread::Builder::new().name("s3rs-writer".into()).spawn(move || writer_loop(wdb, rx, wdel, durable))?;
+        std::thread::Builder::new().name("s3rs-writer".into()).spawn({
+            let space = space.clone();
+            move || writer_loop(wdb, rx, wdel, durable, space)
+        })?;
 
-        Ok(Arc::new(Store { root, fsync: cfg.fsync, inline_threshold: cfg.inline_threshold, db, writer: tx, deleter: del_tx }))
+        Ok(Arc::new(Store {
+            root,
+            fsync: cfg.fsync,
+            inline_threshold: cfg.inline_threshold,
+            db,
+            writer: tx,
+            deleter: del_tx,
+            space,
+        }))
     }
 
     /// Record that the store shut down cleanly (all metadata flushed, nothing in flight). Waits
@@ -511,7 +613,7 @@ impl Store {
     // ---------------------------------------------------------------- reads
 
     pub fn bucket_exists(&self, bucket: &str) -> S3Result<bool> {
-        let t = self.db.begin_read()?.open_table(BUCKETS)?;
+        let t = self.db.get()?.begin_read()?.open_table(BUCKETS)?;
         Ok(t.get(bucket)?.is_some())
     }
 
@@ -520,7 +622,7 @@ impl Store {
     }
 
     pub fn list_buckets(&self) -> S3Result<Vec<(String, u64)>> {
-        let t = self.db.begin_read()?.open_table(BUCKETS)?;
+        let t = self.db.get()?.begin_read()?.open_table(BUCKETS)?;
         let mut out = Vec::new();
         for e in t.iter()? {
             let (k, v) = e?;
@@ -532,7 +634,7 @@ impl Store {
     /// Fetch object metadata (and inline bytes, from the same snapshot). Errors with
     /// NoSuchBucket / NoSuchKey as appropriate.
     pub fn get_object(&self, bucket: &str, key: &str) -> S3Result<(ObjectMeta, Option<Bytes>)> {
-        let txn = self.db.begin_read()?;
+        let txn = self.db.get()?.begin_read()?;
         let objects = txn.open_table(OBJECTS)?;
         let Some(v) = objects.get(obj_key(bucket, key).as_slice())? else {
             let buckets = txn.open_table(BUCKETS)?;
@@ -573,7 +675,7 @@ impl Store {
         marker: Option<&str>,
         max_keys: usize,
     ) -> S3Result<ListResult> {
-        let txn = self.db.begin_read()?;
+        let txn = self.db.get()?.begin_read()?;
         if txn.open_table(BUCKETS)?.get(bucket)?.is_none() {
             return Err(err::NoSuchBucket());
         }
@@ -661,13 +763,13 @@ impl Store {
 
     /// (object versions, bytes) stored in a bucket.
     pub fn bucket_usage(&self, bucket: &str) -> S3Result<(u64, u64)> {
-        Ok(self.db.begin_read()?.open_table(USAGE)?.get(bucket)?.map(|v| v.value()).unwrap_or((0, 0)))
+        Ok(self.db.get()?.begin_read()?.open_table(USAGE)?.get(bucket)?.map(|v| v.value()).unwrap_or((0, 0)))
     }
 
     /// Early quota check before receiving `size` bytes for `target`. The writer checks again
     /// atomically when the data is committed.
     pub fn quota_allows(&self, bucket: &str, target: Incoming, size: u64) -> S3Result<()> {
-        let txn = self.db.begin_read()?;
+        let txn = self.db.get()?.begin_read()?;
         let Some(q) = txn.open_table(CONFIG)?.get((bucket, "quota"))?.and_then(|v| Quota::decode(v.value())) else {
             return Ok(());
         };
@@ -704,12 +806,12 @@ impl Store {
 
     /// Bytes held by unfinished multipart uploads in a bucket.
     pub fn bucket_part_bytes(&self, bucket: &str) -> S3Result<u64> {
-        Ok(self.db.begin_read()?.open_table(PART_BYTES)?.get(bucket)?.map(|v| v.value()).unwrap_or(0))
+        Ok(self.db.get()?.begin_read()?.open_table(PART_BYTES)?.get(bucket)?.map(|v| v.value()).unwrap_or(0))
     }
 
     /// Usage of every bucket (for metrics).
     pub fn all_usage(&self) -> S3Result<Vec<(String, u64, u64)>> {
-        let t = self.db.begin_read()?.open_table(USAGE)?;
+        let t = self.db.get()?.begin_read()?.open_table(USAGE)?;
         let mut out = Vec::new();
         for e in t.iter()? {
             let (k, v) = e?;
@@ -721,7 +823,7 @@ impl Store {
 
     /// A bucket configuration document, if set. Errors with NoSuchBucket.
     pub fn bucket_config(&self, bucket: &str, kind: &str) -> S3Result<Option<Vec<u8>>> {
-        let txn = self.db.begin_read()?;
+        let txn = self.db.get()?.begin_read()?;
         if txn.open_table(BUCKETS)?.get(bucket)?.is_none() {
             return Err(err::NoSuchBucket());
         }
@@ -729,7 +831,7 @@ impl Store {
     }
 
     pub fn get_upload(&self, id: u128) -> S3Result<Option<UploadMeta>> {
-        let t = self.db.begin_read()?.open_table(UPLOADS)?;
+        let t = self.db.get()?.begin_read()?.open_table(UPLOADS)?;
         match t.get(id)? {
             Some(v) => Ok(Some(UploadMeta::decode(v.value())?)),
             None => Ok(None),
@@ -738,7 +840,7 @@ impl Store {
 
     /// Parts of an upload with part number > `marker`, at most `max` (+ whether truncated).
     pub fn list_parts(&self, id: u128, marker: u32, max: usize) -> S3Result<(Vec<(u32, PartMeta)>, bool)> {
-        let t = self.db.begin_read()?.open_table(PARTS)?;
+        let t = self.db.get()?.begin_read()?.open_table(PARTS)?;
         let mut out = Vec::new();
         let mut truncated = false;
         for e in t.range((id, marker.saturating_add(1))..=(id, u32::MAX))? {
@@ -758,7 +860,7 @@ impl Store {
         if !valid_version_id(vid) {
             return Err(err::InvalidArgument().with_message("Invalid version id specified"));
         }
-        let txn = self.db.begin_read()?;
+        let txn = self.db.get()?.begin_read()?;
         if txn.open_table(BUCKETS)?.get(bucket)?.is_none() {
             return Err(err::NoSuchBucket());
         }
@@ -827,7 +929,7 @@ impl Store {
         version_marker: Option<&str>,
         max: usize,
     ) -> S3Result<VersionList> {
-        let txn = self.db.begin_read()?;
+        let txn = self.db.get()?.begin_read()?;
         if txn.open_table(BUCKETS)?.get(bucket)?.is_none() {
             return Err(err::NoSuchBucket());
         }
@@ -960,7 +1062,7 @@ impl Store {
     /// Noncurrent entries for lifecycle: (key, meta, became-noncurrent time in ms or None if the
     /// entry is itself the latest version, whether it is the only version of its key).
     pub fn scan_noncurrent(&self, bucket: &str, prefix: &str, after: Option<&[u8]>, limit: usize) -> S3Result<NoncurrentPage> {
-        let txn = self.db.begin_read()?;
+        let txn = self.db.get()?.begin_read()?;
         let objects = txn.open_table(OBJECTS)?;
         let versions = txn.open_table(VERSIONS)?;
         let base_len = bucket.len() + 1;
@@ -1032,7 +1134,7 @@ impl Store {
         after: Option<&str>,
         limit: usize,
     ) -> S3Result<Vec<(String, ObjectMeta)>> {
-        let txn = self.db.begin_read()?;
+        let txn = self.db.get()?.begin_read()?;
         let t = txn.open_table(OBJECTS)?;
         let base_len = bucket.len() + 1;
         let full_prefix = obj_key(bucket, prefix);
@@ -1063,7 +1165,7 @@ impl Store {
     }
 
     pub fn list_uploads(&self, bucket: &str, prefix: &str) -> S3Result<Vec<UploadEntry>> {
-        let t = self.db.begin_read()?.open_table(UPLOADS)?;
+        let t = self.db.get()?.begin_read()?.open_table(UPLOADS)?;
         let mut out = Vec::new();
         for e in t.iter()? {
             let (k, v) = e?;
@@ -1125,7 +1227,8 @@ pub fn data_path(root: &Path, id: u128) -> PathBuf {
 
 // -------------------------------------------------------------------- writer
 
-fn writer_loop(db: Arc<Database>, rx: mpsc::Receiver<Job>, deleter: mpsc::Sender<Gc>, durable: bool) {
+fn writer_loop(cell: Arc<DbCell>, rx: mpsc::Receiver<Job>, deleter: mpsc::Sender<Gc>, durable: bool, space: Arc<space::Space>) {
+    let ballast = &space.ballast;
     // In non-durable mode redb can only recycle pages freed by earlier commits once a durable
     // commit happens, so make one at least this often even under constant load.
     const DURABLE_EVERY: Duration = Duration::from_secs(1);
@@ -1143,7 +1246,7 @@ fn writer_loop(db: Arc<Database>, rx: mpsc::Receiver<Job>, deleter: mpsc::Sender
                 Ok(j) => j,
                 Err(mpsc::RecvTimeoutError::Timeout) => {
                     // Periodically make non-durable commits durable so redb can reclaim pages.
-                    if flush(&db).is_ok() {
+                    if cell.get().and_then(|db| flush(&db)).is_ok() {
                         dirty = false;
                         last_durable = Instant::now();
                     }
@@ -1162,43 +1265,31 @@ fn writer_loop(db: Arc<Database>, rx: mpsc::Receiver<Job>, deleter: mpsc::Sender
         let force_durable = batch.iter().any(|j| matches!(j.op, Op::Flush));
         let immediate = durable || force_durable || last_durable.elapsed() >= DURABLE_EVERY;
 
+        // While the ballast can still be given up, keep the batch so a commit that fails on a
+        // full disk can be retried.
+        let backup: Option<Vec<Op>> = ballast.present().then(|| batch.iter().map(|j| j.op.clone()).collect());
         let mut results: Vec<S3Result<OpOut>> = Vec::with_capacity(batch.len());
         let mut obsolete: Vec<u128> = Vec::new();
-        let outcome: S3Result<()> = (|| {
-            let mut txn = db.begin_write()?;
-            if !immediate {
-                txn.set_durability(Durability::None).map_err(S3Error::internal)?;
-            }
-            {
-                let mut tx = Tables {
-                    buckets: txn.open_table(BUCKETS)?,
-                    objects: txn.open_table(OBJECTS)?,
-                    inline: txn.open_table(INLINE)?,
-                    uploads: txn.open_table(UPLOADS)?,
-                    parts: txn.open_table(PARTS)?,
-                    config: txn.open_table(CONFIG)?,
-                    versions: txn.open_table(VERSIONS)?,
-                    usage: txn.open_table(USAGE)?,
-                    part_bytes: txn.open_table(PART_BYTES)?,
-                };
-                for job in batch.iter_mut() {
-                    let mut garbage = Vec::new();
-                    let op = std::mem::replace(&mut job.op, Op::Flush);
-                    let r = apply(&mut tx, op, &mut garbage, &mut last_seq);
-                    if let Err(e) = &r
-                        && e.code == "InternalError"
-                    {
-                        return Err(e.clone());
-                    }
-                    if r.is_ok() {
-                        obsolete.extend(garbage);
-                    }
-                    results.push(r);
+        let mut outcome = run_batch(&cell, &mut batch, immediate, &mut last_seq, &mut results, &mut obsolete);
+        if let Err(e) = &outcome {
+            eprintln!("metadata commit failed: {e}");
+            // On a full disk, give up the ballast first: reopening the database may need space.
+            let retry = e.code == "StorageFull" && backup.is_some() && ballast.release();
+            recover(&cell);
+            if retry && let Some(ops) = backup {
+                eprintln!("disk full: released the {} MiB ballast file and retrying", ballast.size >> 20);
+                for (job, op) in batch.iter_mut().zip(ops) {
+                    job.op = op;
+                }
+                results.clear();
+                obsolete.clear();
+                outcome = run_batch(&cell, &mut batch, immediate, &mut last_seq, &mut results, &mut obsolete);
+                if let Err(e) = &outcome {
+                    eprintln!("metadata commit failed again: {e}");
+                    recover(&cell);
                 }
             }
-            txn.commit()?;
-            Ok(())
-        })();
+        }
 
         match outcome {
             Ok(()) => {
@@ -1214,15 +1305,75 @@ fn writer_loop(db: Arc<Database>, rx: mpsc::Receiver<Job>, deleter: mpsc::Sender
                 }
             }
             Err(e) => {
-                eprintln!("metadata commit failed: {e}");
                 for job in batch {
                     let _ = job.reply.send(Err(e.clone()));
                 }
             }
         }
     }
-    if dirty {
+    if dirty && let Ok(db) = cell.get() {
         let _ = flush(&db);
+    }
+}
+
+/// Apply a batch of operations in one transaction. On error nothing is committed.
+fn run_batch(
+    cell: &DbCell,
+    batch: &mut [Job],
+    immediate: bool,
+    last_seq: &mut u64,
+    results: &mut Vec<S3Result<OpOut>>,
+    obsolete: &mut Vec<u128>,
+) -> S3Result<()> {
+    let db = cell.get()?;
+    let mut txn = db.begin_write()?;
+    if !immediate {
+        txn.set_durability(Durability::None).map_err(S3Error::internal)?;
+    }
+    {
+        let mut tx = Tables {
+            buckets: txn.open_table(BUCKETS)?,
+            objects: txn.open_table(OBJECTS)?,
+            inline: txn.open_table(INLINE)?,
+            uploads: txn.open_table(UPLOADS)?,
+            parts: txn.open_table(PARTS)?,
+            config: txn.open_table(CONFIG)?,
+            versions: txn.open_table(VERSIONS)?,
+            usage: txn.open_table(USAGE)?,
+            part_bytes: txn.open_table(PART_BYTES)?,
+        };
+        for job in batch.iter_mut() {
+            let mut garbage = Vec::new();
+            let op = std::mem::replace(&mut job.op, Op::Flush);
+            let r = apply(&mut tx, op, &mut garbage, last_seq);
+            // Storage failures abort the whole transaction; S3-level errors only fail their op.
+            if let Err(e) = &r
+                && matches!(e.code, "InternalError" | "StorageFull")
+            {
+                return Err(e.clone());
+            }
+            if r.is_ok() {
+                obsolete.extend(garbage);
+            }
+            results.push(r);
+        }
+    }
+    txn.commit()?;
+    Ok(())
+}
+
+/// After a failed write: an I/O error (typically a full disk) poisons redb; reopen it so later
+/// writes, including the deletes that free space, can work again.
+fn recover(cell: &DbCell) {
+    let broken = match cell.get() {
+        Ok(db) => poisoned(&db),
+        Err(_) => true,
+    };
+    if broken {
+        match cell.reopen() {
+            Ok(()) => eprintln!("reopened the metadata database after an I/O error"),
+            Err(e) => eprintln!("could not reopen the metadata database yet: {e}"),
+        }
     }
 }
 
@@ -2010,8 +2161,14 @@ mod tests {
 
     fn temp_store() -> (Arc<Store>, PathBuf) {
         let dir = std::env::temp_dir().join(format!("s3rs-test-{}", util::id_hex(util::new_id())));
-        let store =
-            Store::open(StoreConfig { root: dir.clone(), fsync: false, inline_threshold: 1024, cache_bytes: 1 << 20 }).unwrap();
+        let store = Store::open(StoreConfig {
+            root: dir.clone(),
+            fsync: false,
+            inline_threshold: 1024,
+            cache_bytes: 1 << 20,
+            min_free: Some(0),
+        })
+        .unwrap();
         (store, dir)
     }
 
@@ -2164,12 +2321,18 @@ mod tests {
         }
         let store = (0..100)
             .find_map(|_| {
-                Store::open(StoreConfig { root: dir.clone(), fsync: false, inline_threshold: 1024, cache_bytes: 1 << 20 })
-                    .ok()
-                    .or_else(|| {
-                        std::thread::sleep(Duration::from_millis(20));
-                        None
-                    })
+                Store::open(StoreConfig {
+                    root: dir.clone(),
+                    fsync: false,
+                    inline_threshold: 1024,
+                    cache_bytes: 1 << 20,
+                    min_free: Some(0),
+                })
+                .ok()
+                .or_else(|| {
+                    std::thread::sleep(Duration::from_millis(20));
+                    None
+                })
             })
             .expect("store reopens");
         assert_eq!(store.bucket_usage("b").unwrap(), (2, 10));

@@ -128,6 +128,11 @@ jobs:
           ./target/release/s3rs fsck -d /tmp/s3rs-data --deep --encryption-key-file /tmp/s3rs.key
       - name: crash consistency (SIGKILL under concurrent writes)
         run: python3 tests/crash.py ./target/release/s3rs 8
+      - name: disk full (100 MB tmpfs)
+        run: |
+          sudo mkdir -p /mnt/small
+          sudo mount -t tmpfs -o size=100m,mode=1777 tmpfs /mnt/small
+          python3 tests/diskfull.py ./target/release/s3rs /mnt/small
       - name: Server log
         if: always()
         run: cat /tmp/s3rs.log

@@ -270,7 +270,13 @@ fn verify(h: Hashers, size: u64, e: &Expect, body: &impl Source) -> S3Result<([u
 }
 
 /// Stream a request body into storage, verifying lengths, digests and checksums.
+/// How often (in bytes received) an upload re-checks the free-space reserve.
+const SPACE_CHECK_EVERY: u64 = 8 << 20;
+
 pub async fn ingest(store: &Arc<Store>, mut body: impl Source, e: Expect) -> S3Result<Ingested> {
+    // Keep the free-space reserve: refuse now if the declared size can't fit, and re-check as
+    // data arrives (for uploads of unknown size, and for concurrent uploads sharing the space).
+    store.space.check(e.len.unwrap_or(0))?;
     if e.len.is_some_and(|l| l > e.max_len) {
         return Err(err::EntityTooLarge());
     }
@@ -340,12 +346,17 @@ pub async fn ingest(store: &Arc<Store>, mut body: impl Source, e: Expect) -> S3R
 
     let feed = async {
         let mut total = buf.len() as u64;
+        let mut next_space_check = SPACE_CHECK_EVERY;
         loop {
             match body.next().await? {
                 Some(b) => {
                     total += b.len() as u64;
                     if total > e.max_len {
                         return Err(err::EntityTooLarge());
+                    }
+                    if total >= next_space_check {
+                        store.space.check(0)?;
+                        next_space_check = total + SPACE_CHECK_EVERY;
                     }
                     buf.extend_from_slice(&b);
                     if buf.len() >= WRITE_CHUNK && tx.send(buf.split().freeze()).await.is_err() {
@@ -601,6 +612,9 @@ pub fn copy_range_blocking(
     src_key: Option<&WrapKey>,
     dst_key: Option<&WrapKey>,
 ) -> io::Result<(u128, [u8; 16])> {
+    if store.space.check(len).is_err() {
+        return Err(io::ErrorKind::StorageFull.into());
+    }
     let id = util::new_id();
     let tmp = store.tmp_path(id);
     let res = (|| {
@@ -659,6 +673,10 @@ pub fn copy_range_blocking(
 
 /// Create new data files sharing the content of `segs` (hard links; falls back to copying).
 pub fn link_segments_blocking(store: &Store, segs: &[(u128, u64)]) -> io::Result<Vec<(u128, u64)>> {
+    // Links cost no data space, but a copied object's metadata still needs room.
+    if store.space.check(0).is_err() {
+        return Err(io::ErrorKind::StorageFull.into());
+    }
     let mut out: Vec<(u128, u64)> = Vec::with_capacity(segs.len());
     for &(id, len) in segs {
         let new = util::new_id();

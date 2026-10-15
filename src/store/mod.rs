@@ -101,6 +101,8 @@ const REPL_WAIT: TableDefinition<&[u8], (u64, u64)> = TableDefinition::new("repl
 const EVENTS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("event_queue");
 /// Access keys created through the admin API: access key -> record (see crate::keys).
 const KEYS: TableDefinition<&str, &[u8]> = TableDefinition::new("access_keys");
+/// Server secrets generated on first start: name -> bytes (`sts`: signs STS session tokens).
+const SECRETS: TableDefinition<&str, &[u8]> = TableDefinition::new("secrets");
 const USAGE_VERSION: u64 = 2;
 /// Contents of the clean-shutdown marker. Older releases wrote an empty marker without
 /// maintaining usage, so any other content (or none) makes the next start recompute usage.
@@ -711,6 +713,14 @@ impl Store {
             txn.open_table(REPL_WAIT)?;
             txn.open_table(EVENTS)?;
             txn.open_table(KEYS)?;
+            {
+                let mut secrets = txn.open_table(SECRETS)?;
+                if secrets.get("sts")?.is_none() {
+                    let mut k = [0u8; 32];
+                    getrandom::fill(&mut k).expect("system randomness");
+                    secrets.insert("sts", k.as_slice())?;
+                }
+            }
             txn.commit()?;
         }
         // After a crash or a run of an older release, the counters may not match the data.
@@ -976,6 +986,13 @@ impl Store {
     /// The queue keys of all event notifications for `target` (to drop a removed target's).
     pub fn event_keys(&self, target: &str) -> S3Result<Vec<Vec<u8>>> {
         Ok(self.events(target, usize::MAX)?.into_iter().map(|(k, _)| k).collect())
+    }
+
+    /// The key that signs STS session tokens.
+    pub fn session_key(&self) -> S3Result<[u8; 32]> {
+        let txn = self.db.get()?.begin_read()?;
+        let v = txn.open_table(SECRETS)?.get("sts")?.ok_or_else(|| S3Error::internal("the STS key is missing"))?;
+        v.value().try_into().map_err(|_| S3Error::internal("the STS key is damaged"))
     }
 
     /// Access keys created through the admin API: (access key, record).

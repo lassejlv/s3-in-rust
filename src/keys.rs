@@ -91,6 +91,7 @@ impl Record {
             buckets: self.buckets.clone(),
             policy,
             expires_ms: self.expires_ms,
+            session: None,
         })
     }
 }
@@ -294,6 +295,7 @@ mod tests {
             buckets: None,
             policy: None,
             expires_ms: None,
+            session: None,
         }];
         let (_, r) = parse_request(r#"{"secret_key":"0123456789abcdef0","read_only":true}"#, 0).unwrap();
         let stored = vec![("a".to_string(), r.encode()), ("b".to_string(), r.encode()), ("c".to_string(), b"junk".to_vec())];

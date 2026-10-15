@@ -642,7 +642,7 @@ impl Server {
     ) -> iam::Ctx<'a> {
         iam::Ctx {
             username: match principal {
-                Principal::User(c) => Some(c.access_key.as_str()),
+                Principal::User(c) => Some(c.identity()),
                 _ => None,
             },
             source_ip: client.ip,
@@ -684,6 +684,12 @@ impl Server {
             Principal::User(c) => {
                 if c.read_only && !(action.starts_with("s3:Get") || action.starts_with("s3:List")) {
                     return Err(err::AccessDenied().with_message("This access key is read-only"));
+                }
+                // A session may do only what its session policy allows, on top of the rest.
+                if let Some(p) = c.session.as_ref().and_then(|s| s.policy.as_ref())
+                    && p.evaluate(action, &resource(), ctx) != iam::Decision::Allow
+                {
+                    return Err(err::AccessDenied().with_message("The session policy does not allow this"));
                 }
                 if let Some(b) = bucket
                     && !c.can_access(b)
@@ -1036,6 +1042,57 @@ impl Server {
         Ok(())
     }
 
+    /// STS (`POST /` with a form body): AssumeRole. Errors use STS's own XML format.
+    async fn sts(&self, parts: &Parts, body: Incoming, peer: SocketAddr, rid: &str, rec: &mut crate::accesslog::Record) -> Resp {
+        let result = self.assume_role(parts, body, peer, rid, rec).await;
+        let mut r = Resp::new(match &result {
+            Ok(_) => StatusCode::OK,
+            Err(e) => e.status,
+        });
+        r.set("content-type", "text/xml");
+        r.body = Body::full(match result {
+            Ok(xml) => xml,
+            Err(e) => crate::sts::error_xml(&e, rid),
+        });
+        r
+    }
+
+    async fn assume_role(
+        &self,
+        parts: &Parts,
+        body: Incoming,
+        peer: SocketAddr,
+        rid: &str,
+        rec: &mut crate::accesslog::Record,
+    ) -> S3Result<String> {
+        let Some(a) = &self.auth else {
+            return Err(crate::sts::error("InvalidAction", "STS is not available when authentication is disabled"));
+        };
+        let body = http_body_util::BodyExt::collect(http_body_util::Limited::new(body, 64 * 1024))
+            .await
+            .map_err(|_| crate::sts::error("ValidationError", "The request body is too large"))?
+            .to_bytes();
+        let principal = a.verify_with_body(parts, parts.uri.query().unwrap_or(""), &body)?;
+        let Principal::User(c) = &principal else { return Err(err::AccessDenied()) };
+        rec.user = Some(c.identity().to_string());
+        self.throttle(&principal, self.client(&parts.headers, peer).ip)?;
+        let text = std::str::from_utf8(&body).map_err(|_| crate::sts::error("ValidationError", "The body is not UTF-8"))?;
+        let req = match crate::sts::parse_request(&crate::sts::parse_form(text))? {
+            crate::sts::Action::GetCallerIdentity => return Ok(crate::sts::identity_xml(c, rid)),
+            crate::sts::Action::AssumeRole(r) => r,
+        };
+        if c.session.is_some() {
+            return Err(err::AccessDenied().with_message("Temporary credentials cannot assume a role"));
+        }
+        let key = a.session_key().ok_or_else(|| S3Error::internal("the STS key is not loaded"))?;
+        let mut expires = now_ms() + req.duration_secs * 1000;
+        if let Some(t) = c.expires_ms {
+            expires = expires.min(t);
+        }
+        let issued = crate::sts::issue(key, &c.access_key, &req.name, req.policy.as_deref(), expires);
+        Ok(crate::sts::response_xml(&issued, &c.access_key, &req.name, rid))
+    }
+
     /// Set the keys from the command line and credentials file (at startup and on SIGHUP), and
     /// put them in effect together with the stored keys. Returns how many keys are in effect.
     pub fn set_file_credentials(&self, creds: Vec<auth::Credential>) -> S3Result<usize> {
@@ -1280,6 +1337,12 @@ impl Server {
             return self.preflight(&parts, bucket.as_deref());
         }
         if parts.method == Method::POST
+            && bucket.is_none()
+            && header(&parts.headers, "content-type").is_some_and(|t| t.starts_with("application/x-www-form-urlencoded"))
+        {
+            return Ok(self.sts(&parts, body, peer, rid, rec).await);
+        }
+        if parts.method == Method::POST
             && key.is_none()
             && let Some(b) = &bucket
             && let Some(boundary) = header(&parts.headers, "content-type").and_then(crate::post::boundary)
@@ -1294,7 +1357,7 @@ impl Server {
             Some(_) => (auth::payload_mode(&parts)?, Principal::Anonymous),
         };
         if let Principal::User(c) = &principal {
-            rec.user = Some(c.access_key.clone());
+            rec.user = Some(c.identity().to_string());
         }
         self.throttle(&principal, self.client(&parts.headers, peer).ip)?;
         let query = parse_query(raw_query);
@@ -1654,7 +1717,7 @@ impl Server {
                 // point it at arbitrary destination buckets.
                 let unrestricted = match &r.principal {
                     Principal::Everyone => true,
-                    Principal::User(c) => c.buckets.is_none() && c.policy.is_none() && !c.read_only,
+                    Principal::User(c) => c.unrestricted(),
                     Principal::Anonymous => false,
                 };
                 if !unrestricted {
@@ -2373,7 +2436,7 @@ impl Server {
             etag: String::new(),
             version: None,
             principal: match principal {
-                Principal::User(c) => c.access_key.clone(),
+                Principal::User(c) => c.identity().to_string(),
                 _ => String::new(),
             },
             source_ip: ip.to_string(),
@@ -2649,7 +2712,7 @@ impl Server {
     /// otherwise.
     fn throttle(&self, principal: &Principal, ip: IpAddr) -> S3Result<()> {
         let refused = match principal {
-            Principal::User(c) => self.key_limit.as_ref().map(|l| l.check(&c.access_key)),
+            Principal::User(c) => self.key_limit.as_ref().map(|l| l.check(c.identity())),
             _ => self.anon_limit.as_ref().map(|l| l.check(&ip.to_string())),
         };
         match refused {

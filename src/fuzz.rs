@@ -274,6 +274,7 @@ fn auth_headers() {
         buckets: None,
         policy: None,
         expires_ms: None,
+        session: None,
     }]);
     let seeds: &[&[u8]] = &[
         b"AWS4-HMAC-SHA256 Credential=AKID/20240101/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=0000000000000000000000000000000000000000000000000000000000000000",

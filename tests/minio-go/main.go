@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/minio/minio-go/v7"
@@ -89,6 +90,29 @@ func main() {
 	}
 	cancel()
 	fmt.Println("listen", info.Records[0].EventName, info.Records[0].S3.Object.Key)
+	// Temporary credentials from STS AssumeRole (minio-go's own STS client).
+	scheme := "http://"
+	if os.Getenv("S3RS_TLS") == "1" {
+		scheme = "https://"
+	}
+	sts, err := credentials.NewSTSAssumeRole(scheme+endpoint, credentials.STSAssumeRoleOptions{
+		AccessKey:       env("S3RS_ACCESS_KEY", "testkey"),
+		SecretKey:       env("S3RS_SECRET_KEY", "testsecret"),
+		DurationSeconds: 900,
+		RoleSessionName: "minio-go",
+	})
+	must(err, "sts")
+	tc, err := minio.New(endpoint, &minio.Options{Creds: sts, Secure: os.Getenv("S3RS_TLS") == "1"})
+	must(err, "sts client")
+	_, err = tc.PutObject(ctx, "gotest", "sts.txt", bytes.NewReader([]byte("via sts")), 7, minio.PutObjectOptions{})
+	must(err, "put with session credentials")
+	v, err := sts.Get()
+	must(err, "session credentials")
+	if !strings.HasPrefix(v.AccessKeyID, "ASIA") || v.SessionToken == "" {
+		fmt.Printf("FAIL sts: unexpected credentials %s\n", v.AccessKeyID)
+		os.Exit(1)
+	}
+	fmt.Println("sts: put with session credentials", v.AccessKeyID)
 	for o := range c.ListObjects(ctx, "gotest", minio.ListObjectsOptions{Recursive: true}) {
 		must(c.RemoveObject(ctx, "gotest", o.Key, minio.RemoveObjectOptions{}), "rm")
 	}

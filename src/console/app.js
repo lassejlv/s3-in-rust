@@ -88,27 +88,30 @@ class S3Error extends Error {
 
 const S3 = {
   ak: "", sk: "", region: "us-east-1",
+  // Session token of temporary (STS) credentials.
+  token: "",
   keyCache: new Map(),
 
-  async signingKey(date) {
-    const id = `${date}/${this.region}`;
+  async signingKey(date, service = "s3") {
+    const id = `${date}/${this.region}/${service}`;
     if (!this.keyCache.has(id)) {
       let k = await hmac(enc.encode("AWS4" + this.sk), date);
       k = await hmac(k, this.region);
-      k = await hmac(k, "s3");
+      k = await hmac(k, service);
       this.keyCache.set(id, await hmac(k, "aws4_request"));
     }
     return this.keyCache.get(id);
   },
 
   // Sign a request; returns { url, headers } ready for fetch / XHR.
-  async sign(method, path, { query = {}, headers = {}, payloadHash = EMPTY_SHA256 } = {}) {
+  async sign(method, path, { query = {}, headers = {}, payloadHash = EMPTY_SHA256, service = "s3" } = {}) {
     const amzDate = new Date().toISOString().replace(/[-:]|\.\d{3}/g, "");
     const date = amzDate.slice(0, 8);
     const h = {};
     for (const [k, v] of Object.entries(headers)) h[k.toLowerCase()] = String(v).trim();
     h["x-amz-date"] = amzDate;
     h["x-amz-content-sha256"] = payloadHash;
+    if (this.token) h["x-amz-security-token"] = this.token;
     const all = { host: location.host, ...h };
     const names = Object.keys(all).sort();
     const canonicalUri = uriEncode(path, true);
@@ -118,9 +121,9 @@ const S3 = {
       .map(([k, v]) => `${k}=${v}`)
       .join("&");
     const creq = [method, canonicalUri, canonicalQuery, names.map((n) => `${n}:${all[n]}\n`).join(""), names.join(";"), payloadHash].join("\n");
-    const scope = `${date}/${this.region}/s3/aws4_request`;
+    const scope = `${date}/${this.region}/${service}/aws4_request`;
     const sts = ["AWS4-HMAC-SHA256", amzDate, scope, await sha256Hex(creq)].join("\n");
-    const sig = hex(await hmac(await this.signingKey(date), sts));
+    const sig = hex(await hmac(await this.signingKey(date, service), sts));
     h["authorization"] = `AWS4-HMAC-SHA256 Credential=${this.ak}/${scope}, SignedHeaders=${names.join(";")}, Signature=${sig}`;
     return { url: canonicalUri + (canonicalQuery ? "?" + canonicalQuery : ""), headers: h };
   },
@@ -138,6 +141,7 @@ const S3 = {
       "X-Amz-Expires": String(expires),
       "X-Amz-SignedHeaders": "host",
     };
+    if (this.token) query["X-Amz-Security-Token"] = this.token;
     const canonicalUri = uriEncode(path, true);
     const canonicalQuery = Object.keys(query)
       .map((k) => [uriEncode(k), uriEncode(query[k])])
@@ -150,10 +154,10 @@ const S3 = {
     return `${location.origin}${canonicalUri}?${canonicalQuery}&X-Amz-Signature=${sig}`;
   },
 
-  async request(method, path, { query = {}, headers = {}, body = null } = {}) {
+  async request(method, path, { query = {}, headers = {}, body = null, service = "s3" } = {}) {
     const bytes = typeof body === "string" ? enc.encode(body) : body;
     const payloadHash = bytes ? await sha256Hex(bytes) : EMPTY_SHA256;
-    const s = await this.sign(method, path, { query, headers, payloadHash });
+    const s = await this.sign(method, path, { query, headers, payloadHash, service });
     const resp = await fetch(s.url, { method, headers: s.headers, body: bytes, cache: "no-store" });
     if (!resp.ok && resp.status !== 304) {
       let code = null, message = null;
@@ -163,6 +167,8 @@ const S3 = {
         code = xmlText(doc, "Code");
         message = xmlText(doc, "Message");
       }
+      // The console's session ran out: sign in again.
+      if (code === "ExpiredToken" && this.token) logout();
       throw new S3Error(resp.status, code, message ? `${code}: ${message}` : code || `HTTP ${resp.status}`);
     }
     return resp;
@@ -171,6 +177,16 @@ const S3 = {
   async xml(method, path, opts) {
     const resp = await this.request(method, path, opts);
     return new DOMParser().parseFromString(await resp.text(), "application/xml");
+  },
+
+  // Temporary credentials for the current key (STS AssumeRole).
+  async assumeRole(seconds) {
+    const body = `Action=AssumeRole&Version=2011-06-15&RoleSessionName=console&DurationSeconds=${seconds}`;
+    const doc = await this.xml("POST", "/", { body, service: "sts", headers: { "content-type": "application/x-www-form-urlencoded" } });
+    return {
+      ak: xmlText(doc, "AccessKeyId"), sk: xmlText(doc, "SecretAccessKey"), token: xmlText(doc, "SessionToken"),
+      expires: Date.parse(xmlText(doc, "Expiration")),
+    };
   },
 
   async listBuckets() {
@@ -273,16 +289,28 @@ function browserReachable(key) {
 
 // ------------------------------------------------------------------ login
 
-async function login(ak, sk, region, remember) {
-  S3.ak = ak; S3.sk = sk; S3.region = region; S3.keyCache.clear();
+// Sign in with a key, or with saved session credentials (`token`, `user`).
+async function login(ak, sk, region, remember, saved = null) {
+  S3.ak = ak; S3.sk = sk; S3.region = region; S3.token = saved ? saved.token : ""; S3.keyCache.clear();
   state.buckets = await S3.listBuckets();
-  // By default the key lives only in this page's memory; reloading signs out.
-  if (remember) {
-    try { sessionStorage.setItem("s3rs-console", JSON.stringify({ ak, sk, region })); } catch (_) { /* private mode */ }
+  const user = saved ? saved.user : ak;
+  // Work with 12-hour session credentials from here on, so the key's own secret is not kept
+  // (or saved) by the page. Servers without STS keep using the key.
+  if (!saved) {
+    try {
+      const s = await S3.assumeRole(12 * 3600);
+      S3.ak = s.ak; S3.sk = s.sk; S3.token = s.token; S3.keyCache.clear();
+      // By default nothing is saved; reloading signs out.
+      if (remember) {
+        try {
+          sessionStorage.setItem("s3rs-console", JSON.stringify({ ak: s.ak, sk: s.sk, token: s.token, user, region, expires: s.expires }));
+        } catch (_) { /* private mode */ }
+      }
+    } catch (_) { /* keep the key */ }
   }
   $("login").classList.add("hidden");
   $("app").classList.remove("hidden");
-  $("whoami").textContent = `${ak} @ ${location.host}`;
+  $("whoami").textContent = `${user} @ ${location.host}`;
   renderBuckets();
   let fromHash = "";
   try { fromHash = decodeURIComponent(location.hash.slice(1)); } catch (_) { /* malformed link */ }
@@ -828,8 +856,11 @@ document.addEventListener("DOMContentLoaded", () => {
 
   let saved = null;
   try { saved = JSON.parse(sessionStorage.getItem("s3rs-console") || "null"); } catch (_) { /* ignore */ }
-  if (saved) {
-    login(saved.ak, saved.sk, saved.region, true).catch(() => $("login").classList.remove("hidden"));
+  if (saved && saved.token && saved.expires > Date.now()) {
+    login(saved.ak, saved.sk, saved.region, true, saved).catch(() => {
+      try { sessionStorage.removeItem("s3rs-console"); } catch (_) { /* ignore */ }
+      $("login").classList.remove("hidden");
+    });
   } else {
     $("login").classList.remove("hidden");
   }

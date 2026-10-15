@@ -1,9 +1,8 @@
 //! AWS Signature Version 4: header auth, presigned URLs and streaming (aws-chunked) payloads.
 
-use crate::error::{S3Error, S3Result, err};
+use crate::error::{S3Result, err};
 use crate::util::{self, ct_eq, hex, uri_decode, uri_encode};
 use hmac::{KeyInit, Mac};
-use hyper::StatusCode;
 use hyper::http::request::Parts;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -93,9 +92,24 @@ pub struct Credential {
     pub policy: Option<Arc<crate::iam::Policy>>,
     /// A temporary key stops working at this time (unix milliseconds).
     pub expires_ms: Option<u64>,
+    /// Set for temporary credentials from STS AssumeRole.
+    pub session: Option<Arc<crate::sts::Session>>,
 }
 
 impl Credential {
+    /// Who this is in policies, rate limits and logs: a session acts as the key it was issued for.
+    pub fn identity(&self) -> &str {
+        self.session.as_ref().map_or(&self.access_key, |s| &s.parent)
+    }
+
+    /// Not limited in any way (read-only, bucket patterns, a policy or a session policy).
+    pub fn unrestricted(&self) -> bool {
+        self.buckets.is_none()
+            && self.policy.is_none()
+            && !self.read_only
+            && self.session.as_ref().is_none_or(|s| s.policy.is_none())
+    }
+
     pub fn can_access(&self, bucket: &str) -> bool {
         self.buckets.as_ref().is_none_or(|pats| pats.iter().any(|p| crate::access::glob(p, bucket, false)))
     }
@@ -127,6 +141,24 @@ pub struct Auth {
     /// Bumped on every reload and part of the signing-key cache key, so a key derived from an
     /// old secret by a request racing the reload is never served afterwards.
     generation: std::sync::atomic::AtomicU64,
+    /// Signs session tokens (STS); set once the metadata database is open.
+    session_key: std::sync::OnceLock<[u8; 32]>,
+    /// Session credentials already checked: access key -> (token, generation, credential).
+    sessions: Mutex<HashMap<String, CachedSession>>,
+}
+
+/// (session token, credentials generation, credential).
+type CachedSession = (String, u64, Arc<Credential>);
+
+/// The session token sent with a request, if any.
+fn security_token<'a>(parts: &'a Parts, raw_query: &'a str) -> Option<std::borrow::Cow<'a, str>> {
+    if let Some(t) = parts.headers.get("x-amz-security-token").and_then(|v| v.to_str().ok()) {
+        return Some(t.into());
+    }
+    raw_query.split('&').find_map(|p| {
+        let (k, v) = p.split_once('=')?;
+        k.eq_ignore_ascii_case("x-amz-security-token").then(|| uri_decode(v, false).unwrap_or_default().into())
+    })
 }
 
 /// Whether a request carries any authentication (header or presigned query).
@@ -143,6 +175,7 @@ struct SigParams<'a> {
     service: &'a str,
     signed_headers: &'a str,
     signature: &'a str,
+    token: Option<&'a str>,
 }
 
 fn parse_credential(cred: &str) -> S3Result<(&str, &str, &str, &str)> {
@@ -182,6 +215,8 @@ impl Auth {
             creds: RwLock::new(Arc::new(HashMap::new())),
             key_cache: Mutex::new(HashMap::new()),
             generation: std::sync::atomic::AtomicU64::new(0),
+            session_key: std::sync::OnceLock::new(),
+            sessions: Mutex::new(HashMap::new()),
         };
         auth.replace(creds);
         auth
@@ -193,27 +228,84 @@ impl Auth {
         *self.creds.write().unwrap() = Arc::new(map);
         self.generation.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         self.key_cache.lock().unwrap().clear();
+        self.sessions.lock().unwrap().clear();
     }
 
-    fn credential(&self, access_key: &str) -> S3Result<Arc<Credential>> {
-        let c = self.creds.read().unwrap().get(access_key).cloned().ok_or_else(err::InvalidAccessKeyId)?;
-        if c.expires_ms.is_some_and(|t| util::now_ms() >= t) {
+    /// The key that signs session tokens (kept in the metadata database).
+    pub fn set_session_key(&self, key: [u8; 32]) {
+        let _ = self.session_key.set(key);
+    }
+
+    pub fn session_key(&self) -> Option<&[u8; 32]> {
+        self.session_key.get()
+    }
+
+    fn credential(&self, access_key: &str, token: Option<&str>) -> S3Result<Arc<Credential>> {
+        let now = util::now_ms();
+        let c = match self.creds.read().unwrap().get(access_key).cloned() {
+            Some(c) => c,
+            None => match token {
+                Some(t) if crate::sts::is_session_key(access_key) => self.session(access_key, t, now)?,
+                _ => return Err(err::InvalidAccessKeyId()),
+            },
+        };
+        if c.expires_ms.is_some_and(|t| now >= t) {
             // The code SDKs answer by fetching fresh credentials.
-            return Err(S3Error::new("ExpiredToken", StatusCode::BAD_REQUEST, "The provided token has expired."));
+            return Err(crate::sts::expired_token());
         }
         Ok(c)
     }
 
-    fn principal(&self, access_key: &str) -> Principal {
-        match self.credential(access_key) {
+    /// The credential of an STS session: the claims in its token, checked against the server's
+    /// key, applied to the key it was issued for as that key is now.
+    fn session(&self, access_key: &str, token: &str, now: u64) -> S3Result<Arc<Credential>> {
+        use std::sync::atomic::Ordering::SeqCst;
+        let key = self.session_key.get().ok_or_else(err::InvalidAccessKeyId)?;
+        let generation = self.generation.load(SeqCst);
+        if let Some((t, g, c)) = self.sessions.lock().unwrap().get(access_key)
+            && *g == generation
+            && ct_eq(t.as_bytes(), token.as_bytes())
+        {
+            return Ok(c.clone());
+        }
+        let claims = crate::sts::open(key, access_key, token, now)?;
+        let parent = self.creds.read().unwrap().get(&claims.parent).cloned().ok_or_else(crate::sts::invalid_token)?;
+        let policy = match &claims.policy {
+            Some(p) => Some(Arc::new(
+                crate::iam::Policy::parse(p, crate::iam::Kind::Identity, None).map_err(|_| crate::sts::invalid_token())?,
+            )),
+            None => None,
+        };
+        let c = Arc::new(Credential {
+            access_key: access_key.to_string(),
+            secret: crate::sts::secret_for(key, access_key),
+            read_only: parent.read_only,
+            buckets: parent.buckets.clone(),
+            policy: parent.policy.clone(),
+            expires_ms: Some(parent.expires_ms.map_or(claims.expires_ms, |t| t.min(claims.expires_ms))),
+            session: Some(Arc::new(crate::sts::Session { parent: claims.parent, name: claims.name, policy })),
+        });
+        let mut cache = self.sessions.lock().unwrap();
+        // A reload since `generation` was read may have changed the parent: don't cache then.
+        if self.generation.load(SeqCst) == generation {
+            if cache.len() >= 4096 {
+                cache.clear();
+            }
+            cache.insert(access_key.to_string(), (token.to_string(), generation, c.clone()));
+        }
+        Ok(c)
+    }
+
+    fn principal(&self, access_key: &str, token: Option<&str>) -> Principal {
+        match self.credential(access_key, token) {
             Ok(c) => Principal::User(c),
             Err(_) => Principal::Anonymous,
         }
     }
 
-    fn signing_key(&self, access_key: &str, date: &str, region: &str, service: &str) -> S3Result<[u8; 32]> {
+    fn signing_key(&self, access_key: &str, token: Option<&str>, date: &str, region: &str, service: &str) -> S3Result<[u8; 32]> {
         let generation = self.generation.load(std::sync::atomic::Ordering::SeqCst);
-        let cred = self.credential(access_key)?;
+        let cred = self.credential(access_key, token)?;
         let secret = &cred.secret;
         let cache_key = format!("{generation}/{access_key}/{date}/{region}/{service}");
         if let Some(k) = self.key_cache.lock().unwrap().get(&cache_key) {
@@ -234,18 +326,20 @@ impl Auth {
     /// Authenticate a request. `vhost_bucket` is the bucket taken from the Host header for
     /// virtual-hosted-style requests (needed for SigV2's canonical resource).
     pub fn verify(&self, parts: &Parts, raw_query: &str, vhost_bucket: Option<&str>) -> S3Result<(Payload, Principal)> {
+        let token = security_token(parts, raw_query);
+        let token = token.as_deref();
         if let Some(h) = parts.headers.get(hyper::header::AUTHORIZATION) {
             let h = h.to_str().map_err(|_| err::AccessDenied())?;
             if let Some(v2) = h.strip_prefix("AWS ") {
                 let (ak, sig) =
                     v2.split_once(':').ok_or_else(|| err::InvalidArgument().with_message("Malformed Authorization header"))?;
-                self.verify_v2(parts, raw_query, vhost_bucket, ak, sig, None)?;
-                return Ok((payload_mode(parts)?, self.principal(ak)));
+                self.verify_v2(parts, raw_query, vhost_bucket, ak, sig, None, token)?;
+                return Ok((payload_mode(parts)?, self.principal(ak, token)));
             }
-            return self.verify_header(parts, raw_query, h);
+            return self.verify_header(parts, raw_query, h, None, token);
         }
         if raw_query.contains("X-Amz-Signature=") {
-            return self.verify_presigned(parts, raw_query);
+            return self.verify_presigned(parts, raw_query, token);
         }
         if raw_query.contains("Signature=") && raw_query.contains("AWSAccessKeyId=") {
             let q: HashMap<String, String> = raw_query
@@ -259,8 +353,8 @@ impl Auth {
                 return Err(err::AccessDenied().with_message("Request has expired"));
             }
             let ak = get("AWSAccessKeyId")?;
-            self.verify_v2(parts, raw_query, vhost_bucket, ak, get("Signature")?, Some(expires))?;
-            return Ok((payload_mode(parts)?, self.principal(ak)));
+            self.verify_v2(parts, raw_query, vhost_bucket, ak, get("Signature")?, Some(expires), token)?;
+            return Ok((payload_mode(parts)?, self.principal(ak, token)));
         }
         Err(err::AccessDenied())
     }
@@ -268,6 +362,7 @@ impl Auth {
     /// Verify the signature of a browser-form upload (POST policy). `fields` maps lowercase
     /// form-field names to values; the signature covers the base64 policy document.
     pub fn verify_post_policy(&self, fields: &HashMap<String, String>, policy_b64: &str) -> S3Result<Principal> {
+        let token = fields.get("x-amz-security-token").map(String::as_str);
         if let Some(sig) = fields.get("x-amz-signature") {
             if fields.get("x-amz-algorithm").map(String::as_str) != Some(ALGO) {
                 return Err(err::InvalidArgument().with_message("x-amz-algorithm must be AWS4-HMAC-SHA256"));
@@ -275,28 +370,29 @@ impl Auth {
             let cred =
                 fields.get("x-amz-credential").ok_or_else(|| err::AccessDenied().with_message("Missing x-amz-credential"))?;
             let (ak, date, region, service) = parse_credential(cred)?;
-            let key = self.signing_key(ak, date, region, service)?;
+            let key = self.signing_key(ak, token, date, region, service)?;
             let expected = hex(&hmac(&key, policy_b64.as_bytes()));
             if !ct_eq(expected.as_bytes(), sig.trim().as_bytes()) {
                 return Err(err::SignatureDoesNotMatch());
             }
-            return Ok(self.principal(ak));
+            return Ok(self.principal(ak, token));
         }
         if let (Some(ak), Some(sig)) = (fields.get("awsaccesskeyid"), fields.get("signature")) {
-            let cred = self.credential(ak)?;
+            let cred = self.credential(ak, token)?;
             let secret = cred.secret.as_bytes();
             let mut m = <hmac::Hmac<sha1::Sha1> as KeyInit>::new_from_slice(secret).expect("hmac key");
             m.update(policy_b64.as_bytes());
             if !ct_eq(util::base64(&m.finalize().into_bytes()).as_bytes(), sig.trim().as_bytes()) {
                 return Err(err::SignatureDoesNotMatch());
             }
-            return Ok(self.principal(ak));
+            return Ok(self.principal(ak, token));
         }
         Err(err::InvalidArgument()
             .with_message("Bucket POST with a policy must contain a signature (Signature or X-Amz-Signature)"))
     }
 
     /// AWS Signature Version 2 (legacy; still used by some clients for presigned URLs).
+    #[allow(clippy::too_many_arguments)]
     fn verify_v2(
         &self,
         parts: &Parts,
@@ -305,8 +401,9 @@ impl Auth {
         access_key: &str,
         signature: &str,
         expires: Option<u64>,
+        token: Option<&str>,
     ) -> S3Result<()> {
-        let cred = self.credential(access_key)?;
+        let cred = self.credential(access_key, token)?;
         let secret = cred.secret.as_bytes();
         let h = |n: &str| parts.headers.get(n).and_then(|v| v.to_str().ok()).unwrap_or("").trim();
         let date = match expires {
@@ -334,8 +431,24 @@ impl Auth {
                 }
             }
         }
+        // Presigned (query-string) requests carry x-amz-* values, such as the session token,
+        // and Content-Type / Content-MD5 in the query; they are signed like headers.
+        let (mut md5, mut ctype) = (h("content-md5").to_string(), h("content-type").to_string());
+        if expires.is_some() {
+            for p in raw_query.split('&') {
+                let (k, v) = p.split_once('=').unwrap_or((p, ""));
+                let k = uri_decode(k, true).unwrap_or_default().to_ascii_lowercase();
+                let v = uri_decode(v, false).unwrap_or_default();
+                match k.as_str() {
+                    "content-md5" if md5.is_empty() => md5 = v,
+                    "content-type" if ctype.is_empty() => ctype = v,
+                    n if n.starts_with("x-amz-") && !amz.iter().any(|(k, _)| k == n) => amz.push((k, v.trim().to_string())),
+                    _ => {}
+                }
+            }
+        }
         amz.sort();
-        let mut sts = format!("{}\n{}\n{}\n{}\n", parts.method.as_str(), h("content-md5"), h("content-type"), date);
+        let mut sts = format!("{}\n{md5}\n{ctype}\n{date}\n", parts.method.as_str());
         for (k, v) in &amz {
             sts.push_str(k);
             sts.push(':');
@@ -411,7 +524,16 @@ impl Auth {
         Ok(())
     }
 
-    fn verify_header(&self, parts: &Parts, raw_query: &str, h: &str) -> S3Result<(Payload, Principal)> {
+    /// `body_sha256` is the hash of a body already read, for requests that sign it without
+    /// sending `x-amz-content-sha256` (STS).
+    fn verify_header(
+        &self,
+        parts: &Parts,
+        raw_query: &str,
+        h: &str,
+        body_sha256: Option<&str>,
+        token: Option<&str>,
+    ) -> S3Result<(Payload, Principal)> {
         let Some(rest) = h.strip_prefix(ALGO) else {
             return Err(
                 err::InvalidArgument().with_message("Unsupported authorization type (only AWS4-HMAC-SHA256 is supported)")
@@ -446,14 +568,16 @@ impl Auth {
             return Err(err::RequestTimeTooSkewed());
         }
 
-        let content_sha = parts
-            .headers
-            .get("x-amz-content-sha256")
-            .and_then(|v| v.to_str().ok())
-            .ok_or_else(|| err::InvalidRequest().with_message("Missing required header for this request: x-amz-content-sha256"))?
-            .to_string();
+        let content_sha = match (parts.headers.get("x-amz-content-sha256").and_then(|v| v.to_str().ok()), body_sha256) {
+            (Some(h), Some(b)) if h != b => return Err(err::XAmzContentSHA256Mismatch()),
+            (Some(h), _) => h.to_string(),
+            (None, Some(b)) => b.to_string(),
+            (None, None) => {
+                return Err(err::InvalidRequest().with_message("Missing required header for this request: x-amz-content-sha256"));
+            }
+        };
 
-        let p = SigParams { access_key, date, region, service, signed_headers, signature };
+        let p = SigParams { access_key, date, region, service, signed_headers, signature, token };
         let key = self.check_signature(parts, raw_query, &p, &amz_date, &content_sha, false)?;
 
         let mut mode = payload_mode(parts)?;
@@ -467,10 +591,22 @@ impl Auth {
                 prev: signature.to_string(),
             });
         }
-        Ok((mode, self.principal(access_key)))
+        Ok((mode, self.principal(access_key, token)))
     }
 
-    fn verify_presigned(&self, parts: &Parts, raw_query: &str) -> S3Result<(Payload, Principal)> {
+    /// Authenticate a request whose body has been read (STS): SigV4 in a header, over the body.
+    pub fn verify_with_body(&self, parts: &Parts, raw_query: &str, body: &[u8]) -> S3Result<Principal> {
+        let h = parts
+            .headers
+            .get(hyper::header::AUTHORIZATION)
+            .and_then(|h| h.to_str().ok())
+            .ok_or_else(|| err::AccessDenied().with_message("Missing Authentication Token"))?;
+        let token = security_token(parts, raw_query);
+        let sha = sha256_hex(body);
+        Ok(self.verify_header(parts, raw_query, h, Some(&sha), token.as_deref())?.1)
+    }
+
+    fn verify_presigned(&self, parts: &Parts, raw_query: &str, token: Option<&str>) -> S3Result<(Payload, Principal)> {
         let mut get = HashMap::new();
         for pair in raw_query.split('&') {
             let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
@@ -509,13 +645,14 @@ impl Auth {
             service,
             signed_headers: field("X-Amz-SignedHeaders")?,
             signature: field("X-Amz-Signature")?,
+            token,
         };
         self.check_signature(parts, raw_query, &p, amz_date, &content_sha, true)?;
         match payload_mode(parts)? {
             Payload::Chunked { .. } => {
                 Err(err::NotImplemented().with_message("Streaming payloads are not supported with presigned URLs"))
             }
-            m => Ok((m, self.principal(access_key))),
+            m => Ok((m, self.principal(access_key, token))),
         }
     }
 
@@ -549,7 +686,7 @@ impl Auth {
         let canonical_headers = canonical_headers(parts, &signed);
         let canonical_query = canonical_query(raw_query, presigned);
         let scope = format!("{}/{}/{}/aws4_request", p.date, p.region, p.service);
-        let key = self.signing_key(p.access_key, p.date, p.region, p.service)?;
+        let key = self.signing_key(p.access_key, p.token, p.date, p.region, p.service)?;
 
         let raw_path = parts.uri.path();
         let normalized = uri_decode(raw_path, false).map(|d| uri_encode(&d, true));
@@ -661,6 +798,7 @@ mod tests {
             buckets: None,
             policy: None,
             expires_ms: None,
+            session: None,
         }])
     }
 
@@ -673,9 +811,33 @@ mod tests {
             buckets: Some(vec!["team-a-*".into(), "shared".into()]),
             policy: None,
             expires_ms: None,
+            session: None,
         };
         assert!(c.can_access("team-a-logs") && c.can_access("shared"));
         assert!(!c.can_access("team-b") && !c.can_access("shared2"));
+    }
+
+    #[test]
+    fn session_credentials() {
+        let auth = doc_auth();
+        let parent = "AKIAIOSFODNN7EXAMPLE";
+        let now = util::now_ms();
+        let i = crate::sts::issue(&[3; 32], parent, "job", None, now + 60_000);
+        // Without the server's key (not loaded) or without the token, the key is unknown.
+        assert_eq!(auth.credential(&i.access_key, Some(&i.token)).unwrap_err().code, "InvalidAccessKeyId");
+        auth.set_session_key([3; 32]);
+        assert_eq!(auth.credential(&i.access_key, None).unwrap_err().code, "InvalidAccessKeyId");
+        let c = auth.credential(&i.access_key, Some(&i.token)).unwrap();
+        assert_eq!((c.secret.as_str(), c.identity()), (i.secret.as_str(), parent));
+        // Cached, and still checked against the token.
+        assert!(auth.credential(&i.access_key, Some(&i.token)).is_ok());
+        let other = crate::sts::issue(&[3; 32], parent, "job", None, now + 60_000);
+        assert_eq!(auth.credential(&i.access_key, Some(&other.token)).unwrap_err().code, "InvalidToken");
+        // The parent's limits apply, and the session goes away with the parent.
+        auth.replace(vec![Credential { read_only: true, ..(*auth.credential(parent, None).unwrap()).clone() }]);
+        assert!(auth.credential(&i.access_key, Some(&i.token)).unwrap().read_only);
+        auth.replace(vec![]);
+        assert_eq!(auth.credential(&i.access_key, Some(&i.token)).unwrap_err().code, "InvalidToken");
     }
 
     /// A SigV2 signature covers the operation: one made for a plain PUT is not valid for PUT
@@ -694,7 +856,7 @@ mod tests {
             let uri = if query.is_empty() { "/b/k".to_string() } else { format!("/b/k?{query}") };
             let req = hyper::Request::builder().method("PUT").uri(uri).header("date", &date).body(()).unwrap();
             let (parts, _) = req.into_parts();
-            auth.verify_v2(&parts, query, None, "AKIAIOSFODNN7EXAMPLE", sig, None).is_ok()
+            auth.verify_v2(&parts, query, None, "AKIAIOSFODNN7EXAMPLE", sig, None, None).is_ok()
         };
         let plain = sign("/b/k");
         assert!(check("", &plain));
@@ -730,6 +892,7 @@ mod tests {
             service: "s3",
             signed_headers: "host;range;x-amz-content-sha256;x-amz-date",
             signature: "f0e8bdb87c964420e857bd35b5d6ed310bd44f0170aba48dd91039c6036bdb41",
+            token: None,
         };
         let _ = signed;
         auth.check_signature(&parts, "", &p, "20130524T000000Z", EMPTY_SHA256, false).unwrap();
@@ -754,6 +917,7 @@ mod tests {
             service: "s3",
             signed_headers: "host",
             signature: "aeeed9bbccd4d02ee5c0109b86d86835f995330da4c265957d157751f604d404",
+            token: None,
         };
         auth.check_signature(&parts, q, &p, "20130524T000000Z", "UNSIGNED-PAYLOAD", true).unwrap();
     }
@@ -763,7 +927,7 @@ mod tests {
     fn aws_doc_chunk_signature() {
         let auth = doc_auth();
         let mut s = ChunkSigner {
-            key: auth.signing_key("AKIAIOSFODNN7EXAMPLE", "20130524", "us-east-1", "s3").unwrap(),
+            key: auth.signing_key("AKIAIOSFODNN7EXAMPLE", None, "20130524", "us-east-1", "s3").unwrap(),
             date: "20130524T000000Z".into(),
             scope: "20130524/us-east-1/s3/aws4_request".into(),
             prev: "4f232c4386841ef735655705268965c44a0e4690baa4adea153f7db9fa80a0a9".into(),

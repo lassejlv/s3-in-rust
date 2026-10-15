@@ -78,8 +78,10 @@ key. From the console you can:
 The console is three static files compiled into the binary. Every request is signed with SigV4
 inside the browser tab, so the server keeps no sessions and the console can do nothing an S3
 client with the same key couldn't. Signing needs a secure context, so use HTTPS or `localhost`. The pages are served with a
-strict Content-Security-Policy and refuse to be framed. The key stays in the page's memory unless you
-tick "Stay signed in", which keeps it in `sessionStorage` until the tab closes.
+strict Content-Security-Policy and refuse to be framed. After signing in, the console swaps the
+key for 12-hour [STS session credentials](#access-control) and forgets the secret. These stay in
+the page's memory unless you tick "Stay signed in", which keeps them (never the key's secret) in
+`sessionStorage` until the tab closes or they expire.
 
 The console shares its origin with the S3 API, so while it is enabled, objects downloaded from the
 API endpoint are sent with `Content-Security-Policy: sandbox`. HTML or SVG stored in a bucket then
@@ -310,6 +312,32 @@ Keys from the command line and the credentials file are listed with `"source": "
 only be changed there. If both define the same access key, the file wins; the stored key can still
 be revoked with `DELETE`, so it doesn't come back when the file key is removed. Creating and
 revoking keys is always written durably, also with `--no-fsync`.
+
+**Temporary credentials (STS AssumeRole).** Any key can ask for short-lived credentials (an
+access key, a secret and a session token) to hand to a job, a browser or another user instead of
+its own secret. They act as that key, with all its limits, until they expire (15 minutes to 12
+hours, one hour by default), and an optional session policy narrows them further. Point the STS
+client at the s3rs endpoint; `RoleArn` is accepted and ignored:
+
+```python
+sts = boto3.client("sts", endpoint_url="https://s3.example.com", aws_access_key_id="...",
+                   aws_secret_access_key="...", region_name="us-east-1")
+creds = sts.assume_role(
+    RoleArn="arn:aws:iam::000000000000:role/any", RoleSessionName="upload-job", DurationSeconds=900,
+    # Optional: this session may only upload below incoming/.
+    Policy=json.dumps({"Statement": [{"Effect": "Allow", "Action": "s3:PutObject",
+                                      "Resource": "arn:aws:s3:::uploads/incoming/*"}]}),
+)["Credentials"]
+s3 = boto3.client("s3", endpoint_url="https://s3.example.com", aws_access_key_id=creds["AccessKeyId"],
+                  aws_secret_access_key=creds["SecretAccessKey"], aws_session_token=creds["SessionToken"])
+```
+
+`aws sts assume-role --endpoint-url ...` and `aws sts get-caller-identity` work the same way.
+Nothing is stored per session: the token carries its claims, signed with a key s3rs generates in
+the metadata database on first start, so sessions survive restarts. A session works only while the
+key it came from exists and is not expired, so revoking that key ends its sessions, and changes to
+the key's limits apply to them at once. Sessions can't assume roles themselves. In policies, rate
+limits and logs a session is the key it came from (`${aws:username}` is that key).
 
 **Per-key policies** use IAM's JSON format. Paths are relative to the credentials file. For example,
 this policy gives every key using it a private home prefix:
@@ -831,7 +859,8 @@ direct uploads from web apps.
 | Reads | Single `Range` requests, `partNumber` reads, `If-Match` / `If-None-Match` / `If-Modified-Since` / `If-Unmodified-Since`, `response-*` header overrides |
 | Writes | Conditional writes (`If-None-Match: *` or an ETag, `If-Match`), `Content-MD5`, `x-amz-content-sha256` verification, user metadata (`x-amz-meta-*`) and standard headers |
 | Checksums | CRC32, CRC32C, CRC64NVME, SHA1 and SHA256, sent as headers or as aws-chunked trailers. They are verified on upload and returned with `x-amz-checksum-mode: ENABLED`. Multipart uploads get COMPOSITE or FULL_OBJECT checksums, and their parts keep their own. CopyObject with `x-amz-checksum-algorithm` computes a new one (also in place). |
-| Auth | SigV4 headers, SigV4 presigned URLs, SigV4 streaming (`STREAMING-AWS4-HMAC-SHA256-PAYLOAD[-TRAILER]`, `STREAMING-UNSIGNED-PAYLOAD-TRAILER`), SigV2 headers and presigned URLs |
+| Auth | SigV4 headers, SigV4 presigned URLs, SigV4 streaming (`STREAMING-AWS4-HMAC-SHA256-PAYLOAD[-TRAILER]`, `STREAMING-UNSIGNED-PAYLOAD-TRAILER`), SigV2 headers and presigned URLs, session tokens (`x-amz-security-token`) |
+| STS | AssumeRole (with session policies), GetCallerIdentity |
 | Transport | HTTP/1.1 keep-alive, HTTP/2 (h2c), path-style and virtual-hosted-style addressing |
 
 Not implemented: SSE-KMS, storage class transitions and SigV4A. These
@@ -932,8 +961,9 @@ HTTPS, with an `https://` webhook, using a throwaway CA from `tests/tls/gen-cert
 
 ## Limitations and notes
 
-- Keys are configured in a file (reloaded on `SIGHUP`), not through an IAM API: there are no
-  users, groups or roles to create at runtime, and no STS temporary credentials.
+- Keys come from a file (reloaded on `SIGHUP`) or the admin API, not from an IAM API: there are
+  no users, groups or roles. STS AssumeRole issues sessions for the calling key (`RoleArn` is
+  ignored); other STS actions, such as AssumeRoleWithWebIdentity, are not implemented.
 - Each object can be at most 5 GiB on a single PUT. A multipart upload can have up to 10,000 parts of
   5 GiB each, the same limits as S3.
 - Only one `s3rs` process can use a data directory at a time.

@@ -40,6 +40,15 @@ const shot = (page, name) => (out ? page.screenshot({ path: `${out}/${name}.png`
   await page.click('#login-form button[type=submit]');
   await page.waitForSelector('#app:not(.hidden)');
 
+  step('the tab keeps session credentials, not the key');
+  const saved = JSON.parse(await page.evaluate(() => sessionStorage.getItem('s3rs-console')));
+  if (!saved || !saved.token || !saved.ak.startsWith('ASIA') || JSON.stringify(saved).includes(SK)) {
+    throw new Error('unexpected saved credentials: ' + JSON.stringify(saved && Object.keys(saved)));
+  }
+  await page.reload();
+  await page.waitForSelector('#app:not(.hidden)');
+  if (!(await page.textContent('#whoami')).startsWith(AK + ' @')) throw new Error('whoami: ' + await page.textContent('#whoami'));
+
   step('create bucket');
   await page.click('#new-bucket');
   await page.fill('#f-name', BUCKET);

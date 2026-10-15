@@ -51,9 +51,12 @@ First release.
   Deny).
 - Keys can also be created, listed and revoked at runtime through the admin API
   (`/_admin/keys`), including temporary keys that expire on their own (`expires_in`).
+- STS AssumeRole and GetCallerIdentity: short-lived session credentials (with session tokens)
+  for any key, optionally narrowed by a session policy, ending with the key they came from.
 
 **Operations**
-- Web console at `/_console/`, including object version history (download, restore, delete).
+- Web console at `/_console/`, including object version history (download, restore, delete). It
+  works with STS session credentials, so a signed-in tab never stores the key's secret.
 - Per-bucket server access logs in S3's format (PutBucketLogging), written to a target bucket.
 - Prometheus metrics (also per bucket: objects, bytes, requests and traffic), JSON access logs, event notifications (webhooks and live streams). Webhook
   events are queued on disk with the write they describe and delivered in order, at least once,

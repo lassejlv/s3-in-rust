@@ -37,6 +37,7 @@ mod replication;
 mod s3;
 mod scrub;
 mod store;
+mod sts;
 mod tls;
 mod util;
 mod website;
@@ -483,6 +484,7 @@ fn load_credentials(path: &std::path::Path, into: &mut Vec<auth::Credential>) ->
             buckets,
             policy,
             expires_ms: None,
+            session: None,
         });
     }
     Ok(())
@@ -520,6 +522,7 @@ fn collect_credentials(cfg: &Config) -> Result<Vec<auth::Credential>, String> {
             buckets: None,
             policy: None,
             expires_ms: None,
+            session: None,
         }),
         (None, None) => {}
         _ => return Err("both an access key and a secret key are required".into()),
@@ -847,6 +850,12 @@ fn main() {
             std::process::exit(1);
         }
     };
+    if let Some(a) = &auth {
+        match store.session_key() {
+            Ok(k) => a.set_session_key(k),
+            Err(e) => elog!("warning: STS AssumeRole is unavailable: {e}"),
+        }
+    }
 
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().expect("tokio runtime");
     rt.block_on(serve(cfg, store, auth, creds, tls, webhook_tls));

@@ -428,7 +428,7 @@ impl Server {
             file_creds: RwLock::new(Vec::new()),
             keys_reload: Mutex::new(()),
             next_key_expiry: AtomicU64::new(u64::MAX),
-            completed: std::sync::Mutex::new(Completed::default()),
+            completed: std::sync::Mutex::new(Completed { done: HashMap::new(), inflight: HashMap::new() }),
             anon_limit: opts.rate_limit_anonymous.map(crate::ratelimit::Limiter::new),
             block_public_access: opts.block_public_access,
             me: std::sync::OnceLock::new(),
@@ -3538,9 +3538,10 @@ impl Server {
         let op = Op::Complete { bucket: bucket.into(), key: key.into(), upload, parts, checksum, cond };
         let template = self.event(&r.principal, r.client.ip, &r.rid, "ObjectCreated:CompleteMultipartUpload", bucket, key);
         let (op, notify) = self.created_events(template, bucket, op);
+        let completing = Completing::start(&self.completed, upload);
         let meta = match self.store.submit(op).await {
             Ok(OpOut::Object(meta)) => {
-                self.completed.lock().unwrap().remember(upload, bucket, key, &meta);
+                completing.finish(bucket, key, &meta);
                 if let Some(n) = notify {
                     n.done();
                 }
@@ -3549,7 +3550,7 @@ impl Server {
             Ok(_) => return Err(S3Error::internal("unexpected writer reply")),
             // Completing an upload that was just completed (a client retrying after a lost
             // response) succeeds again, as on S3.
-            Err(e) if e.code == "NoSuchUpload" => self.completed.lock().unwrap().get(upload, bucket, key).ok_or(e)?,
+            Err(e) if e.code == "NoSuchUpload" => completing.result(bucket, key).await.ok_or(e)?,
             Err(e) => return Err(e),
         };
         let mut x = Xml::new("CompleteMultipartUploadResult");
@@ -3748,18 +3749,76 @@ fn upload_checksum_algo(headers: &[(String, String)]) -> Option<ChecksumAlgo> {
 /// Uploads completed recently, so a client that retries a CompleteMultipartUpload (after
 /// losing the response) gets the same answer, as on S3.
 #[derive(Default)]
-struct Completed(HashMap<u128, (String, String, ObjectMeta)>);
+struct Completed {
+    done: HashMap<u128, (String, String, ObjectMeta)>,
+    /// Completions being written. A request completing the same upload at the same time gets
+    /// `NoSuchUpload` from the writer, possibly before the winner has called `remember`; it
+    /// waits for the winner's result here instead.
+    inflight: HashMap<u128, tokio::sync::watch::Receiver<Option<ObjectMeta>>>,
+}
 
 impl Completed {
     fn remember(&mut self, upload: u128, bucket: &str, key: &str, meta: &ObjectMeta) {
-        if self.0.len() >= 10_000 {
-            self.0.clear();
+        if self.done.len() >= 10_000 {
+            self.done.clear();
         }
-        self.0.insert(upload, (bucket.to_string(), key.to_string(), meta.clone()));
+        self.done.insert(upload, (bucket.to_string(), key.to_string(), meta.clone()));
     }
 
     fn get(&self, upload: u128, bucket: &str, key: &str) -> Option<ObjectMeta> {
-        self.0.get(&upload).filter(|(b, k, _)| b == bucket && k == key).map(|(_, _, m)| m.clone())
+        self.done.get(&upload).filter(|(b, k, _)| b == bucket && k == key).map(|(_, _, m)| m.clone())
+    }
+}
+
+/// An in-flight completion registered in `Completed`; removed when dropped.
+struct Completing<'a> {
+    completed: &'a std::sync::Mutex<Completed>,
+    upload: u128,
+    tx: Option<tokio::sync::watch::Sender<Option<ObjectMeta>>>,
+}
+
+impl<'a> Completing<'a> {
+    fn start(completed: &'a std::sync::Mutex<Completed>, upload: u128) -> Self {
+        let mut c = completed.lock().unwrap();
+        let tx = match c.inflight.entry(upload) {
+            std::collections::hash_map::Entry::Occupied(_) => None,
+            std::collections::hash_map::Entry::Vacant(v) => {
+                let (tx, rx) = tokio::sync::watch::channel(None);
+                v.insert(rx);
+                Some(tx)
+            }
+        };
+        Completing { completed, upload, tx }
+    }
+
+    fn finish(&self, bucket: &str, key: &str, meta: &ObjectMeta) {
+        self.completed.lock().unwrap().remember(self.upload, bucket, key, meta);
+        if let Some(tx) = &self.tx {
+            let _ = tx.send(Some(meta.clone()));
+        }
+    }
+
+    /// The result of this upload's completion, by this request or a concurrent one.
+    async fn result(&self, bucket: &str, key: &str) -> Option<ObjectMeta> {
+        let rx = {
+            let c = self.completed.lock().unwrap();
+            if let Some(m) = c.get(self.upload, bucket, key) {
+                return Some(m);
+            }
+            c.inflight.get(&self.upload).cloned()
+        };
+        let mut rx = rx?;
+        // Ends with the winner's result, or when it gave up (failed or was cancelled).
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(30), rx.wait_for(Option::is_some)).await;
+        self.completed.lock().unwrap().get(self.upload, bucket, key)
+    }
+}
+
+impl Drop for Completing<'_> {
+    fn drop(&mut self) {
+        if self.tx.is_some() {
+            self.completed.lock().unwrap().inflight.remove(&self.upload);
+        }
     }
 }
 

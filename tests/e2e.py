@@ -501,6 +501,54 @@ def t_public_read_acl():
         s3.delete_bucket(Bucket=b)
 
 
+def t_public_access_block():
+    import json
+    pb = B + "-pab"
+    s3.create_bucket(Bucket=pb, ACL="public-read")
+    s3.put_object(Bucket=pb, Key="f", Body=b"x")
+    assert http("GET", f"/{pb}/f")[0] == 200
+    expect_error("NoSuchPublicAccessBlockConfiguration", lambda: s3.get_public_access_block(Bucket=pb))
+    # IgnorePublicAcls makes the public ACL inert.
+    s3.put_public_access_block(Bucket=pb, PublicAccessBlockConfiguration={"IgnorePublicAcls": True})
+    got = s3.get_public_access_block(Bucket=pb)["PublicAccessBlockConfiguration"]
+    assert got == {"BlockPublicAcls": False, "IgnorePublicAcls": True, "BlockPublicPolicy": False, "RestrictPublicBuckets": False}, got
+    assert http("GET", f"/{pb}/f")[0] == 403
+    # BlockPublicAcls refuses new public ACLs.
+    s3.put_public_access_block(Bucket=pb, PublicAccessBlockConfiguration={"BlockPublicAcls": True})
+    expect_error("AccessDenied", lambda: s3.put_bucket_acl(Bucket=pb, ACL="public-read-write"))
+    expect_error("AccessDenied", lambda: s3.put_object(Bucket=pb, Key="g", Body=b"x", ACL="public-read"))
+    s3.put_object(Bucket=pb, Key="g", Body=b"x", ACL="private")
+    # BlockPublicPolicy refuses public policies; RestrictPublicBuckets disarms existing ones.
+    s3.put_bucket_acl(Bucket=pb, ACL="private")
+    public = json.dumps({"Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Principal": "*",
+                         "Action": "s3:GetObject", "Resource": f"arn:aws:s3:::{pb}/*"}]})
+    s3.put_bucket_policy(Bucket=pb, Policy=public)
+    assert http("GET", f"/{pb}/f")[0] == 200
+    s3.put_public_access_block(Bucket=pb, PublicAccessBlockConfiguration={"BlockPublicPolicy": True, "RestrictPublicBuckets": True})
+    expect_error("AccessDenied", lambda: s3.put_bucket_policy(Bucket=pb, Policy=public))
+    assert http("GET", f"/{pb}/f")[0] == 403
+    s3.delete_public_access_block(Bucket=pb)
+    assert http("GET", f"/{pb}/f")[0] == 200
+    s3.delete_bucket_policy(Bucket=pb)
+    # Ownership controls: BucketOwnerEnforced turns ACLs off.
+    expect_error("OwnershipControlsNotFoundError", lambda: s3.get_bucket_ownership_controls(Bucket=pb))
+    s3.put_bucket_ownership_controls(Bucket=pb, OwnershipControls={"Rules": [{"ObjectOwnership": "BucketOwnerEnforced"}]})
+    assert s3.get_bucket_ownership_controls(Bucket=pb)["OwnershipControls"]["Rules"] == [{"ObjectOwnership": "BucketOwnerEnforced"}]
+    expect_error("AccessControlListNotSupported", lambda: s3.put_bucket_acl(Bucket=pb, ACL="public-read"))
+    expect_error("AccessControlListNotSupported", lambda: s3.put_object(Bucket=pb, Key="h", Body=b"x", ACL="public-read"))
+    s3.put_object(Bucket=pb, Key="h", Body=b"x", ACL="bucket-owner-full-control")
+    s3.delete_bucket_ownership_controls(Bucket=pb)
+    pb2 = B + "-own"
+    expect_error("InvalidBucketAclWithObjectOwnership",
+                 lambda: s3.create_bucket(Bucket=pb2, ACL="public-read", ObjectOwnership="BucketOwnerEnforced"))
+    s3.create_bucket(Bucket=pb2, ObjectOwnership="BucketOwnerPreferred")
+    assert s3.get_bucket_ownership_controls(Bucket=pb2)["OwnershipControls"]["Rules"][0]["ObjectOwnership"] == "BucketOwnerPreferred"
+    for b in (pb, pb2):
+        for o in s3.list_objects_v2(Bucket=b).get("Contents", []):
+            s3.delete_object(Bucket=b, Key=o["Key"])
+        s3.delete_bucket(Bucket=b)
+
+
 def t_bucket_policy():
     import json
     expect_error("NoSuchBucketPolicy", lambda: s3.get_bucket_policy(Bucket=B))

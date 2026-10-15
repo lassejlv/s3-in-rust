@@ -505,11 +505,100 @@ pub struct BucketAccess {
     pub lock: Option<crate::lock::BucketLock>,
     pub website: Option<std::sync::Arc<crate::website::Config>>,
     pub lifecycle: Option<std::sync::Arc<Vec<crate::lifecycle::Rule>>>,
+    pub public_block: PublicAccessBlock,
+    pub ownership: Option<Ownership>,
+}
+
+/// PutPublicAccessBlock settings.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PublicAccessBlock {
+    /// Refuse public ACLs on buckets and objects.
+    pub block_acls: bool,
+    /// Treat public ACLs as private.
+    pub ignore_acls: bool,
+    /// Refuse bucket policies that grant public access.
+    pub block_policy: bool,
+    /// Don't let a public bucket policy give anonymous callers access.
+    pub restrict: bool,
+}
+
+const PAB_FIELDS: [&str; 4] = ["BlockPublicAcls", "IgnorePublicAcls", "BlockPublicPolicy", "RestrictPublicBuckets"];
+
+impl PublicAccessBlock {
+    pub fn parse(doc: &xml::Node) -> S3Result<Self> {
+        if doc.name != "PublicAccessBlockConfiguration" {
+            return Err(err::MalformedXML());
+        }
+        let mut v = [false; 4];
+        for (i, name) in PAB_FIELDS.iter().enumerate() {
+            v[i] = match doc.child_text(name).map(str::trim) {
+                None => false,
+                Some(t) if t.eq_ignore_ascii_case("true") => true,
+                Some(t) if t.eq_ignore_ascii_case("false") => false,
+                Some(_) => return Err(err::MalformedXML().with_message(format!("{name} must be true or false"))),
+            };
+        }
+        Ok(PublicAccessBlock { block_acls: v[0], ignore_acls: v[1], block_policy: v[2], restrict: v[3] })
+    }
+
+    pub fn to_xml(self) -> String {
+        let mut x = xml::Xml::new("PublicAccessBlockConfiguration");
+        for (name, on) in PAB_FIELDS.iter().zip([self.block_acls, self.ignore_acls, self.block_policy, self.restrict]) {
+            x.elem(name, on.to_string());
+        }
+        x.finish("PublicAccessBlockConfiguration")
+    }
+}
+
+/// PutBucketOwnershipControls settings. Every object belongs to the bucket owner here, so the
+/// difference is whether ACLs may be set (`BucketOwnerEnforced` disables them).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ownership {
+    BucketOwnerEnforced,
+    BucketOwnerPreferred,
+    ObjectWriter,
+}
+
+impl Ownership {
+    pub fn parse(s: &str) -> S3Result<Self> {
+        match s.trim() {
+            "BucketOwnerEnforced" => Ok(Ownership::BucketOwnerEnforced),
+            "BucketOwnerPreferred" => Ok(Ownership::BucketOwnerPreferred),
+            "ObjectWriter" => Ok(Ownership::ObjectWriter),
+            _ => Err(err::InvalidArgument()
+                .with_message("ObjectOwnership must be BucketOwnerEnforced, BucketOwnerPreferred or ObjectWriter")),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Ownership::BucketOwnerEnforced => "BucketOwnerEnforced",
+            Ownership::BucketOwnerPreferred => "BucketOwnerPreferred",
+            Ownership::ObjectWriter => "ObjectWriter",
+        }
+    }
+
+    pub fn parse_xml(doc: &xml::Node) -> S3Result<Self> {
+        let v = (doc.name == "OwnershipControls")
+            .then(|| doc.child("Rule")?.child_text("ObjectOwnership"))
+            .flatten()
+            .ok_or_else(err::MalformedXML)?;
+        Ownership::parse(v).map_err(|e| err::MalformedXML().with_message(e.message))
+    }
+
+    pub fn to_xml(self) -> String {
+        let mut x = xml::Xml::new("OwnershipControls");
+        x.open("Rule").elem("ObjectOwnership", self.as_str()).close("Rule");
+        x.finish("OwnershipControls")
+    }
 }
 
 impl BucketAccess {
     /// What the canned ACL grants to anonymous callers.
     fn acl_grants(&self, action: &str) -> bool {
+        if self.public_block.ignore_acls {
+            return false;
+        }
         match self.acl {
             CannedAcl::Private => false,
             CannedAcl::PublicRead => matches!(action, "s3:GetObject" | "s3:ListBucket" | "s3:GetBucketLocation"),
@@ -537,6 +626,8 @@ impl BucketAccess {
     pub fn allows_anonymous(&self, action: &str, resource: &str, ctx: &crate::iam::Ctx) -> bool {
         match self.policy_decision(action, resource, ctx) {
             crate::iam::Decision::Deny => false,
+            // RestrictPublicBuckets: a public policy gives anonymous callers nothing.
+            crate::iam::Decision::Allow if self.public_block.restrict => self.acl_grants(action),
             crate::iam::Decision::Allow => true,
             crate::iam::Decision::NotApplicable => self.acl_grants(action),
         }

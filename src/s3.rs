@@ -480,7 +480,28 @@ impl Server {
             .and_then(|d| crate::lifecycle::parse(&d).ok())
             .filter(|r| r.iter().any(|r| r.enabled && (r.expire_days.is_some() || r.expire_date.is_some())))
             .map(Arc::new);
-        let a = Arc::new(BucketAccess { acl, policy, cors, versioning, default_sse, lock, website, lifecycle });
+        let public_block = self
+            .store
+            .bucket_config(bucket, "public-access-block")?
+            .and_then(|v| xml::parse(&String::from_utf8_lossy(&v)))
+            .and_then(|d| access::PublicAccessBlock::parse(&d).ok())
+            .unwrap_or_default();
+        let ownership = self
+            .store
+            .bucket_config(bucket, "ownership")?
+            .and_then(|v| access::Ownership::parse(&String::from_utf8_lossy(&v)).ok());
+        let a = Arc::new(BucketAccess {
+            acl,
+            policy,
+            cors,
+            versioning,
+            default_sse,
+            lock,
+            website,
+            lifecycle,
+            public_block,
+            ownership,
+        });
         let mut cache = self.access_cache.write().unwrap();
         if self.access_gen.load(Ordering::SeqCst) == generation {
             if cache.len() > 10_000 {
@@ -1444,6 +1465,17 @@ impl Server {
                             .ok_or_else(err::ReplicationConfigurationNotFoundError)?;
                         Ok(Resp::xml(String::from_utf8_lossy(&doc).into_owned()))
                     }
+                    "publicAccessBlock" => {
+                        let doc = self
+                            .store
+                            .bucket_config(bucket, "public-access-block")?
+                            .ok_or_else(err::NoSuchPublicAccessBlockConfiguration)?;
+                        Ok(Resp::xml(String::from_utf8_lossy(&doc).into_owned()))
+                    }
+                    "ownershipControls" => match self.bucket_access(bucket)?.ownership {
+                        Some(o) => Ok(Resp::xml(o.to_xml())),
+                        None => Err(err::OwnershipControlsNotFoundError()),
+                    },
                     "requestPayment" => {
                         let mut x = Xml::new("RequestPaymentConfiguration");
                         x.elem("Payer", "BucketOwner");
@@ -1465,13 +1497,18 @@ impl Server {
                     Some(a) => CannedAcl::parse(a)?,
                     None => acl_from_xml(&self.read_xml(r).await?)?,
                 };
+                self.check_acl(bucket, r.header("x-amz-acl").unwrap_or(xml_acl_name(acl)))?;
                 let value = (acl != CannedAcl::Private).then(|| acl.as_str().as_bytes().to_vec());
                 self.set_bucket_config(bucket, "acl", value).await?;
                 Ok(Resp::ok())
             }
             BucketOp::PutConfig("policy") => {
                 let body = self.read_body(r, 20 * 1024).await?;
-                iam::Policy::parse(&String::from_utf8_lossy(&body), iam::Kind::Bucket, Some(bucket))?;
+                let policy = iam::Policy::parse(&String::from_utf8_lossy(&body), iam::Kind::Bucket, Some(bucket))?;
+                if policy.is_public() && self.bucket_access(bucket)?.public_block.block_policy {
+                    return Err(err::AccessDenied()
+                        .with_message("The bucket's public access block (BlockPublicPolicy) refuses public policies"));
+                }
                 self.set_bucket_config(bucket, "policy", Some(body.to_vec())).await?;
                 Ok(Resp::new(StatusCode::NO_CONTENT))
             }
@@ -1620,6 +1657,21 @@ impl Server {
                 self.bucket_log.invalidate(bucket, target.is_some());
                 Ok(Resp::ok())
             }
+            BucketOp::PutConfig("publicAccessBlock") => {
+                self.store.require_bucket(bucket)?;
+                let pab = access::PublicAccessBlock::parse(&self.read_xml(r).await?)?;
+                self.set_bucket_config(bucket, "public-access-block", Some(pab.to_xml().into_bytes())).await?;
+                Ok(Resp::ok())
+            }
+            BucketOp::PutConfig("ownershipControls") => {
+                self.store.require_bucket(bucket)?;
+                let o = access::Ownership::parse_xml(&self.read_xml(r).await?)?;
+                if o == access::Ownership::BucketOwnerEnforced && self.bucket_access(bucket)?.acl != CannedAcl::Private {
+                    return Err(err::InvalidBucketAclWithObjectOwnership());
+                }
+                self.set_bucket_config(bucket, "ownership", Some(o.as_str().as_bytes().to_vec())).await?;
+                Ok(Resp::ok())
+            }
             BucketOp::PutConfig(_) => Err(err::NotImplemented()),
             BucketOp::Create => {
                 if !valid_bucket_name(bucket) {
@@ -1627,6 +1679,10 @@ impl Server {
                 }
                 // Body is an optional CreateBucketConfiguration; we only have one region.
                 let acl = r.header("x-amz-acl").map(CannedAcl::parse).transpose()?;
+                let ownership = r.header("x-amz-object-ownership").map(access::Ownership::parse).transpose()?;
+                if ownership == Some(access::Ownership::BucketOwnerEnforced) && acl.is_some_and(|a| a != CannedAcl::Private) {
+                    return Err(err::InvalidBucketAclWithObjectOwnership());
+                }
                 let with_lock = r.header("x-amz-bucket-object-lock-enabled").is_some_and(|v| v.eq_ignore_ascii_case("true"));
                 let _ = r.body.read_all(MAX_XML_BODY).await?;
                 match self.store.submit(Op::CreateBucket(bucket.to_string())).await {
@@ -1648,9 +1704,18 @@ impl Server {
                 if let Some(acl) = acl.filter(|a| *a != CannedAcl::Private) {
                     self.set_bucket_config(bucket, "acl", Some(acl.as_str().as_bytes().to_vec())).await?;
                 }
+                if let Some(o) = ownership {
+                    self.set_bucket_config(bucket, "ownership", Some(o.as_str().as_bytes().to_vec())).await?;
+                }
                 let mut resp = Resp::ok();
                 resp.set("location", &format!("/{bucket}"));
                 Ok(resp)
+            }
+            BucketOp::DeleteConfig(sub @ ("publicAccessBlock" | "ownershipControls")) => {
+                self.store.require_bucket(bucket)?;
+                let kind = if sub == "publicAccessBlock" { "public-access-block" } else { "ownership" };
+                self.set_bucket_config(bucket, kind, None).await?;
+                Ok(Resp::new(StatusCode::NO_CONTENT))
             }
             BucketOp::DeleteConfig("replication") => {
                 self.store.require_bucket(bucket)?;
@@ -1740,6 +1805,7 @@ impl Server {
                     Some(a) => CannedAcl::parse(a)?,
                     None => acl_from_xml(&self.read_xml(r).await?)?,
                 };
+                self.check_acl(bucket, r.header("x-amz-acl").unwrap_or(xml_acl_name(acl)))?;
                 // Accepting a different ACL and ignoring it would let a caller believe an object
                 // in a public bucket was now private.
                 let current = self.bucket_access(bucket)?.acl;
@@ -2603,6 +2669,9 @@ impl Server {
         // Versioned buckets keep every version, so small objects go to data files rather than
         // inline in the metadata database (which would otherwise only ever grow).
         let versioned = self.bucket_access(bucket)?.versioning == store::Versioning::Enabled;
+        if let Some(acl) = r.header("x-amz-acl") {
+            self.check_acl(bucket, acl)?;
+        }
         let tags = request_tags(r)?;
         let lock_headers = self.new_lock_headers(&r.parts.headers, bucket)?;
         let enc = self.write_encryption(&r.parts.headers, bucket, None)?;
@@ -2653,6 +2722,22 @@ impl Server {
             resp.set(a.header(), v);
         }
         Ok(resp)
+    }
+
+    /// May this canned ACL be set in the bucket (on it, or on an object)? Public ACLs are refused
+    /// by BlockPublicAcls, and any ACL but the owner's by BucketOwnerEnforced.
+    fn check_acl(&self, bucket: &str, acl: &str) -> S3Result<()> {
+        let a = self.bucket_access(bucket)?;
+        let acl = acl.trim();
+        if a.ownership == Some(access::Ownership::BucketOwnerEnforced) && acl != "bucket-owner-full-control" {
+            return Err(err::AccessControlListNotSupported());
+        }
+        if a.public_block.block_acls && matches!(acl, "public-read" | "public-read-write" | "authenticated-read") {
+            return Err(
+                err::AccessDenied().with_message("The bucket's public access block (BlockPublicAcls) refuses public ACLs")
+            );
+        }
+        Ok(())
     }
 
     /// `x-amz-expiration` for an object a lifecycle rule will expire.
@@ -2804,6 +2889,9 @@ impl Server {
 
     async fn copy_object(&self, r: &mut Req, bucket: &str, key: &str) -> S3Result<Resp> {
         let (sb, sk, sv) = self.copy_source(r)?;
+        if let Some(acl) = r.header("x-amz-acl") {
+            self.check_acl(bucket, acl)?;
+        }
         let dest_versioned = self.bucket_access(bucket)?.versioning == store::Versioning::Enabled;
         let replace = r.header("x-amz-metadata-directive").is_some_and(|d| d.eq_ignore_ascii_case("REPLACE"));
         let replace_tags = r.header("x-amz-tagging-directive").is_some_and(|d| d.eq_ignore_ascii_case("REPLACE"));
@@ -2947,6 +3035,9 @@ impl Server {
     async fn create_upload(&self, r: &mut Req, bucket: &str, key: &str) -> S3Result<Resp> {
         let _ = r.body.read_all(MAX_XML_BODY).await?;
         let id = util::new_id();
+        if let Some(acl) = r.header("x-amz-acl") {
+            self.check_acl(bucket, acl)?;
+        }
         let tags = request_tags(r)?;
         // The upload's encryption applies to every part and to the completed object.
         let enc = self.write_encryption(&r.parts.headers, bucket, None)?;
@@ -3167,6 +3258,9 @@ impl Server {
             None => None,
         };
         self.store.require_bucket(bucket)?;
+        if let Some(acl) = f.get("acl") {
+            self.check_acl(bucket, acl)?;
+        }
 
         let tags = match f.get("tagging") {
             Some(doc) => access::parse_tagging_xml(&xml::parse(doc).ok_or_else(err::MalformedXML)?, 10)?,
@@ -3428,6 +3522,12 @@ impl Server {
         }
         Ok(Resp::xml(x.finish("DeleteResult")))
     }
+}
+
+/// The canned ACL an ACL document amounts to (one granting only the owner full control is the
+/// owner's, which BucketOwnerEnforced allows).
+fn xml_acl_name(acl: CannedAcl) -> &'static str {
+    if acl == CannedAcl::Private { "bucket-owner-full-control" } else { acl.as_str() }
 }
 
 /// Conditions on a delete, from headers or a DeleteObjects entry.

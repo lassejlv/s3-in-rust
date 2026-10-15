@@ -99,6 +99,10 @@ errors! {
     ObjectLockConfigurationNotFoundError => NOT_FOUND, "Object Lock configuration does not exist for this bucket";
     NoSuchWebsiteConfiguration => NOT_FOUND, "The specified bucket does not have a website configuration";
     ReplicationConfigurationNotFoundError => NOT_FOUND, "The replication configuration was not found";
+    NoSuchPublicAccessBlockConfiguration => NOT_FOUND, "The public access block configuration was not found";
+    OwnershipControlsNotFoundError => NOT_FOUND, "The bucket ownership controls were not found";
+    AccessControlListNotSupported => BAD_REQUEST, "The bucket does not allow ACLs";
+    InvalidBucketAclWithObjectOwnership => BAD_REQUEST, "Bucket cannot have ACLs set with ObjectOwnership's BucketOwnerEnforced setting";
     ConditionalRequestConflict => CONFLICT, "A conflicting conditional operation is currently in progress against this resource.";
 }
 

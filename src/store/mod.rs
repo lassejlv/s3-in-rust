@@ -49,6 +49,8 @@ pub const CONFIG_KINDS: &[&str] = &[
     "quota",
     "replication",
     "logging",
+    "public-access-block",
+    "ownership",
     // Where the backfill of a new replication configuration has got to (see Op::ReplBackfill).
     "replication-backfill",
 ];

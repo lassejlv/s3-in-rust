@@ -386,8 +386,15 @@ headers are ignored.
 
 The `public-read` ACL lets anonymous callers GET objects and list the bucket. `public-read-write`
 also lets them upload and delete. Objects have no ACLs of their own: they have their bucket's
-ACL. GetObjectAcl reports it, `x-amz-acl` on uploads is ignored, and PutObjectAcl refuses
-(`NotImplemented`) to set anything else.
+ACL. GetObjectAcl reports it, `x-amz-acl` on uploads is otherwise ignored, and PutObjectAcl
+refuses (`NotImplemented`) to set anything else.
+
+**Public access blocks** work as on S3: `BlockPublicAcls` refuses public ACLs (on the bucket and
+in `x-amz-acl` on uploads), `IgnorePublicAcls` makes a public ACL behave as private,
+`BlockPublicPolicy` refuses bucket policies that grant public access, and `RestrictPublicBuckets`
+stops a public policy from giving anonymous callers anything. With the `BucketOwnerEnforced`
+ownership control, ACLs other than `bucket-owner-full-control` are refused
+(`AccessControlListNotSupported`).
 
 **CORS.** `PutBucketCors`, `GetBucketCors` and `DeleteBucketCors` are supported. `OPTIONS` preflight
 requests are answered without authentication. Matching responses get `Access-Control-*` headers, and
@@ -807,7 +814,7 @@ direct uploads from web apps.
 
 | Area | Operations |
 |---|---|
-| Buckets | ListBuckets (with `max-buckets`, continuation tokens and `prefix`), CreateBucket (with canned ACL), DeleteBucket, HeadBucket, GetBucketLocation, Get/PutBucketVersioning, Get/PutBucketAcl, Get/Put/DeleteBucketPolicy, GetBucketPolicyStatus, Get/Put/DeleteBucketCors, Get/Put/DeleteBucketTagging, Get/Put/DeleteBucketEncryption, Get/PutObjectLockConfiguration, Get/Put/DeleteBucketWebsite, Get/PutBucketNotificationConfiguration, Get/Put/DeleteBucketReplication, Get/PutBucketLogging, ListenBucketNotification (MinIO) |
+| Buckets | ListBuckets (with `max-buckets`, continuation tokens and `prefix`), CreateBucket (with canned ACL), DeleteBucket, HeadBucket, GetBucketLocation, Get/PutBucketVersioning, Get/PutBucketAcl, Get/Put/DeleteBucketPolicy, GetBucketPolicyStatus, Get/Put/DeleteBucketCors, Get/Put/DeleteBucketTagging, Get/Put/DeleteBucketEncryption, Get/PutObjectLockConfiguration, Get/Put/DeleteBucketWebsite, Get/PutBucketNotificationConfiguration, Get/Put/DeleteBucketReplication, Get/PutBucketLogging, Get/Put/DeletePublicAccessBlock, Get/Put/DeleteBucketOwnershipControls (`BucketOwnerEnforced` turns ACLs off), ListenBucketNotification (MinIO) |
 | Objects | PutObject, GetObject, HeadObject, GetObjectAttributes, DeleteObject and DeleteObjects (also conditional: `If-Match`, `x-amz-if-match-size`, `x-amz-if-match-last-modified-time`), CopyObject (COPY/REPLACE for metadata and tags), Get/Put/DeleteObjectTagging, `x-amz-tagging` on upload, GetObjectAcl, Get/PutObjectRetention, Get/PutObjectLegalHold, SSE-S3 and SSE-C on every read/write/copy path |
 | Listing | ListObjects (v1), ListObjectsV2, ListObjectVersions (versions and delete markers); prefix, delimiter, pagination, `start-after`, `encoding-type=url` |
 | Multipart | CreateMultipartUpload, UploadPart, UploadPartCopy (with ranges), CompleteMultipartUpload, AbortMultipartUpload, ListParts, ListMultipartUploads |

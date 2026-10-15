@@ -42,6 +42,8 @@ First release.
 - Authentication: SigV4 (headers, presigned URLs, streaming and trailers) and SigV2.
 
 **Access control**
+- Public access blocks (BlockPublicAcls, IgnorePublicAcls, BlockPublicPolicy,
+  RestrictPublicBuckets) and bucket ownership controls, as set by tools such as Terraform.
 - Several access keys from a credentials file (reloaded on SIGHUP): read-only keys,
   bucket-limited keys, and IAM-style policies per key or bucket (conditions, variables, explicit
   Deny).

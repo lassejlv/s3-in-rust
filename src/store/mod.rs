@@ -2131,11 +2131,8 @@ fn bucket_has_versions(tx: &Tables, bucket: &str) -> S3Result<bool> {
 /// Sequence numbers for replication queue entries: increasing, also across restarts.
 fn next_repl_seq() -> u64 {
     static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let floor = now_ms() << 16;
-    let prev = SEQ
-        .fetch_update(std::sync::atomic::Ordering::SeqCst, std::sync::atomic::Ordering::SeqCst, |c| Some(c.max(floor) + 1))
-        .unwrap_or_default();
-    prev.max(floor) + 1
+    SEQ.fetch_max(now_ms() << 16, std::sync::atomic::Ordering::SeqCst);
+    SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1
 }
 
 /// Queue `key` for replication, keeping the time of the oldest change not yet replicated.

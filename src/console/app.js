@@ -622,8 +622,9 @@ async function showDetails(key) {
       h.get("x-amz-version-id") ? null : el("button", { class: "small", onclick: () => renameObject(key) }, "Rename"),
       el("button", { class: "small danger", onclick: () => deleteKeys([key]) }, "Delete"));
     const preview = await renderPreview(key, h);
+    const access = await renderAccess(key);
     const versions = await renderVersions(key);
-    body.replaceChildren(...[actions, preview, kv, versions].filter(Boolean));
+    body.replaceChildren(...[actions, preview, access, kv, versions].filter(Boolean));
   } catch (e) {
     body.replaceChildren(el("p", { class: "error" }, e.message));
   }
@@ -654,6 +655,43 @@ async function renderVersions(key) {
       el("td", {}, el("div", { class: "row-actions tight" }, ...actions)));
   });
   return el("div", { class: "versions" }, el("h3", {}, `Versions (${versions.length})`), el("table", { class: "versions-table" }, ...rows));
+}
+
+// Who can read the object without signing in: anyone (its own public-read ACL, or a public
+// bucket) or only signed-in keys.
+async function renderAccess(key) {
+  const publicIn = async (path, query) => {
+    const doc = await S3.xml("GET", path, { query });
+    return [...doc.getElementsByTagName("Grant")].some((g) => (xmlText(g, "URI") || "").endsWith("/AllUsers"));
+  };
+  let bucketPublic, objectPublic;
+  try {
+    bucketPublic = await publicIn(`/${state.bucket}`, { acl: "" });
+    objectPublic = await publicIn(objectPath(key), { acl: "" });
+  } catch (_) {
+    return null; // ACLs turned off (BucketOwnerEnforced) or not allowed for this key
+  }
+  const url = location.origin + uriEncode(objectPath(key), true);
+  const row = el("div", { class: "access" });
+  if (bucketPublic) {
+    row.append(el("span", { class: "badge" }, "Public"), " Everything in this bucket can be read by anyone.");
+  } else if (objectPublic) {
+    row.append(el("span", { class: "badge" }, "Public"), " ",
+      el("input", { class: "share-url", value: url, readonly: true, onfocus: (e) => e.target.select() }), " ",
+      el("button", { class: "small", onclick: () => setObjectAcl(key, "private") }, "Make private"));
+  } else {
+    row.append(el("span", { class: "badge muted" }, "Private"), " ",
+      el("button", { class: "small", title: "Anyone with the link can read it, without signing in", onclick: () => setObjectAcl(key, "public-read") }, "Make public"));
+  }
+  return row;
+}
+
+async function setObjectAcl(key, acl) {
+  try {
+    await S3.request("PUT", objectPath(key), { query: { acl: "" }, headers: { "x-amz-acl": acl } });
+    toast(acl === "private" ? "Only signed-in keys can read it now" : "Anyone with the link can read it now");
+    showDetails(key);
+  } catch (e) { toast(e.message, true); }
 }
 
 async function renameObject(key) {

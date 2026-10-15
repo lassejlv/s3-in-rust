@@ -74,6 +74,7 @@ key. From the console you can:
   older one as the current version.
 - Rename or move objects (in buckets without versioning; only metadata changes, so it is
   instant whatever the size).
+- Make single objects public (readable by anyone with their link) or private again.
 - Delete objects and whole folders, and change a bucket's versioning, public access and website
   settings.
 

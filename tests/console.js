@@ -196,6 +196,16 @@ const shot = (page, name) => (out ? page.screenshot({ path: `${out}/${name}.png`
   await page.waitForSelector('a:has-text("final/")');
   if (await page.locator('tr:has-text("draft.txt")').count()) throw new Error('old name still listed');
 
+  step('make an object public in a private bucket');
+  await page.click('#details button:has-text("Make public")');
+  await page.waitForSelector('#details .access .share-url');
+  const publicUrl = await page.inputValue('#details .access .share-url');
+  const anonymous = await fetch(publicUrl);
+  if (anonymous.status !== 200 || !(await anonymous.text()).includes('to be renamed')) throw new Error('public object not readable: ' + anonymous.status);
+  await page.click('#details button:has-text("Make private")');
+  await page.waitForSelector('#details button:has-text("Make public")');
+  if ((await fetch(publicUrl)).status !== 403) throw new Error('private object still readable');
+
   step('dark mode + mobile screenshot');
   await page.emulateMedia({ colorScheme: 'dark' });
   await page.setViewportSize({ width: 390, height: 760 });

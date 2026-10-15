@@ -108,7 +108,7 @@ Each flag can also be set with the environment variable shown (switches take `1`
 | `--webhook-ca` | `S3RS_WEBHOOK_CA` | | Extra PEM CA certificates trusted for `https://` webhooks |
 | `--lifecycle-interval` | `S3RS_LIFECYCLE_INTERVAL` | `3600` | Seconds between lifecycle sweeps. `0` turns lifecycle off. |
 | `--encryption-key` | `S3RS_ENCRYPTION_KEY` | | Master key for SSE-S3, as 64 hex characters or base64 (e.g. `openssl rand -hex 32`) |
-| `--encryption-key-file` | | | Reads the master key from a file |
+| `--encryption-key-file` | `S3RS_ENCRYPTION_KEY_FILE` | | Reads the master key from a file |
 | `--encrypt-by-default` | `S3RS_ENCRYPT_BY_DEFAULT` | off | Encrypts every new object with the master key |
 | `--region` | `S3RS_REGION` | `us-east-1` | Region reported to clients |
 | `--domain` | `S3RS_DOMAIN` | | Turns on virtual-hosted-style requests (`<bucket>.<domain>`) |
@@ -446,6 +446,14 @@ Supported: index documents (`/` and `/dir/`, and `/dir` redirects to `/dir/`), e
 `x-amz-website-redirect-location`, ranges and conditional GETs. Errors are HTML pages. The endpoint
 accepts only anonymous GET and HEAD, and never lists buckets. Redirects use `https://` when s3rs
 serves TLS, and with `--behind-proxy` they use the scheme from `X-Forwarded-Proto`.
+
+## Running in production
+
+[OPERATIONS.md](OPERATIONS.md) has a go-live checklist and covers the rest of running s3rs:
+- a hardened systemd unit ([`deploy/s3rs.service`](deploy/s3rs.service)) and its configuration
+  template
+- sizing, plus Prometheus alert rules ([`deploy/prometheus-alerts.yml`](deploy/prometheus-alerts.yml))
+- backup schedules, upgrades and downgrades, and incident runbooks
 
 ## Usage and quotas
 

@@ -1,0 +1,73 @@
+# Prometheus alerting rules for s3rs. Scrape /_metrics with the metrics token, e.g.:
+#   - job_name: s3rs
+#     authorization: { credentials: <S3RS_METRICS_TOKEN> }
+#     static_configs: [{ targets: ["s3.example.com:9000"] }]
+groups:
+  - name: s3rs
+    rules:
+      - alert: S3rsDown
+        expr: up{job="s3rs"} == 0
+        for: 1m
+        labels: { severity: critical }
+        annotations:
+          summary: "s3rs on {{ $labels.instance }} is not responding"
+
+      - alert: S3rsDiskLow
+        expr: s3rs_disk_free_bytes < 4 * s3rs_disk_reserve_bytes
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "s3rs data disk on {{ $labels.instance }} is filling up"
+          description: "{{ $value | humanize1024 }}B free; uploads stop at the reserve (s3rs_disk_reserve_bytes)."
+
+      - alert: S3rsDiskFull
+        expr: s3rs_disk_free_bytes < s3rs_disk_reserve_bytes
+        for: 1m
+        labels: { severity: critical }
+        annotations:
+          summary: "s3rs on {{ $labels.instance }} is refusing uploads (507 StorageFull)"
+          description: "Free space is below the reserve. Delete data or grow the disk; deletes still work."
+
+      - alert: S3rsServerErrors
+        expr: |
+          sum by (instance) (rate(s3rs_requests_total{code="5xx"}[5m]))
+            / sum by (instance) (rate(s3rs_requests_total[5m])) > 0.01
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "More than 1% of requests to s3rs on {{ $labels.instance }} fail with 5xx"
+          description: "The server log (stderr) has the details."
+
+      - alert: S3rsSlowRequests
+        expr: |
+          histogram_quantile(0.99, sum by (instance, le) (rate(s3rs_request_duration_seconds_bucket[5m]))) > 2
+        for: 15m
+        labels: { severity: warning }
+        annotations:
+          summary: "99th percentile request latency on {{ $labels.instance }} is above 2 s"
+
+      - alert: S3rsConnectionsNearLimit
+        expr: s3rs_connections / s3rs_connections_max > 0.9
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "s3rs on {{ $labels.instance }} is near its connection limit"
+          description: "New connections wait in the kernel's queue at the limit. Raise --max-connections or LimitNOFILE."
+
+      - alert: S3rsNotificationsFailing
+        expr: increase(s3rs_notifications_total{result=~"failed|dropped"}[15m]) > 0
+        labels: { severity: warning }
+        annotations:
+          summary: "s3rs event notifications on {{ $labels.instance }} are failing or being dropped"
+
+      - alert: S3rsAccessLogDropping
+        expr: increase(s3rs_access_log_dropped_total[15m]) > 0
+        labels: { severity: warning }
+        annotations:
+          summary: "s3rs on {{ $labels.instance }} is dropping access log lines (stdout is too slow)"
+
+      - alert: S3rsRestarted
+        expr: s3rs_uptime_seconds < 300
+        labels: { severity: info }
+        annotations:
+          summary: "s3rs on {{ $labels.instance }} restarted recently"

@@ -62,7 +62,7 @@ OPTIONS (each also settable through the environment variable shown):
         --encryption-key <K>     Master key for server-side encryption (SSE-S3): 64 hex chars
                                  or base64 (e.g. from `openssl rand -hex 32`)
                                                                  [S3RS_ENCRYPTION_KEY]
-        --encryption-key-file <P> Read the master key from a file
+        --encryption-key-file <P> Read the master key from a file [S3RS_ENCRYPTION_KEY_FILE]
         --encrypt-by-default     Encrypt every new object with the master key
                                                                  [S3RS_ENCRYPT_BY_DEFAULT=1]
         --webhook <ID=URL>       Event notification target (repeatable), e.g.
@@ -151,6 +151,20 @@ fn env(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|v| !v.is_empty())
 }
 
+/// The master key from S3RS_ENCRYPTION_KEY or the file named by S3RS_ENCRYPTION_KEY_FILE.
+fn env_key() -> Result<Option<[u8; 32]>, String> {
+    if let Some(k) = env("S3RS_ENCRYPTION_KEY") {
+        return parse_key(&k).map(Some).map_err(|e| format!("S3RS_ENCRYPTION_KEY: {e}"));
+    }
+    match env("S3RS_ENCRYPTION_KEY_FILE") {
+        Some(p) => {
+            let text = std::fs::read_to_string(&p).map_err(|e| format!("S3RS_ENCRYPTION_KEY_FILE {p}: {e}"))?;
+            parse_key(text.trim()).map(Some).map_err(|e| format!("S3RS_ENCRYPTION_KEY_FILE {p}: {e}"))
+        }
+        None => Ok(None),
+    }
+}
+
 /// Boolean switch from the environment: 1/true/yes/on or 0/false/no/off (unset means off).
 fn env_flag(name: &str) -> Result<bool, String> {
     match env(name).map(|v| v.to_ascii_lowercase()).as_deref() {
@@ -178,10 +192,7 @@ fn parse_args() -> Result<Config, String> {
         webhook_ca: env("S3RS_WEBHOOK_CA").map(PathBuf::from),
         tls_cert: env("S3RS_TLS_CERT").map(PathBuf::from),
         tls_key: env("S3RS_TLS_KEY").map(PathBuf::from),
-        encryption_key: env("S3RS_ENCRYPTION_KEY")
-            .map(|k| parse_key(&k))
-            .transpose()
-            .map_err(|e| format!("S3RS_ENCRYPTION_KEY: {e}"))?,
+        encryption_key: env_key()?,
         encrypt_by_default: env_flag("S3RS_ENCRYPT_BY_DEFAULT")?,
         region: env("S3RS_REGION").unwrap_or_else(|| "us-east-1".into()),
         domain: env("S3RS_DOMAIN").map(|d| d.to_ascii_lowercase()),
@@ -467,7 +478,7 @@ fn backup(args: &[String]) -> ! {
 fn fsck(args: &[String]) -> ! {
     let mut dir: PathBuf = env("S3RS_DATA_DIR").unwrap_or_else(|| "./data".into()).into();
     let (mut deep, mut repair) = (false, false);
-    let mut key = env("S3RS_ENCRYPTION_KEY").map(|k| parse_key(&k));
+    let mut key = env_key().transpose();
     let mut it = args.iter();
     while let Some(a) = it.next() {
         let mut val = || {

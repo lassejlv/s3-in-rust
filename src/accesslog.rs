@@ -1,13 +1,15 @@
 //! Access log: one line per request on stdout, as text or JSON (for log pipelines).
 //!
-//! Lines are handed to a dedicated thread through a bounded queue and written in batches, so a
-//! slow log sink never slows requests down; if the queue is full, lines are dropped and counted
-//! (`s3rs_access_log_dropped_total`).
+//! Lines are handed to a dedicated thread through a queue bounded in lines and bytes and written
+//! in batches, so a slow log sink never slows requests down or grows memory; if the queue is full,
+//! lines are dropped and counted (`s3rs_access_log_dropped_total`). Client-supplied fields are
+//! truncated, so a line stays small whatever the request carries.
 
 use std::fmt::Write as _;
 use std::io::Write;
 use std::net::IpAddr;
-use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed};
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -53,11 +55,103 @@ pub struct Entry<'a> {
     pub duration: Duration,
     pub user_agent: Option<&'a str>,
     pub record: &'a Record,
+    /// The response body was cut short (the client went away, or the stream failed).
+    pub aborted: bool,
+}
+
+/// A request's log line, written when it is dropped: after the response body has been sent
+/// (with the bytes actually sent and the full duration), or, if the client goes away before
+/// the response, with status 499 ("client closed request").
+pub struct PendingLog {
+    log: Arc<AccessLog>,
+    endpoint: &'static str,
+    request_id: String,
+    remote_ip: IpAddr,
+    method: String,
+    path: String,
+    query: String,
+    user_agent: Option<String>,
+    bytes_in: Option<u64>,
+    pub record: Record,
+    status: u16,
+    error: Option<&'static str>,
+    bytes_out: u64,
+    aborted: bool,
+    started: std::time::Instant,
+}
+
+impl PendingLog {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        log: Arc<AccessLog>,
+        endpoint: &'static str,
+        request_id: &str,
+        remote_ip: IpAddr,
+        method: &str,
+        path: &str,
+        query: &str,
+        user_agent: Option<&str>,
+        bytes_in: Option<u64>,
+    ) -> Self {
+        PendingLog {
+            log,
+            endpoint,
+            request_id: request_id.to_string(),
+            remote_ip,
+            method: clip(method, MAX_SHORT).into_owned(),
+            path: clip(path, MAX_PATH).into_owned(),
+            query: clip(query, MAX_QUERY).into_owned(),
+            user_agent: user_agent.map(|u| clip(u, MAX_UA).into_owned()),
+            bytes_in,
+            record: Record::default(),
+            status: 499,
+            error: None,
+            bytes_out: 0,
+            aborted: false,
+            started: std::time::Instant::now(),
+        }
+    }
+
+    pub fn respond(&mut self, status: u16, error: Option<&'static str>) {
+        self.status = status;
+        self.error = error;
+    }
+
+    pub fn sent(&mut self, n: u64) {
+        self.bytes_out += n;
+    }
+
+    pub fn set_aborted(&mut self) {
+        self.aborted = true;
+    }
+}
+
+impl Drop for PendingLog {
+    fn drop(&mut self) {
+        self.log.log(&Entry {
+            endpoint: self.endpoint,
+            request_id: &self.request_id,
+            remote_ip: self.remote_ip,
+            method: &self.method,
+            path: &self.path,
+            query: &self.query,
+            status: self.status,
+            error: self.error,
+            bytes_in: self.bytes_in,
+            bytes_out: Some(self.bytes_out),
+            duration: self.started.elapsed(),
+            user_agent: self.user_agent.as_deref(),
+            record: &self.record,
+            aborted: self.aborted,
+        });
+    }
 }
 
 pub struct AccessLog {
     format: Format,
     tx: mpsc::SyncSender<Msg>,
+    /// Bytes of lines queued but not yet written.
+    queued: Arc<AtomicUsize>,
     pub dropped: AtomicU64,
 }
 
@@ -68,10 +162,25 @@ enum Msg {
 }
 
 const QUEUE: usize = 65_536;
+const QUEUE_BYTES: usize = 16 << 20;
+
+/// `s` cut to at most `max` bytes (at a character boundary), marked with `…` when cut.
+fn clip(s: &str, max: usize) -> std::borrow::Cow<'_, str> {
+    if s.len() <= max {
+        return s.into();
+    }
+    let mut end = max;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &s[..end]).into()
+}
 
 impl AccessLog {
     pub fn new(format: Format) -> AccessLog {
         let (tx, rx) = mpsc::sync_channel::<Msg>(QUEUE);
+        let queued = Arc::new(AtomicUsize::new(0));
+        let written = queued.clone();
         std::thread::Builder::new()
             .name("s3rs-accesslog".into())
             .spawn(move || {
@@ -83,6 +192,7 @@ impl AccessLog {
                         match msg {
                             Msg::Line(line) => {
                                 let _ = out.write_all(line.as_bytes());
+                                written.fetch_sub(line.len(), Relaxed);
                             }
                             Msg::Flush(done) => waiting.push(done),
                         }
@@ -95,7 +205,7 @@ impl AccessLog {
                 let _ = out.flush();
             })
             .expect("spawn access log thread");
-        AccessLog { format, tx, dropped: AtomicU64::new(0) }
+        AccessLog { format, tx, queued, dropped: AtomicU64::new(0) }
     }
 
     pub fn log(&self, e: &Entry) {
@@ -103,19 +213,43 @@ impl AccessLog {
             Format::Text => text(e),
             Format::Json => json(e),
         };
+        let n = line.len();
+        if self.queued.fetch_add(n, Relaxed) + n > QUEUE_BYTES {
+            self.queued.fetch_sub(n, Relaxed);
+            self.dropped.fetch_add(1, Relaxed);
+            return;
+        }
         if self.tx.try_send(Msg::Line(line)).is_err() {
+            self.queued.fetch_sub(n, Relaxed);
             self.dropped.fetch_add(1, Relaxed);
         }
     }
 
-    /// Wait (briefly) until every line logged so far is written.
+    /// Wait (at most a few seconds, even if stdout is stuck) until every line logged so far is
+    /// written.
     pub fn flush(&self) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
         let (done, wait) = mpsc::channel();
-        if self.tx.send(Msg::Flush(done)).is_ok() {
-            let _ = wait.recv_timeout(Duration::from_secs(5));
+        let mut msg = Msg::Flush(done);
+        loop {
+            match self.tx.try_send(msg) {
+                Ok(()) => break,
+                Err(mpsc::TrySendError::Full(m)) if std::time::Instant::now() < deadline => {
+                    msg = m;
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(_) => return,
+            }
         }
+        let _ = wait.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()));
     }
 }
+
+/// Field length limits (bytes): a valid key is at most 1024 bytes.
+const MAX_PATH: usize = 2048;
+const MAX_QUERY: usize = 2048;
+const MAX_UA: usize = 512;
+const MAX_SHORT: usize = 128;
 
 /// Query parameters that carry secrets (presigned URL signatures, session tokens).
 const SECRET_PARAMS: &[&str] = &["x-amz-signature", "signature", "x-amz-security-token"];
@@ -125,7 +259,9 @@ pub fn redact_query(q: &str) -> String {
     q.split('&')
         .map(|p| {
             let name = p.split('=').next().unwrap_or("");
-            if SECRET_PARAMS.iter().any(|s| name.eq_ignore_ascii_case(s)) { format!("{name}=REDACTED") } else { p.to_string() }
+            // Compare decoded names: `X-Amz-Signatur%65` is the same parameter to the server.
+            let decoded = crate::util::uri_decode(name, true).unwrap_or_else(|| name.to_string());
+            if SECRET_PARAMS.iter().any(|s| decoded.eq_ignore_ascii_case(s)) { format!("{name}=REDACTED") } else { p.to_string() }
         })
         .collect::<Vec<_>>()
         .join("&")
@@ -136,18 +272,21 @@ fn ip(e: &Entry) -> IpAddr {
 }
 
 fn text(e: &Entry) -> String {
-    let q = if e.query.is_empty() { String::new() } else { format!("?{}", redact_query(e.query)) };
+    let q = if e.query.is_empty() { String::new() } else { format!("?{}", clip(&redact_query(e.query), MAX_QUERY)) };
     let mut s = format!(
         "{} {} {} {}{q} -> {} ({:.2}ms)",
         ip(e),
-        e.record.user.as_deref().unwrap_or("-"),
-        e.method,
-        e.path,
+        clip(e.record.user.as_deref().unwrap_or("-"), MAX_SHORT),
+        clip(e.method, MAX_SHORT),
+        clip(e.path, MAX_PATH),
         e.status,
         e.duration.as_secs_f64() * 1000.0
     );
     if let Some(code) = e.error {
         let _ = write!(s, " {code}");
+    }
+    if e.aborted {
+        s.push_str(" aborted");
     }
     let _ = write!(s, " id={}", e.request_id);
     s.push('\n');
@@ -185,16 +324,19 @@ fn json(e: &Entry) -> String {
     field("request_id", Some(e.request_id));
     field("endpoint", Some(e.endpoint));
     field("remote_ip", Some(&ip(e).to_string()));
-    field("user", e.record.user.as_deref());
-    field("method", Some(e.method));
-    field("path", Some(e.path));
-    let q = redact_query(e.query);
+    field("user", e.record.user.as_deref().map(|v| clip(v, MAX_SHORT)).as_deref());
+    field("method", Some(&clip(e.method, MAX_SHORT)));
+    field("path", Some(&clip(e.path, MAX_PATH)));
+    let q = clip(&redact_query(e.query), MAX_QUERY).into_owned();
     field("query", (!e.query.is_empty()).then_some(q.as_str()));
-    field("bucket", e.record.bucket.as_deref());
-    field("key", e.record.key.as_deref());
+    field("bucket", e.record.bucket.as_deref().map(|v| clip(v, MAX_SHORT)).as_deref());
+    field("key", e.record.key.as_deref().map(|v| clip(v, MAX_PATH)).as_deref());
     field("error", e.error);
-    field("user_agent", e.user_agent);
+    field("user_agent", e.user_agent.map(|v| clip(v, MAX_UA)).as_deref());
     let _ = write!(s, ",\"status\":{}", e.status);
+    if e.aborted {
+        s.push_str(",\"aborted\":true");
+    }
     if let Some(n) = e.bytes_in {
         let _ = write!(s, ",\"bytes_in\":{n}");
     }
@@ -216,6 +358,9 @@ mod tests {
             "X-Amz-Credential=AK%2F2024&X-Amz-Signature=REDACTED&list-type=2"
         );
         assert_eq!(redact_query("Signature=x&AWSAccessKeyId=AK"), "Signature=REDACTED&AWSAccessKeyId=AK");
+        assert_eq!(redact_query("X-Amz-Signatur%65=s&x=1"), "X-Amz-Signatur%65=REDACTED&x=1");
+        assert_eq!(clip("aé", 2), "a…");
+        assert_eq!(clip("abc", 3), "abc");
         let rec = Record { bucket: Some("b".into()), key: Some("a\"b\n\u{1}".into()), user: Some("ak".into()), client_ip: None };
         let e = Entry {
             endpoint: "api",
@@ -231,6 +376,7 @@ mod tests {
             duration: Duration::from_micros(1500),
             user_agent: Some("aws-cli/2"),
             record: &rec,
+            aborted: false,
         };
         let j = json(&e);
         assert!(j.ends_with("}\n") && !j[..j.len() - 1].contains('\n'), "{j}");

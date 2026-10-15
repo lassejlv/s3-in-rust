@@ -285,10 +285,10 @@ pub async fn run(store: Arc<Store>, interval: Duration, day_secs: u64, stats: Ar
                 stats.expired.fetch_add(e, Ordering::Relaxed);
                 stats.aborted_uploads.fetch_add(a, Ordering::Relaxed);
                 if e > 0 || a > 0 {
-                    eprintln!("lifecycle: expired {e} object(s), aborted {a} multipart upload(s)");
+                    elog!("lifecycle: expired {e} object(s), aborted {a} multipart upload(s)");
                 }
             }
-            Err(e) => eprintln!("lifecycle sweep failed: {e}"),
+            Err(e) => elog!("lifecycle sweep failed: {e}"),
         }
     }
 }

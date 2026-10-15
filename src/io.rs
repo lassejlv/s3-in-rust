@@ -56,6 +56,24 @@ pub struct BodyStream {
     dec: Option<ChunkDecoder>,
     pending: VecDeque<Bytes>,
     eof: bool,
+    /// When the body was first read, and bytes received since (for the minimum rate).
+    started: Option<std::time::Instant>,
+    received: u64,
+}
+
+/// Request bodies must keep up a minimum average rate after a grace period, and never go
+/// quiet for longer than `BODY_IDLE`. Otherwise a client could hold a connection (and, for
+/// POST forms, do so before authenticating) by trickling a byte now and then.
+const BODY_GRACE: Duration = Duration::from_secs(20);
+const BODY_MIN_RATE: u64 = 500;
+
+impl BodyStream {
+    /// How long the next read may take.
+    fn read_budget(&mut self) -> Duration {
+        let started = *self.started.get_or_insert_with(std::time::Instant::now);
+        let allowed = BODY_GRACE + Duration::from_secs(self.received / BODY_MIN_RATE);
+        allowed.saturating_sub(started.elapsed()).min(BODY_IDLE)
+    }
 }
 
 impl BodyStream {
@@ -64,12 +82,12 @@ impl BodyStream {
             Payload::Chunked { signer, trailer } => Some(ChunkDecoder::new(signer.take(), *trailer)),
             _ => None,
         };
-        BodyStream { body: Some(body), dec, pending: VecDeque::new(), eof: false }
+        BodyStream { body: Some(body), dec, pending: VecDeque::new(), eof: false, started: None, received: 0 }
     }
 
     /// A placeholder left behind after the real body has been taken.
     pub fn empty() -> Self {
-        BodyStream { body: None, dec: None, pending: VecDeque::new(), eof: true }
+        BodyStream { body: None, dec: None, pending: VecDeque::new(), eof: true, started: None, received: 0 }
     }
 
     pub async fn next(&mut self) -> S3Result<Option<Bytes>> {
@@ -80,8 +98,10 @@ impl BodyStream {
             if self.eof {
                 return Ok(None);
             }
+            let budget = self.read_budget();
             let Some(body) = &mut self.body else { return Ok(None) };
-            match body.frame().await {
+            let frame = tokio::time::timeout(budget, body.frame()).await.map_err(|_| err::RequestTimeout())?;
+            match frame {
                 None => {
                     self.eof = true;
                     if let Some(d) = &mut self.dec {
@@ -91,6 +111,7 @@ impl BodyStream {
                 Some(Err(_)) => return Err(err::IncompleteBody()),
                 Some(Ok(frame)) => {
                     let Ok(data) = frame.into_data() else { continue };
+                    self.received += data.len() as u64;
                     match &mut self.dec {
                         None if data.is_empty() => {}
                         None => return Ok(Some(data)),
@@ -277,7 +298,10 @@ const SPACE_CHECK_EVERY: u64 = 8 << 20;
 pub async fn ingest(store: &Arc<Store>, mut body: impl Source, e: Expect) -> S3Result<Ingested> {
     // Keep the free-space reserve: refuse now if the declared size can't fit, and re-check as
     // data arrives (for uploads of unknown size, and for concurrent uploads sharing the space).
-    store.space.check(e.len.unwrap_or(0))?;
+    if let Err(err) = store.space.check(e.len.unwrap_or(0)) {
+        discard_small(&mut body, e.len).await;
+        return Err(err);
+    }
     if e.len.is_some_and(|l| l > e.max_len) {
         return Err(err::EntityTooLarge());
     }
@@ -384,6 +408,25 @@ pub async fn ingest(store: &Arc<Store>, mut body: impl Source, e: Expect) -> S3R
     result
 }
 
+/// Before refusing a request whose body has not been read, read and drop a small body, so the
+/// error response reaches the client: closing a connection with unread data in it makes the
+/// kernel reset it, and the client may never see the response.
+pub async fn discard_small(body: &mut impl Source, len: Option<u64>) {
+    const MAX: u64 = 1 << 20;
+    if len.is_some_and(|l| l <= MAX) {
+        let drain = async {
+            let mut n = 0u64;
+            while let Ok(Some(b)) = body.next().await {
+                n += b.len() as u64;
+                if n > MAX {
+                    break;
+                }
+            }
+        };
+        let _ = tokio::time::timeout(Duration::from_secs(5), drain).await;
+    }
+}
+
 /// How long an upload may go without sending any body data.
 const BODY_IDLE: Duration = Duration::from_secs(60);
 /// How long a download may go without the client accepting any data.
@@ -448,7 +491,8 @@ impl WriteState {
 /// queued, so receiving and writing overlap.
 struct WritePipe {
     tx: Option<mpsc::Sender<Bytes>>,
-    task: tokio::task::JoinHandle<io::Result<WriteState>>,
+    /// Taken by the first `wait` (a finished JoinHandle must not be polled again).
+    task: Option<tokio::task::JoinHandle<io::Result<WriteState>>>,
 }
 
 impl WritePipe {
@@ -472,15 +516,14 @@ impl WritePipe {
             }
             Ok(st)
         });
-        WritePipe { tx: Some(tx), task }
+        WritePipe { tx: Some(tx), task: Some(task) }
     }
 
     /// Queue a chunk (waits while four are already queued).
     async fn write(&mut self, chunk: Bytes) -> S3Result<()> {
-        let tx = self.tx.as_ref().expect("not finished");
+        let Some(tx) = self.tx.as_ref() else { return Err(S3Error::internal("the upload writer stopped")) };
         if tx.send(chunk).await.is_err() {
-            // The writer stopped on an error; finish() reports it.
-            self.tx = None;
+            // The writer stopped on an error: report that error.
             return self.wait().await.map(|_| ());
         }
         Ok(())
@@ -488,7 +531,10 @@ impl WritePipe {
 
     async fn wait(&mut self) -> S3Result<WriteState> {
         self.tx = None;
-        Ok((&mut self.task).await.map_err(S3Error::internal)??)
+        match self.task.take() {
+            Some(task) => Ok(task.await.map_err(S3Error::internal)??),
+            None => Err(S3Error::internal("the upload writer already failed")),
+        }
     }
 
     async fn finish(mut self, fsync: bool) -> S3Result<(Hashers, u64)> {

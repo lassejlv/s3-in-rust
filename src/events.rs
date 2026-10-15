@@ -157,7 +157,7 @@ pub fn load_config(bucket: &str, doc: &xml::Node, targets: &[String]) -> Vec<Rul
         Ok(rules) => {
             let n = doc.children.len();
             if rules.len() < n {
-                eprintln!(
+                elog!(
                     "warning: bucket {bucket}: {} notification rule(s) refer to webhook targets that are not configured and are ignored",
                     n - rules.len()
                 );
@@ -165,7 +165,7 @@ pub fn load_config(bucket: &str, doc: &xml::Node, targets: &[String]) -> Vec<Rul
             rules
         }
         Err(e) => {
-            eprintln!("warning: bucket {bucket}: stored notification configuration is invalid: {}", e.message);
+            elog!("warning: bucket {bucket}: stored notification configuration is invalid: {}", e.message);
             Vec::new()
         }
     }
@@ -546,7 +546,7 @@ async fn deliver(
             let now = now_ms() / 60_000;
             if now != warned_at {
                 warned_at = now;
-                eprintln!("webhook {id}: delivery failed ({last_err}); events are dropped until it is reachable again");
+                elog!("webhook {id}: delivery failed ({last_err}); events are dropped until it is reachable again");
             }
         }
     }

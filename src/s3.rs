@@ -63,7 +63,7 @@ pub struct Server {
     pub auth: Option<Auth>,
     pub region: String,
     pub domain: Option<String>,
-    access_log: Option<crate::accesslog::AccessLog>,
+    access_log: Option<Arc<crate::accesslog::AccessLog>>,
     admin_token: Option<String>,
     /// Set while a backup streams (one at a time).
     backup_running: Arc<std::sync::atomic::AtomicBool>,
@@ -364,7 +364,7 @@ impl Server {
             auth,
             region: opts.region,
             domain: opts.domain,
-            access_log: opts.access_log.map(crate::accesslog::AccessLog::new),
+            access_log: opts.access_log.map(|f| Arc::new(crate::accesslog::AccessLog::new(f))),
             admin_token: opts.admin_token,
             backup_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             metrics: crate::metrics::Metrics::new(opts.events.stats.clone()),
@@ -406,7 +406,7 @@ impl Server {
             .map(|v| {
                 iam::Policy::parse(&String::from_utf8_lossy(&v), iam::Kind::Bucket, Some(bucket)).unwrap_or_else(|e| {
                     // Fail closed: a policy we can no longer read may have contained Denies.
-                    eprintln!(
+                    elog!(
                         "warning: bucket {bucket}: stored policy is invalid ({}); denying all access except policy management until it is replaced",
                         e.message
                     );
@@ -638,25 +638,44 @@ impl Server {
         let query = req.uri().query().map(|q| format!("?{q}")).unwrap_or_default();
         let origin = header(req.headers(), "origin").map(str::to_string);
         let cors_bucket = origin.as_ref().and_then(|_| self.resolve(req.uri(), req.headers()).ok()).and_then(|(b, _, _)| b);
-        // Captured before the request is consumed, for the access log.
-        let log_in = self.access_log.as_ref().map(|_| {
+        // Written when the response has been sent, or with 499 if this future is dropped first.
+        let mut pending = self.access_log.as_ref().map(|log| {
             let h = req.headers();
             let n = |name| header(h, name).and_then(|v| v.parse::<u64>().ok());
-            (n("x-amz-decoded-content-length").or_else(|| n("content-length")), header(h, "user-agent").map(str::to_string))
+            crate::accesslog::PendingLog::new(
+                log.clone(),
+                "api",
+                &rid,
+                peer.ip(),
+                method.as_str(),
+                &path,
+                query.strip_prefix('?').unwrap_or(&query),
+                header(h, "user-agent"),
+                n("x-amz-decoded-content-length").or_else(|| n("content-length")),
+            )
         });
-        let mut rec = crate::accesslog::Record::default();
+        let mut scratch = crate::accesslog::Record::default();
+        let rec = pending.as_mut().map_or(&mut scratch, |p| &mut p.record);
+        // An HTTP/1 request with a body that fails may leave part of that body unread; hyper
+        // then closes the connection, so say so instead of letting the client reuse it.
+        let h1_with_body = req.version() <= hyper::Version::HTTP_11
+            && (req.headers().contains_key("transfer-encoding")
+                || header(req.headers(), "content-length").is_some_and(|v| v.trim() != "0"));
         let mut error_code = None;
         let _inflight = self.metrics.start();
-        let mut resp = match self.route(req, peer, &rid, &mut rec).await {
+        let mut resp = match self.route(req, peer, &rid, rec).await {
             Ok(r) => r,
             Err(e) => {
                 error_code = Some(e.code);
                 if e.status == StatusCode::INTERNAL_SERVER_ERROR {
-                    eprintln!("error: {method} {path}: {e}");
+                    elog!("error: {method} {path}: {e}");
                 }
                 let mut r = Resp::new(e.status);
                 for (k, v) in &e.headers {
                     r.set(k, v);
+                }
+                if h1_with_body {
+                    r.set("connection", "close");
                 }
                 if method != Method::HEAD {
                     r.set("content-type", "application/xml");
@@ -672,22 +691,9 @@ impl Server {
         }
         let elapsed = started.elapsed();
         self.metrics.finish(&method, resp.status.as_u16(), elapsed);
-        if let (Some(log), Some((bytes_in, user_agent))) = (&self.access_log, &log_in) {
-            log.log(&crate::accesslog::Entry {
-                endpoint: "api",
-                request_id: &rid,
-                remote_ip: peer.ip(),
-                method: method.as_str(),
-                path: &path,
-                query: query.strip_prefix('?').unwrap_or(&query),
-                status: resp.status.as_u16(),
-                error: error_code,
-                bytes_in: *bytes_in,
-                bytes_out: header(&resp.headers, "content-length").and_then(|v| v.parse().ok()),
-                duration: elapsed,
-                user_agent: user_agent.as_deref(),
-                record: &rec,
-            });
+        if let Some(mut p) = pending {
+            p.respond(resp.status.as_u16(), error_code);
+            resp.body = Body::Logged(Box::new(std::mem::replace(&mut resp.body, Body::Empty)), Box::new(p));
         }
         let mut out = Response::new(resp.body);
         *out.status_mut() = resp.status;
@@ -731,23 +737,22 @@ impl Server {
         let resp = self.website(&parts, &rid, peer).await;
         let elapsed = started.elapsed();
         self.metrics.finish(&method, resp.status.as_u16(), elapsed);
+        let mut resp = resp;
         if let Some(log) = &self.access_log {
-            let rec = crate::accesslog::Record { client_ip: Some(self.client(&parts.headers, peer).ip), ..Default::default() };
-            log.log(&crate::accesslog::Entry {
-                endpoint: "website",
-                request_id: &rid,
-                remote_ip: peer.ip(),
-                method: method.as_str(),
-                path: &path,
-                query: parts.uri.query().unwrap_or(""),
-                status: resp.status.as_u16(),
-                error: None,
-                bytes_in: None,
-                bytes_out: header(&resp.headers, "content-length").and_then(|v| v.parse().ok()),
-                duration: elapsed,
-                user_agent: header(&parts.headers, "user-agent"),
-                record: &rec,
-            });
+            let mut p = crate::accesslog::PendingLog::new(
+                log.clone(),
+                "website",
+                &rid,
+                peer.ip(),
+                method.as_str(),
+                &path,
+                parts.uri.query().unwrap_or(""),
+                header(&parts.headers, "user-agent"),
+                None,
+            );
+            p.record.client_ip = Some(self.client(&parts.headers, peer).ip);
+            p.respond(resp.status.as_u16(), None);
+            resp.body = Body::Logged(Box::new(std::mem::replace(&mut resp.body, Body::Empty)), Box::new(p));
         }
         let mut out = Response::new(resp.body);
         *out.status_mut() = resp.status;
@@ -913,40 +918,37 @@ impl Server {
         if self.backup_running.swap(true, Ordering::SeqCst) {
             return Err(S3Error::new("BackupInProgress", StatusCode::CONFLICT, "Another backup is already running."));
         }
-        let running = self.backup_running.clone();
+        // Cleared when dropped, whichever way the backup ends (including a panic).
+        struct Running(Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for Running {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::SeqCst);
+            }
+        }
+        let running = Running(self.backup_running.clone());
         let store = self.store.clone();
-        let backup = match tokio::task::spawn_blocking(move || store.begin_backup()).await {
-            Ok(Ok(b)) => b,
-            Ok(Err(e)) => {
-                running.store(false, Ordering::SeqCst);
-                return Err(e);
-            }
-            Err(e) => {
-                running.store(false, Ordering::SeqCst);
-                return Err(S3Error::internal(e));
-            }
-        };
+        let backup = tokio::task::spawn_blocking(move || store.begin_backup()).await.map_err(S3Error::internal)??;
         let size = backup.plan.tar_size();
         if !backup.plan.missing.is_empty() {
-            eprintln!(
+            elog!(
                 "backup: {} data file(s) referenced by the metadata are missing and not included; run s3rs fsck",
                 backup.plan.missing.len()
             );
         }
-        eprintln!("backup: streaming {} file(s), {size} bytes", backup.plan.entries.len());
+        elog!("backup: streaming {} file(s), {size} bytes", backup.plan.entries.len());
         let (tx, rx) = tokio::sync::mpsc::channel(8);
         tokio::task::spawn_blocking(move || {
             let mut out = crate::store::backup::ChunkSender::new(tx);
             match crate::store::backup::write_tar(&backup.plan, &mut out) {
-                Ok(()) => eprintln!("backup: done"),
+                Ok(()) => elog!("backup: done"),
                 Err(e) => {
-                    eprintln!("backup: aborted: {e}");
+                    elog!("backup: aborted: {e}");
                     out.fail(e);
                 }
             }
             // Releases the hold on data file deletion and removes the snapshot.
             drop(backup);
-            running.store(false, Ordering::SeqCst);
+            drop(running);
         });
         let mut r = Resp::ok();
         r.set("content-type", "application/x-tar")
@@ -2135,8 +2137,10 @@ impl Server {
         let conditional = r.header("if-match").is_some() || r.header("if-none-match").is_some();
         if let Some(len) = expect.len
             && !conditional
+            && let Err(e) = self.store.quota_allows(bucket, store::Incoming::Object(key), len)
         {
-            self.store.quota_allows(bucket, store::Incoming::Object(key), len)?;
+            io::discard_small(&mut r.body, Some(len)).await;
+            return Err(e);
         }
         let body = std::mem::replace(&mut r.body, BodyStream::empty());
         let ing = io::ingest(&self.store, body, expect).await?;
@@ -2451,8 +2455,11 @@ impl Server {
             return self.upload_part_copy(r, bucket, key, upload, part, part_key, &u.headers).await;
         }
         let mut expect = self.expect(r, MAX_PART_SIZE, false)?;
-        if let Some(len) = expect.len {
-            self.store.quota_allows(bucket, store::Incoming::Part { upload, part }, len)?;
+        if let Some(len) = expect.len
+            && let Err(e) = self.store.quota_allows(bucket, store::Incoming::Part { upload, part }, len)
+        {
+            io::discard_small(&mut r.body, Some(len)).await;
+            return Err(e);
         }
         let expect_key = part_key.clone();
         expect.encrypt = part_key;

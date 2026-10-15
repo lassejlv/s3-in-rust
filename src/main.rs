@@ -1,4 +1,14 @@
 //! s3rs — a fast, lightweight, S3-compatible object storage server in pure Rust.
+#![deny(clippy::print_stderr)]
+
+/// `eprintln!` that never panics: stderr may be a file on a full disk, or a closed pipe, and a
+/// failed diagnostic must not take down the thread that wrote it.
+macro_rules! elog {
+    ($($t:tt)*) => {{
+        use std::io::Write as _;
+        let _ = writeln!(std::io::stderr(), $($t)*);
+    }};
+}
 
 mod access;
 mod accesslog;
@@ -440,7 +450,7 @@ fn backup(args: &[String]) -> ! {
     while let Some(a) = it.next() {
         let mut val = || {
             it.next().cloned().unwrap_or_else(|| {
-                eprintln!("{a} requires a value");
+                elog!("{a} requires a value");
                 std::process::exit(2)
             })
         };
@@ -454,13 +464,13 @@ fn backup(args: &[String]) -> ! {
                 std::process::exit(0);
             }
             other => {
-                eprintln!("unknown argument: {other}");
+                elog!("unknown argument: {other}");
                 std::process::exit(2);
             }
         }
     }
     let Some(output) = output else {
-        eprintln!("s3rs backup: -o FILE (or - for stdout) is required");
+        elog!("s3rs backup: -o FILE (or - for stdout) is required");
         std::process::exit(2);
     };
     let result = if output == "-" {
@@ -483,15 +493,15 @@ fn backup(args: &[String]) -> ! {
     };
     match result {
         Ok(plan) => {
-            eprintln!("backup: wrote {} file(s), {} bytes", plan.entries.len(), plan.tar_size());
+            elog!("backup: wrote {} file(s), {} bytes", plan.entries.len(), plan.tar_size());
             if !plan.missing.is_empty() {
-                eprintln!("warning: {} referenced data file(s) are missing; run s3rs fsck", plan.missing.len());
+                elog!("warning: {} referenced data file(s) are missing; run s3rs fsck", plan.missing.len());
                 std::process::exit(1);
             }
             std::process::exit(0);
         }
         Err(e) => {
-            eprintln!("error: {e}");
+            elog!("error: {e}");
             std::process::exit(2);
         }
     }
@@ -505,7 +515,7 @@ fn fsck(args: &[String]) -> ! {
     while let Some(a) = it.next() {
         let mut val = || {
             it.next().cloned().unwrap_or_else(|| {
-                eprintln!("{a} requires a value");
+                elog!("{a} requires a value");
                 std::process::exit(2)
             })
         };
@@ -532,7 +542,7 @@ Checks a data directory while the server is stopped:
                 std::process::exit(0);
             }
             other => {
-                eprintln!("unknown fsck argument: {other}");
+                elog!("unknown fsck argument: {other}");
                 std::process::exit(2);
             }
         }
@@ -540,7 +550,7 @@ Checks a data directory while the server is stopped:
     let key = match key.transpose() {
         Ok(k) => k,
         Err(e) => {
-            eprintln!("error: encryption key: {e}");
+            elog!("error: encryption key: {e}");
             std::process::exit(2);
         }
     };
@@ -548,7 +558,7 @@ Checks a data directory while the server is stopped:
     let r = match store::fsck::run(&dir, deep, key, repair) {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("error: {e}");
+            elog!("error: {e}");
             std::process::exit(2);
         }
     };
@@ -598,14 +608,14 @@ fn main() {
     let cfg = match parse_args().and_then(check_secrets) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("{e}");
+            elog!("{e}");
             std::process::exit(2);
         }
     };
     let creds = match collect_credentials(&cfg) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("error: {e}");
+            elog!("error: {e}");
             std::process::exit(2);
         }
     };
@@ -614,14 +624,14 @@ fn main() {
     } else if cfg.anonymous {
         None
     } else {
-        eprintln!(
+        elog!(
             "error: set --access-key/--secret-key (or S3RS_ACCESS_KEY/S3RS_SECRET_KEY), use --credentials-file, or pass --anonymous"
         );
         std::process::exit(2);
     };
 
     if cfg.encrypt_by_default && cfg.encryption_key.is_none() {
-        eprintln!("error: --encrypt-by-default requires --encryption-key");
+        elog!("error: --encrypt-by-default requires --encryption-key");
         std::process::exit(2);
     }
     let tls = match (&cfg.tls_cert, &cfg.tls_key) {
@@ -629,12 +639,12 @@ fn main() {
         (Some(cert), Some(key)) => match tls::Server::load(cert.clone(), key.clone()) {
             Ok(t) => Some(Arc::new(t)),
             Err(e) => {
-                eprintln!("error: TLS: {e}");
+                elog!("error: TLS: {e}");
                 std::process::exit(2);
             }
         },
         _ => {
-            eprintln!("error: --tls-cert and --tls-key must be given together");
+            elog!("error: --tls-cert and --tls-key must be given together");
             std::process::exit(2);
         }
     };
@@ -643,7 +653,7 @@ fn main() {
             Ok(c) => Some(c),
             Err(e) => {
                 let what = if cfg.webhooks.iter().any(|(_, u)| u.tls) { "https:// webhooks" } else { "--webhook-ca" };
-                eprintln!("error: {what}: {e}");
+                elog!("error: {what}: {e}");
                 std::process::exit(2);
             }
         }
@@ -660,7 +670,7 @@ fn main() {
     }) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("error: cannot open data directory {}: {e}", cfg.data_dir.display());
+            elog!("error: cannot open data directory {}: {e}", cfg.data_dir.display());
             std::process::exit(1);
         }
     };
@@ -673,7 +683,7 @@ async fn bind(addr: SocketAddr) -> TcpListener {
     match TcpListener::bind(addr).await {
         Ok(l) => l,
         Err(e) => {
-            eprintln!("error: cannot listen on {addr}: {e}");
+            elog!("error: cannot listen on {addr}: {e}");
             std::process::exit(1);
         }
     }
@@ -778,7 +788,7 @@ async fn serve(
         ));
     }
     let scheme = if tls.is_some() { "https" } else { "http" };
-    eprintln!(
+    elog!(
         "s3rs {} listening on {scheme}://{} (data: {}, region: {}, auth: {}, fsync: {}, encryption: {})",
         env!("CARGO_PKG_VERSION"),
         cfg.listen,
@@ -794,17 +804,17 @@ async fn serve(
     );
     let reserve = store.space.reserve();
     if reserve > 0 {
-        eprintln!("uploads are refused when the data disk has less than {} MiB free", reserve >> 20);
+        elog!("uploads are refused when the data disk has less than {} MiB free", reserve >> 20);
     }
     if cfg.console {
-        eprintln!("s3rs web console on {scheme}://{}/_console/", cfg.listen);
+        elog!("s3rs web console on {scheme}://{}/_console/", cfg.listen);
     }
     for (id, url) in &cfg.webhooks {
         let s = if url.tls { "https" } else { "http" };
-        eprintln!("webhook target {id}: {s}://{}:{}{} (arn:s3rs:webhook::{id})", url.host, url.port, url.path);
+        elog!("webhook target {id}: {s}://{}:{}{} (arn:s3rs:webhook::{id})", url.host, url.port, url.path);
     }
     if let Some(a) = cfg.website_listen {
-        eprintln!("s3rs website endpoint on {scheme}://{a}");
+        elog!("s3rs website endpoint on {scheme}://{a}");
     }
 
     let mut builder = auto::Builder::new(TokioExecutor::new());
@@ -821,7 +831,8 @@ async fn serve(
         .timer(TokioTimer::new())
         .keep_alive_interval(Duration::from_secs(30))
         .keep_alive_timeout(Duration::from_secs(20))
-        .max_concurrent_streams(256)
+        // Each stream can hold a data file open; --max-connections assumes about one per connection.
+        .max_concurrent_streams(128)
         .initial_stream_window_size(4 * 1024 * 1024)
         .initial_connection_window_size(16 * 1024 * 1024);
     let builder = Arc::new(builder);
@@ -837,8 +848,8 @@ async fn serve(
             while hup.recv().await.is_some() {
                 if let Some(t) = &tls {
                     match t.reload() {
-                        Ok(()) => eprintln!("reloaded the TLS certificate"),
-                        Err(e) => eprintln!("TLS RELOAD FAILED, still using the previous certificate: {e}"),
+                        Ok(()) => elog!("reloaded the TLS certificate"),
+                        Err(e) => elog!("TLS RELOAD FAILED, still using the previous certificate: {e}"),
                     }
                 }
                 if server.auth.is_none() {
@@ -851,14 +862,14 @@ async fn serve(
                             a.replace(creds);
                         }
                         if n == 0 {
-                            eprintln!("reloaded: NO access keys are configured now; every signed request will be refused");
+                            elog!("reloaded: NO access keys are configured now; every signed request will be refused");
                         } else {
-                            eprintln!("reloaded {n} access key(s)");
+                            elog!("reloaded {n} access key(s)");
                         }
                     }
                     // Keeping the old keys can keep a key alive that the edit meant to remove,
                     // so say so loudly.
-                    Err(e) => eprintln!("RELOAD FAILED, still using the previous keys (including any you removed): {e}"),
+                    Err(e) => elog!("RELOAD FAILED, still using the previous keys (including any you removed): {e}"),
                 }
             }
         });
@@ -869,7 +880,7 @@ async fn serve(
     let max_conns =
         cfg.max_connections.unwrap_or_else(|| nofile.map_or(4096, |n| (n.saturating_sub(64) / 2) as usize).clamp(64, 10_000));
     server.metrics.max_connections.store(max_conns as u64, std::sync::atomic::Ordering::Relaxed);
-    eprintln!(
+    elog!(
         "accepting up to {max_conns} connections{}",
         nofile.map(|n| format!(" (file descriptor limit {n})")).unwrap_or_default()
     );
@@ -895,7 +906,7 @@ async fn serve(
             Ok(c) => c,
             Err(e) => {
                 // Typically EMFILE; back off instead of spinning.
-                eprintln!("accept error: {e}");
+                elog!("accept error: {e}");
                 tokio::time::sleep(Duration::from_millis(50)).await;
                 continue;
             }
@@ -948,11 +959,11 @@ async fn serve(
     drop(website_listener);
     // End open event streams so they don't hold up the drain.
     server.events.shutdown();
-    eprintln!("shutting down: draining in-flight requests (up to {}s)", SHUTDOWN_GRACE.as_secs());
+    elog!("shutting down: draining in-flight requests (up to {}s)", SHUTDOWN_GRACE.as_secs());
     let drained = tokio::select! {
         _ = graceful.shutdown() => true,
         _ = tokio::time::sleep(SHUTDOWN_GRACE) => {
-            eprintln!("grace period over; closing remaining connections");
+            elog!("grace period over; closing remaining connections");
             false
         }
     };
@@ -963,7 +974,7 @@ async fn serve(
     if drained {
         store.mark_clean_shutdown();
     }
-    eprintln!("bye");
+    elog!("bye");
 }
 
 async fn shutdown_signal() {

@@ -532,11 +532,11 @@ impl Store {
         if unclean {
             let started = std::time::Instant::now();
             match collect_orphans(&db, &root) {
-                Ok((n, bytes)) => eprintln!(
+                Ok((n, bytes)) => elog!(
                     "recovery: removed {n} orphaned data file(s), {bytes} bytes, in {:.1}s",
                     started.elapsed().as_secs_f64()
                 ),
-                Err(e) => eprintln!("recovery: orphan scan failed: {e}"),
+                Err(e) => elog!("recovery: orphan scan failed: {e}"),
             }
         }
         let db = Arc::new(DbCell {
@@ -547,7 +547,7 @@ impl Store {
         });
         let space = Arc::new(space::Space::new(&root, cfg.min_free));
         if let Err(e) = space.restore_ballast() {
-            eprintln!("warning: cannot create the ballast file: {e}");
+            elog!("warning: cannot create the ballast file: {e}");
         }
 
         let (del_tx, del_rx) = mpsc::channel::<Gc>();
@@ -572,12 +572,12 @@ impl Store {
                     if let Err(e) = std::fs::remove_file(data_path(&del_root, id))
                         && e.kind() != std::io::ErrorKind::NotFound
                     {
-                        eprintln!("gc: failed to remove {}: {e}", util::id_hex(id));
+                        elog!("gc: failed to remove {}: {e}", util::id_hex(id));
                     }
                 }
                 // Deletes free space: put the ballast back once there is room.
                 if !gc_space.ballast.present() && matches!(gc_space.restore_ballast(), Ok(true)) {
-                    eprintln!("disk space recovered: recreated the ballast file");
+                    elog!("disk space recovered: recreated the ballast file");
                 }
             }
         })?;
@@ -608,14 +608,14 @@ impl Store {
     /// finish in time, no marker is written and the next start runs the recovery scan.
     pub fn mark_clean_shutdown(&self) {
         if self.db.reopened.load(std::sync::atomic::Ordering::SeqCst) {
-            eprintln!("shutdown: the metadata database was reopened after an I/O error; the next start will run a recovery scan");
+            elog!("shutdown: the metadata database was reopened after an I/O error; the next start will run a recovery scan");
             return;
         }
         let (done, wait) = mpsc::channel();
         if self.deleter.send(Gc::Sync(done)).is_ok() && wait.recv_timeout(Duration::from_secs(60)).is_ok() {
             let _ = std::fs::write(self.root.join(CLEAN_MARKER), CLEAN_TAG);
         } else {
-            eprintln!("shutdown: file deletions did not finish; the next start will run a recovery scan");
+            elog!("shutdown: file deletions did not finish; the next start will run a recovery scan");
         }
     }
 
@@ -630,6 +630,9 @@ impl Store {
     /// Start a consistent backup: data file deletion is held back (before the snapshot, so no
     /// file the snapshot refers to can disappear) until the returned `Backup` is dropped.
     pub fn begin_backup(&self) -> S3Result<Backup> {
+        // The snapshot is at most as large as the live database; it must not eat the reserve.
+        let db_len = std::fs::metadata(self.root.join("meta.redb")).map(|m| m.len()).unwrap_or(0);
+        self.space.check(db_len)?;
         self.gc_paused.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let pause = GcPause(self.gc_paused.clone());
         let snapshot = backup::SnapshotFile(self.root.join("tmp").join(format!("backup-{}.redb", util::id_hex(util::new_id()))));
@@ -1308,7 +1311,7 @@ fn writer_loop(cell: Arc<DbCell>, rx: mpsc::Receiver<Job>, deleter: mpsc::Sender
                             }
                         }
                         Err(e) => {
-                            eprintln!("metadata flush failed: {e}");
+                            elog!("metadata flush failed: {e}");
                             if recover(&cell) {
                                 held.clear();
                                 dirty = false;
@@ -1337,7 +1340,7 @@ fn writer_loop(cell: Arc<DbCell>, rx: mpsc::Receiver<Job>, deleter: mpsc::Sender
         let mut obsolete: Vec<u128> = Vec::new();
         let mut outcome = run_batch(&cell, &mut batch, immediate, &mut last_seq, &mut results, &mut obsolete);
         if let Err(e) = &outcome {
-            eprintln!("metadata commit failed: {e}");
+            elog!("metadata commit failed: {e}");
             // On a full disk, give up the ballast first: reopening the database may need space.
             let retry = e.code == "StorageFull" && backup.is_some() && ballast.release();
             if recover(&cell) {
@@ -1346,7 +1349,7 @@ fn writer_loop(cell: Arc<DbCell>, rx: mpsc::Receiver<Job>, deleter: mpsc::Sender
                 dirty = false;
             }
             if retry && let Some(ops) = backup {
-                eprintln!("disk full: released the {} MiB ballast file and retrying", ballast.size >> 20);
+                elog!("disk full: released the {} MiB ballast file and retrying", ballast.size >> 20);
                 for (job, op) in batch.iter_mut().zip(ops) {
                     job.op = op;
                 }
@@ -1354,7 +1357,7 @@ fn writer_loop(cell: Arc<DbCell>, rx: mpsc::Receiver<Job>, deleter: mpsc::Sender
                 obsolete.clear();
                 outcome = run_batch(&cell, &mut batch, immediate, &mut last_seq, &mut results, &mut obsolete);
                 if let Err(e) = &outcome {
-                    eprintln!("metadata commit failed again: {e}");
+                    elog!("metadata commit failed again: {e}");
                     if recover(&cell) {
                         held.clear();
                         dirty = false;
@@ -1450,8 +1453,8 @@ fn recover(cell: &DbCell) -> bool {
     };
     if broken {
         match cell.reopen() {
-            Ok(()) => eprintln!("reopened the metadata database after an I/O error"),
-            Err(e) => eprintln!("could not reopen the metadata database yet: {e}"),
+            Ok(()) => elog!("reopened the metadata database after an I/O error"),
+            Err(e) => elog!("could not reopen the metadata database yet: {e}"),
         }
     }
     broken
@@ -1604,10 +1607,10 @@ fn rebuild_usage_if_needed(db: &Database, force: bool) -> S3Result<()> {
     }
     txn.commit()?;
     if !usage.is_empty() {
-        eprintln!("usage: computed for {} bucket(s) in {:.1}s", usage.len(), started.elapsed().as_secs_f64());
+        elog!("usage: computed for {} bucket(s) in {:.1}s", usage.len(), started.elapsed().as_secs_f64());
     }
     if skipped > 0 {
-        eprintln!("usage: skipped {skipped} unreadable object record(s); run s3rs fsck");
+        elog!("usage: skipped {skipped} unreadable object record(s); run s3rs fsck");
     }
     Ok(())
 }

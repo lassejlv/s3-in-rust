@@ -35,6 +35,12 @@ impl From<std::io::Error> for S3Error {
         use std::io::ErrorKind;
         match e.kind() {
             ErrorKind::StorageFull | ErrorKind::QuotaExceeded => crate::store::space::storage_full(),
+            // Out of file descriptors: temporary, and clients should back off and retry.
+            _ if cfg!(unix) && matches!(e.raw_os_error(), Some(23 | 24)) => S3Error::new(
+                "SlowDown",
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Please reduce your request rate (the server is out of file descriptors).",
+            ),
             _ => S3Error::internal(e),
         }
     }

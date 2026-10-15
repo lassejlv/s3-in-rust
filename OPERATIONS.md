@@ -132,7 +132,7 @@ A backup holds the state at the moment it started. Writes made during the backup
 
 | Symptom | What to do |
 |---|---|
-| Uploads fail with `507 StorageFull` | The disk is below the reserve. Delete objects (deletes always work), shorten lifecycle rules, abort stale multipart uploads (their parts count too), or grow the disk. Uploads resume on their own. |
+| Uploads fail with `507 StorageFull` | The disk is below the reserve. Delete objects (deletes always work), shorten lifecycle rules, abort stale multipart uploads (their parts count too), or grow the disk. Uploads resume on their own. A backup that is streaming holds back the deletion of data files until it finishes. |
 | `disk full: released the ballast file` in the log | The disk filled up despite the reserve, usually because another process wrote to it. Free space. The ballast is recreated automatically. |
 | The server crashed or was killed | Just start it again. The next start finds no clean-shutdown marker, scans for orphaned data files and recomputes usage counters. Acknowledged writes are never lost (see `tests/crash.py`). |
 | Suspected corruption (bad disk, restored from a filesystem snapshot) | Stop the server and run `s3rs fsck --deep --encryption-key-file …`. `--repair` removes orphaned files and rebuilds counters. It never deletes object data, and it does nothing at all if some metadata can't be read. |

@@ -67,6 +67,8 @@ impl Space {
     /// enough room to recreate it.
     pub fn check(&self, incoming: u64) -> S3Result<()> {
         let mut need = self.reserve.saturating_add(incoming);
+        // Even with the reserve turned off (0): the ballast is what lets deletes commit on a
+        // disk that filled up anyway, so uploads wait until it can be recreated.
         if !self.ballast.present() {
             need = need.saturating_add(2 * self.ballast.size);
         }

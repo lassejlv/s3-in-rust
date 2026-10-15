@@ -117,7 +117,7 @@ Each flag can also be set with the environment variable shown (switches take `1`
 | `--inline-threshold` | `S3RS_INLINE_THRESHOLD` | `65536` | Objects up to this many bytes are stored inside the metadata DB |
 | `--cache-mb` | `S3RS_CACHE_MB` | `256` | Metadata cache size |
 | `--max-connections` | `S3RS_MAX_CONNECTIONS` | from the fd limit, ≤ 10000 | Stops accepting beyond this many open connections (see [Limits and timeouts](#limits-and-timeouts)) |
-| `--min-free-space` | `S3RS_MIN_FREE_SPACE` | 2% of the disk (16M–256M) | Refuses uploads when the data disk's free space would drop below this (e.g. `512M`, `2G`; `0` turns it off). See [Disk space](#disk-space). |
+| `--min-free-space` | `S3RS_MIN_FREE_SPACE` | 2% of the disk (16M–256M) | Refuses uploads when the data disk's free space would drop below this (e.g. `512M`, `2G`; `0` turns the reserve off, but after the ballast file was used, uploads still wait until it can be recreated). See [Disk space](#disk-space). |
 | `--no-fsync` | `S3RS_NO_FSYNC` | off | Skips fsync. Faster, but a crash or power loss can lose about the last second of acknowledged writes. |
 | `--access-log` | `S3RS_ACCESS_LOG` | off | Logs every request to stdout as `json` or `text` (see [Access logs](#access-logs)) |
 | `-v, --verbose` | `S3RS_VERBOSE` | off | Same as `--access-log text` |
@@ -140,8 +140,9 @@ thousands of slow transfers don't starve anything else. On top of that:
 | New connection sends nothing | closed after 30 s |
 | Request headers (also the next request on a kept-alive connection) | 30 s |
 | TLS handshake | 10 s |
-| Upload body sends nothing | `400 RequestTimeout` after 60 s |
-| Download client reads nothing | connection aborted after 120 s |
+| Request body sends nothing | `400 RequestTimeout` after 60 s |
+| Request body too slow | `400 RequestTimeout` once the body averages under 500 bytes/s (after a 20 s grace period). This also covers POST form uploads, which authenticate only after their fields arrive. |
+| Client accepts no response data | connection closed after 120 s with no progress (a slow but steady reader is fine) |
 | HTTP/2 peer stops answering pings | closed (pinged every 30 s) |
 | Open connections | `--max-connections`. Beyond it s3rs stops accepting and new connections wait in the kernel's queue. |
 
@@ -183,9 +184,9 @@ default 2% of the disk, between 16 MiB and 256 MiB):
   reserve. The check runs before any data is received and again every 8 MiB while it arrives.
   Deletes and other metadata changes are always allowed.
 - The data directory also holds a ballast file (0.5% of the disk, 8–64 MiB). If the disk fills up
-  anyway, for example because another process wrote to it, the server deletes the ballast so
-  pending writes and deletes can still commit. Uploads stay refused until there is room to
-  recreate it.
+  anyway, for example because another process wrote to it, the server deletes the ballast to give
+  pending writes and deletes room to commit. If even that is not enough, free space outside s3rs.
+  Uploads stay refused until there is room to recreate the ballast.
 - If the database still hits an I/O error, the server reopens it in place and recovers without a
   restart once space is available.
 - `/_metrics` exports `s3rs_disk_free_bytes` and `s3rs_disk_reserve_bytes`. Alert well before the
@@ -517,6 +518,11 @@ How it works:
 - The response has an exact `Content-Length`. If the server hits an error midway, it aborts the
   transfer, so a truncated download never looks complete (`curl -f` exits non-zero).
 - Only one backup runs at a time. A second request gets `409 BackupInProgress`.
+- The backup is written by one background thread.
+- If the client stops reading for 120 seconds, the connection is closed and the backup aborted.
+  The held-back deletes then run.
+- The snapshot needs free space the size of the metadata database, and is refused (`507`) if
+  taking it would eat into the free-space reserve.
 
 Encrypted objects stay encrypted in the archive. Restoring them needs the same `--encryption-key`,
 and SSE-C objects need their customer keys as before. Treat archives like the data itself: they

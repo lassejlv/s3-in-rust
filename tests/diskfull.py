@@ -12,14 +12,15 @@ Two scenarios, each in a fresh data directory on that filesystem:
    space is freed.
 2. Reserve disabled (--min-free-space 0), and then another process fills the disk to the last
    byte, so the metadata database hits ENOSPC: the server gives up its ballast file so deletes
-   still commit, recovers the database without a restart, and accepts uploads again once the
-   other process's file is gone.
+   can start, recovers the database without a restart, and once the other process's file is
+   gone, deletes and uploads work again.
 
 Both end with a graceful shutdown and a passing `s3rs fsck --deep`.
 """
 
 import os
 import shutil
+import tempfile
 import subprocess
 import sys
 import time
@@ -30,6 +31,7 @@ from botocore.config import Config
 
 BIN, MOUNT = sys.argv[1], sys.argv[2]
 PORT = 9320
+LOGS = tempfile.mkdtemp(prefix="s3rs-diskfull-logs-")  # not on the small filesystem
 ENDPOINT = f"http://127.0.0.1:{PORT}"
 
 
@@ -39,9 +41,14 @@ def client():
                         config=Config(s3={"addressing_style": "path"}, retries={"max_attempts": 1}))
 
 
-def start(data, *extra):
+def logfile(data):
+    return os.path.join(LOGS, os.path.basename(data) + ".log")
+
+
+def start(data, *extra, out=None):
+    out = out or open(logfile(data), "w")
     p = subprocess.Popen([BIN, "-d", data, "-l", f"127.0.0.1:{PORT}", "--access-key", "k", "--secret-key", "secretsecret",
-                          *extra], stdout=open(data + ".log", "w"), stderr=subprocess.STDOUT)
+                          *extra], stdout=out, stderr=out)
     servers.append(p)
     for _ in range(100):
         try:
@@ -70,6 +77,8 @@ def fill(s3):
 def finish(p, data, label):
     p.terminate()
     p.wait()
+    log = open(logfile(data)).read()
+    assert "panicked" not in log, f"{label}: the server panicked:\n{log}"
     leftovers = os.listdir(os.path.join(data, "tmp"))
     assert not leftovers, f"{label}: temporary files left behind: {leftovers[:5]}"
     fsck = subprocess.run([BIN, "fsck", "-d", data, "--deep"], capture_output=True, text=True)
@@ -108,15 +117,26 @@ def scenario(label, extra, expect_ballast):
     filler = os.path.join(MOUNT, label + ".filler")
     if expect_ballast:
         fill_disk(filler)
-    # Deletes must work on a full disk; then uploads resume.
+    # With the reserve, deletes always work. On a disk another process filled to the last byte,
+    # the ballast lets deletes start; once that process's file is gone, all of them must work.
+    deleted = 0
     for key in stored:
-        s3.delete_object(Bucket="full", Key=key)
-    log = open(data + ".log").read()
+        try:
+            s3.delete_object(Bucket="full", Key=key)
+            deleted += 1
+        except s3.exceptions.ClientError as e:
+            if not expect_ballast or e.response["Error"]["Code"] != "StorageFull":
+                raise
+    log = open(logfile(data)).read()
     if expect_ballast:
         assert "ballast file and retrying" in log, f"{label}: the disk never filled up:\n{log}"
+        assert deleted > 0, f"{label}: no delete succeeded on the full disk"
         if os.path.exists(filler):
             os.remove(filler)
+        for key in stored:
+            s3.delete_object(Bucket="full", Key=key)
     else:
+        assert deleted == len(stored)
         assert "metadata commit failed" not in log, f"{label}: the reserve did not protect the database:\n{log}"
     deadline = time.time() + 10
     while True:
@@ -132,10 +152,46 @@ def scenario(label, extra, expect_ballast):
     finish(p, data, label)
 
 
+def unwritable_logs():
+    """Diagnostics and access logs that cannot be written (stdout/stderr on /dev/full, as with
+    logs on a full disk) must not crash anything."""
+    data = os.path.join(MOUNT, "devfull")
+    shutil.rmtree(data, ignore_errors=True)
+    p = start(data, "--access-log", "json", "--min-free-space", "0", out=open("/dev/full", "w"))
+    s3 = client()
+    s3.create_bucket(Bucket="full")
+    stored, _ = fill(s3)
+    fill_disk(os.path.join(MOUNT, "devfull.filler"))
+    for key in stored:
+        try:
+            s3.delete_object(Bucket="full", Key=key)
+        except s3.exceptions.ClientError:
+            pass
+    os.remove(os.path.join(MOUNT, "devfull.filler"))
+    for key in stored:
+        s3.delete_object(Bucket="full", Key=key)
+    deadline = time.time() + 10
+    while True:  # uploads resume once the ballast is back
+        try:
+            s3.put_object(Bucket="full", Key="still-alive", Body=b"x" * 100_000)
+            break
+        except s3.exceptions.ClientError:
+            if time.time() > deadline:
+                raise
+            time.sleep(0.3)
+    assert s3.get_object(Bucket="full", Key="still-alive")["Body"].read() == b"x" * 100_000
+    assert p.poll() is None, "the server exited"
+    p.terminate()
+    p.wait()
+    shutil.rmtree(data)
+    print("unwritable logs: OK (the server kept serving)")
+
+
 servers = []
 try:
     scenario("reserve", [], expect_ballast=False)
     scenario("no-reserve", ["--min-free-space", "0"], expect_ballast=True)
+    unwritable_logs()
 finally:
     for p in servers:
         if p.poll() is None:

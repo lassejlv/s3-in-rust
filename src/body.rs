@@ -16,6 +16,18 @@ pub enum Body {
     },
     /// An open-ended stream (event notifications); ends when the sender is dropped.
     Live(mpsc::Receiver<Bytes>),
+    /// A body whose access log line is written once it has been sent (or abandoned).
+    Logged(Box<Body>, Box<crate::accesslog::PendingLog>),
+}
+
+impl Drop for Body {
+    fn drop(&mut self) {
+        if let Body::Logged(inner, log) = self
+            && !inner.is_end_stream_inner()
+        {
+            log.set_aborted();
+        }
+    }
 }
 
 impl Body {
@@ -46,16 +58,20 @@ impl http_body::Body for Body {
                 Poll::Pending => Poll::Pending,
             },
             Body::Live(rx) => rx.poll_recv(cx).map(|b| b.map(|b| Ok(Frame::data(b)))),
+            Body::Logged(inner, log) => {
+                let r = Pin::new(&mut **inner).poll_frame(cx);
+                match &r {
+                    Poll::Ready(Some(Ok(f))) => log.sent(f.data_ref().map_or(0, |d| d.len() as u64)),
+                    Poll::Ready(Some(Err(_))) => log.set_aborted(),
+                    _ => {}
+                }
+                r
+            }
         }
     }
 
     fn is_end_stream(&self) -> bool {
-        match self {
-            Body::Empty => true,
-            Body::Full(b) => b.is_none(),
-            Body::Stream { remaining, .. } => *remaining == 0,
-            Body::Live(_) => false,
-        }
+        self.is_end_stream_inner()
     }
 
     fn size_hint(&self) -> SizeHint {
@@ -64,6 +80,19 @@ impl http_body::Body for Body {
             Body::Full(b) => SizeHint::with_exact(b.as_ref().map_or(0, |b| b.len() as u64)),
             Body::Stream { remaining, .. } => SizeHint::with_exact(*remaining),
             Body::Live(_) => SizeHint::default(),
+            Body::Logged(inner, _) => inner.size_hint(),
+        }
+    }
+}
+
+impl Body {
+    fn is_end_stream_inner(&self) -> bool {
+        match self {
+            Body::Empty => true,
+            Body::Full(b) => b.is_none(),
+            Body::Stream { remaining, .. } => *remaining == 0,
+            Body::Live(_) => false,
+            Body::Logged(inner, _) => inner.is_end_stream_inner(),
         }
     }
 }

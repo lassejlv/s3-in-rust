@@ -673,6 +673,10 @@ have it.
   back the whole backlog is sent at once.
 - **Several destinations:** if one fails, the others still get the change.
 
+**Tested** with two servers (`tests/replication.py`) and under crashes: SIGKILL of either or both
+servers while clients write, overwrite, tag and delete (`tests/replication_chaos.py`). Once the
+queue drains, the destination always matches the source exactly.
+
 **Monitoring.** `s3rs_replication_pending` counts queued keys, and `s3rs_replication_lag_seconds`
 is the age of the oldest change not yet replicated. `s3rs_replication_total{result}` counts keys
 that were replicated, unchanged, skipped (SSE-C) or failed. The log says why keys fail, at most

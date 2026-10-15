@@ -52,7 +52,7 @@ First release.
   (`/_admin/keys`), including temporary keys that expire on their own (`expires_in`).
 
 **Operations**
-- Web console at `/_console/`.
+- Web console at `/_console/`, including object version history (download, restore, delete).
 - Per-bucket server access logs in S3's format (PutBucketLogging), written to a target bucket.
 - Prometheus metrics (also per bucket: objects, bytes, requests and traffic), JSON access logs, event notifications (webhooks and live streams). Webhook
   events are queued on disk with the write they describe and delivered in order, at least once,

@@ -218,6 +218,29 @@ const S3 = {
     return keys;
   },
 
+  // Every version (and delete marker) of one key, newest first.
+  async versionsOf(bucket, key) {
+    const out = [];
+    let km = null, vm = null;
+    for (;;) {
+      const query = { versions: "", prefix: key, "max-keys": "1000" };
+      if (km) { query["key-marker"] = km; if (vm) query["version-id-marker"] = vm; }
+      const doc = await this.xml("GET", `/${bucket}`, { query });
+      const entries = [...doc.documentElement.children].filter((n) => n.localName === "Version" || n.localName === "DeleteMarker");
+      for (const v of entries) {
+        if (xmlText(v, "Key") !== key) continue;
+        out.push({
+          version: xmlText(v, "VersionId"), latest: xmlText(v, "IsLatest") === "true", marker: v.localName === "DeleteMarker",
+          modified: xmlText(v, "LastModified"), size: xmlText(v, "Size"),
+        });
+      }
+      km = xmlText(doc, "NextKeyMarker");
+      vm = xmlText(doc, "NextVersionIdMarker");
+      // Stop once the listing has moved past this key.
+      if (xmlText(doc, "IsTruncated") !== "true" || km !== key) return out;
+    }
+  },
+
   async allVersions(bucket) {
     const out = [];
     let km = null, vm = null;
@@ -452,13 +475,15 @@ async function newFolder() {
   } catch (e) { toast(e.message, true); }
 }
 
-async function download(key) {
+async function download(key, version) {
   try {
     // ASCII fallback plus RFC 5987 filename* so non-ASCII names survive.
     const name = baseName(key);
     const ascii = name.replace(/[^\x20-\x7e]|["\\]/g, "_");
     const disposition = `attachment; filename="${ascii}"; filename*=UTF-8''${uriEncode(name)}`;
-    const url = await S3.presign(objectPath(key), 300, { "response-content-disposition": disposition });
+    const extra = { "response-content-disposition": disposition };
+    if (version) extra.versionId = version;
+    const url = await S3.presign(objectPath(key), 300, extra);
     el("a", { href: url, download: baseName(key) }).click();
   } catch (e) { toast(e.message, true); }
 }
@@ -567,10 +592,60 @@ async function showDetails(key) {
       el("button", { class: "small", onclick: () => share(key) }, "Share link"),
       el("button", { class: "small danger", onclick: () => deleteKeys([key]) }, "Delete"));
     const preview = await renderPreview(key, h);
-    body.replaceChildren(...[actions, preview, kv].filter(Boolean));
+    const versions = await renderVersions(key);
+    body.replaceChildren(...[actions, preview, kv, versions].filter(Boolean));
   } catch (e) {
     body.replaceChildren(el("p", { class: "error" }, e.message));
   }
+}
+
+// Older versions of a key in a versioned bucket: download, restore (copy over the current
+// version) or delete each.
+async function renderVersions(key) {
+  let versions;
+  try {
+    versions = await S3.versionsOf(state.bucket, key);
+  } catch (e) {
+    return null;
+  }
+  if (versions.length < 2 && versions.every((v) => v.version === "null")) return null;
+  const rows = versions.map((v) => {
+    const label = v.marker ? "Deleted" : formatSize(v.size);
+    const actions = v.marker ? [] : [
+      el("button", { class: "small", title: "Download this version", onclick: () => download(key, v.version) }, "Download"),
+    ];
+    if (!v.latest && !v.marker) {
+      actions.push(el("button", { class: "small", title: "Make this the current version", onclick: () => restoreVersion(key, v.version) }, "Restore"));
+    }
+    actions.push(el("button", { class: "small danger", title: "Delete this version for good", onclick: () => deleteVersion(key, v) }, "Delete"));
+    return el("tr", { class: v.latest ? "current" : "", title: `Version ${v.version}` },
+      el("td", {}, formatDate(v.modified), v.latest ? el("span", { class: "badge" }, "current") : null),
+      el("td", { class: "size" }, label),
+      el("td", {}, el("div", { class: "row-actions tight" }, ...actions)));
+  });
+  return el("div", { class: "versions" }, el("h3", {}, `Versions (${versions.length})`), el("table", { class: "versions-table" }, ...rows));
+}
+
+async function restoreVersion(key, version) {
+  try {
+    const source = `${state.bucket}/${uriEncode(key, true)}?versionId=${encodeURIComponent(version)}`;
+    await S3.request("PUT", objectPath(key), { headers: { "x-amz-copy-source": source } });
+    toast("Restored as the current version");
+    showDetails(key);
+    loadList(false);
+  } catch (e) { toast(e.message, true); }
+}
+
+async function deleteVersion(key, v) {
+  const what = v.marker ? "this delete marker" : "this version";
+  const ok = await confirmDialog("Delete version", `Delete ${what} of “${baseName(key)}” for good? This cannot be undone.`, "Delete");
+  if (!ok) return;
+  try {
+    await S3.request("DELETE", objectPath(key), { query: { versionId: v.version } });
+    toast("Version deleted");
+    showDetails(key);
+    loadList(false);
+  } catch (e) { toast(e.message, true); }
 }
 
 async function renderPreview(key, h) {

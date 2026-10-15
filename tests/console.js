@@ -97,6 +97,21 @@ const shot = (page, name) => (out ? page.screenshot({ path: `${out}/${name}.png`
   const after = await page.locator('#rows tr').count();
   if (before !== after) throw new Error(`rows changed from ${before} to ${after} after repeated refresh`);
 
+  step('versions: list, restore an older one');
+  await page.setInputFiles('#upload-input', [{ name: 'hello.txt', mimeType: 'text/plain', buffer: Buffer.from('second version\n') }]);
+  await page.waitForTimeout(800);
+  await page.click('a:has-text("hello.txt")');
+  await page.waitForSelector('#details .versions-table tr:nth-child(2)');
+  const vrows = await page.locator('#details .versions-table tr').count();
+  if (vrows !== 2) throw new Error('expected 2 versions, got ' + vrows);
+  if (!(await page.textContent('#details pre')).includes('second version')) throw new Error('newest version not shown');
+  await page.click('#details .versions-table button:has-text("Restore")');
+  await page.waitForFunction(() => document.querySelectorAll('#details .versions-table tr').length === 3);
+  const restored = await page.textContent('#details pre');
+  if (!restored.includes('Hello from the s3rs console')) throw new Error('restore failed: ' + restored);
+  console.log('  restored the first version (3 versions now)');
+  await shot(page, 'console-versions');
+
   step('non-ASCII download name');
   await page.setInputFiles('#upload-input', [{ name: 'ünïcode ✓.txt', mimeType: 'text/plain', buffer: Buffer.from('u') }]);
   await page.waitForSelector('tr:has-text("ünïcode ✓.txt")', { timeout: 10000 });

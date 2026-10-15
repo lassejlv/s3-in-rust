@@ -70,6 +70,8 @@ key. From the console you can:
 - Browse folders, upload files by drag and drop (with progress), and create folders.
 - Preview text and images, download objects, and create time-limited share links (presigned
   URLs).
+- In versioned buckets, see an object's versions, download or delete any of them, and restore an
+  older one as the current version.
 - Delete objects and whole folders, and change a bucket's versioning, public access and website
   settings.
 

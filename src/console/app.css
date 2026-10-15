@@ -109,6 +109,14 @@ table.objects { width: 100%; border-collapse: collapse; }
 .preview img { display: block; max-width: 100%; max-height: 280px; margin: 0 auto; }
 .preview pre { margin: 0; padding: 10px; max-height: 280px; overflow: auto; white-space: pre-wrap; word-break: break-all; }
 .row-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 16px; }
+.row-actions.tight { gap: 4px; margin: 0; }
+.versions h3 { font-size: 14px; margin: 0 0 8px; }
+.versions-table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+.versions-table td { padding: 5px 4px; border-top: 1px solid var(--border); vertical-align: middle; }
+.versions-table tr.current td { font-weight: 600; }
+.badge { display: inline-block; margin-left: 6px; padding: 0 6px; border-radius: 8px; font-size: 11px; background: var(--border); }
+.versions-table td.size { white-space: nowrap; text-align: right; padding-right: 10px; }
+.versions-table .row-actions { justify-content: flex-end; }
 
 .uploads {
   position: fixed; right: 16px; bottom: 16px; width: min(360px, calc(100% - 32px)); max-height: 40vh; overflow: auto;

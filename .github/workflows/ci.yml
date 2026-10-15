@@ -145,6 +145,8 @@ jobs:
           PY
       - name: crash consistency (SIGKILL under concurrent writes)
         run: python3 tests/crash.py ./target/release/s3rs 8
+      - name: backup and restore (online under concurrent writes, and offline)
+        run: python3 tests/backup.py ./target/release/s3rs
       - name: disk full (100 MB tmpfs)
         run: |
           sudo mkdir -p /mnt/small

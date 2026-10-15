@@ -79,6 +79,8 @@ OPTIONS (each also settable through the environment variable shown):
                                                                  [S3RS_BEHIND_PROXY=1]
         --no-console             Do not serve the web console at /_console/
                                                                  [S3RS_NO_CONSOLE=1]
+        --admin-token <T>        Enable the admin API (GET /_admin/backup) for
+                                 `Authorization: Bearer <T>`     [S3RS_ADMIN_TOKEN]
         --metrics-token <T>      Require `Authorization: Bearer <T>` for /_metrics
                                                                  [S3RS_METRICS_TOKEN]
         --region <REGION>        Region reported to clients      [S3RS_REGION, default us-east-1]
@@ -114,6 +116,7 @@ struct Config {
     anonymous: bool,
     cors_origins: Vec<String>,
     metrics_token: Option<String>,
+    admin_token: Option<String>,
     console: bool,
     behind_proxy: bool,
     webhooks: Vec<(String, events::Url)>,
@@ -160,6 +163,7 @@ fn parse_args() -> Result<Config, String> {
         anonymous: false,
         cors_origins: env("S3RS_CORS_ORIGINS").map(|v| split_list(&v)).unwrap_or_default(),
         metrics_token: env("S3RS_METRICS_TOKEN"),
+        admin_token: env("S3RS_ADMIN_TOKEN"),
         console: !env_flag("S3RS_NO_CONSOLE")?,
         behind_proxy: env_flag("S3RS_BEHIND_PROXY")?,
         webhooks: env("S3RS_WEBHOOKS").map(|v| parse_webhooks(&v)).transpose()?.unwrap_or_default(),
@@ -216,6 +220,7 @@ fn parse_args() -> Result<Config, String> {
             "--anonymous" => c.anonymous = true,
             "--cors-origins" => c.cors_origins = split_list(&val()?),
             "--metrics-token" => c.metrics_token = Some(val()?),
+            "--admin-token" => c.admin_token = Some(val()?),
             "--no-console" => c.console = false,
             "--behind-proxy" => c.behind_proxy = true,
             "--webhook" => {
@@ -377,6 +382,72 @@ fn collect_credentials(cfg: &Config) -> Result<Vec<auth::Credential>, String> {
 }
 
 /// `s3rs fsck [--data-dir DIR] [--deep] [--repair] [--encryption-key K | --encryption-key-file F]`
+/// `s3rs backup [-d DIR] [-o FILE]`: archive a stopped server's data directory (a running one
+/// is backed up with GET /_admin/backup).
+fn backup(args: &[String]) -> ! {
+    let mut dir: PathBuf = env("S3RS_DATA_DIR").unwrap_or_else(|| "./data".into()).into();
+    let mut output: Option<String> = None;
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        let mut val = || {
+            it.next().cloned().unwrap_or_else(|| {
+                eprintln!("{a} requires a value");
+                std::process::exit(2)
+            })
+        };
+        match a.as_str() {
+            "-d" | "--data-dir" => dir = val().into(),
+            "-o" | "--output" => output = Some(val()),
+            "-h" | "--help" => {
+                println!(
+                    "usage: s3rs backup [-d DATA_DIR] -o FILE|-\n\nWrites a tar of a stopped server's data directory; extract it into an empty directory to restore."
+                );
+                std::process::exit(0);
+            }
+            other => {
+                eprintln!("unknown argument: {other}");
+                std::process::exit(2);
+            }
+        }
+    }
+    let Some(output) = output else {
+        eprintln!("s3rs backup: -o FILE (or - for stdout) is required");
+        std::process::exit(2);
+    };
+    let result = if output == "-" {
+        store::backup::offline(&dir, &mut std::io::BufWriter::new(std::io::stdout().lock()))
+    } else {
+        let tmp = format!("{output}.partial");
+        let r = std::fs::File::create(&tmp)
+            .map_err(|e| format!("{tmp}: {e}"))
+            .and_then(|f| {
+                let mut w = std::io::BufWriter::new(f);
+                let plan = store::backup::offline(&dir, &mut w)?;
+                w.into_inner().map_err(|e| e.to_string())?.sync_all().map_err(|e| e.to_string())?;
+                Ok(plan)
+            })
+            .and_then(|plan| std::fs::rename(&tmp, &output).map(|_| plan).map_err(|e| e.to_string()));
+        if r.is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+        r
+    };
+    match result {
+        Ok(plan) => {
+            eprintln!("backup: wrote {} file(s), {} bytes", plan.entries.len(), plan.tar_size());
+            if !plan.missing.is_empty() {
+                eprintln!("warning: {} referenced data file(s) are missing; run s3rs fsck", plan.missing.len());
+                std::process::exit(1);
+            }
+            std::process::exit(0);
+        }
+        Err(e) => {
+            eprintln!("error: {e}");
+            std::process::exit(2);
+        }
+    }
+}
+
 fn fsck(args: &[String]) -> ! {
     let mut dir: PathBuf = env("S3RS_DATA_DIR").unwrap_or_else(|| "./data".into()).into();
     let (mut deep, mut repair) = (false, false);
@@ -471,6 +542,9 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.first().map(String::as_str) == Some("fsck") {
         fsck(&args[1..]);
+    }
+    if args.first().map(String::as_str) == Some("backup") {
+        backup(&args[1..]);
     }
     let cfg = match parse_args() {
         Ok(c) => c,
@@ -583,6 +657,7 @@ async fn serve(
         access_log: cfg.access_log,
         cors_origins: cfg.cors_origins.clone(),
         metrics_token: cfg.metrics_token.clone(),
+        admin_token: cfg.admin_token.clone(),
         master_key: cfg.encryption_key,
         encrypt_by_default: cfg.encrypt_by_default,
         website_domain: cfg.website_domain.clone(),

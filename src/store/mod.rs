@@ -7,6 +7,7 @@
 //!   mutations go through one writer thread that group-commits batches of operations so a burst
 //!   of small PUTs costs one fsync instead of one each.
 
+pub mod backup;
 pub mod fsck;
 pub mod meta;
 pub mod space;
@@ -205,6 +206,23 @@ pub struct Store {
     deleter: mpsc::Sender<Gc>,
     /// Free-space reserve for uploads.
     pub space: Arc<space::Space>,
+    /// While non-zero (a backup is streaming), data files are not deleted.
+    gc_paused: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+/// A backup in progress: the plan, its snapshot file, and a hold on data file deletion.
+pub struct Backup {
+    pub plan: backup::Plan,
+    _snapshot: backup::SnapshotFile,
+    _pause: GcPause,
+}
+
+struct GcPause(Arc<std::sync::atomic::AtomicUsize>);
+
+impl Drop for GcPause {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 /// The metadata database. If an I/O error (typically a full disk) poisons it, the writer
@@ -525,6 +543,8 @@ impl Store {
         let (del_tx, del_rx) = mpsc::channel::<Gc>();
         let del_root = root.clone();
         let gc_space = space.clone();
+        let gc_paused = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let paused = gc_paused.clone();
         std::thread::Builder::new().name("s3rs-gc".into()).spawn(move || {
             for msg in del_rx {
                 let ids = match msg {
@@ -534,6 +554,10 @@ impl Store {
                         continue;
                     }
                 };
+                // A backup in progress may still need these files; they wait in the queue.
+                while paused.load(std::sync::atomic::Ordering::SeqCst) > 0 {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
                 for id in ids {
                     if let Err(e) = std::fs::remove_file(data_path(&del_root, id))
                         && e.kind() != std::io::ErrorKind::NotFound
@@ -565,6 +589,7 @@ impl Store {
             writer: tx,
             deleter: del_tx,
             space,
+            gc_paused,
         }))
     }
 
@@ -586,6 +611,16 @@ impl Store {
 
     pub fn tmp_path(&self, id: u128) -> PathBuf {
         self.root.join("tmp").join(util::id_hex(id))
+    }
+
+    /// Start a consistent backup: data file deletion is held back (before the snapshot, so no
+    /// file the snapshot refers to can disappear) until the returned `Backup` is dropped.
+    pub fn begin_backup(&self) -> S3Result<Backup> {
+        self.gc_paused.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let pause = GcPause(self.gc_paused.clone());
+        let snapshot = backup::SnapshotFile(self.root.join("tmp").join(format!("backup-{}.redb", util::id_hex(util::new_id()))));
+        let plan = backup::snapshot(&*self.db.get()?, &self.root, &snapshot.0)?;
+        Ok(Backup { plan, _snapshot: snapshot, _pause: pause })
     }
 
     /// Schedule data files for deletion (used to clean up after failed writes).

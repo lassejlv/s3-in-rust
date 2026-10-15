@@ -38,6 +38,8 @@ pub struct Options {
     pub access_log: Option<crate::accesslog::Format>,
     /// Origins allowed by default for buckets without their own CORS configuration.
     pub cors_origins: Vec<String>,
+    /// Enables the admin API (`/_admin/...`) for `Authorization: Bearer <token>`.
+    pub admin_token: Option<String>,
     /// If set, `/_metrics` requires `Authorization: Bearer <token>`.
     pub metrics_token: Option<String>,
     /// Master key for SSE-S3 (server-side encryption with server-managed keys).
@@ -62,6 +64,9 @@ pub struct Server {
     pub region: String,
     pub domain: Option<String>,
     access_log: Option<crate::accesslog::AccessLog>,
+    admin_token: Option<String>,
+    /// Set while a backup streams (one at a time).
+    backup_running: Arc<std::sync::atomic::AtomicBool>,
     pub metrics: crate::metrics::Metrics,
     default_cors: Option<Vec<CorsRule>>,
     /// Parsed ACL / policy / CORS per bucket; invalidated whenever they change.
@@ -360,6 +365,8 @@ impl Server {
             region: opts.region,
             domain: opts.domain,
             access_log: opts.access_log.map(crate::accesslog::AccessLog::new),
+            admin_token: opts.admin_token,
+            backup_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             metrics: crate::metrics::Metrics::new(opts.events.stats.clone()),
             default_cors,
             access_cache: RwLock::new(HashMap::new()),
@@ -891,6 +898,65 @@ impl Server {
         })
     }
 
+    /// `GET /_admin/backup`: a tar of a consistent snapshot of the data directory.
+    async fn admin_backup(&self, parts: &Parts) -> S3Result<Resp> {
+        let Some(token) = &self.admin_token else {
+            return Err(err::AccessDenied().with_message("The admin API is disabled; start the server with --admin-token"));
+        };
+        let given = header(&parts.headers, "authorization").and_then(|h| h.strip_prefix("Bearer ")).unwrap_or("");
+        if !util::ct_eq(given.trim().as_bytes(), token.as_bytes()) {
+            return Err(err::AccessDenied());
+        }
+        if parts.method != Method::GET {
+            return Err(err::MethodNotAllowed());
+        }
+        if self.backup_running.swap(true, Ordering::SeqCst) {
+            return Err(S3Error::new("BackupInProgress", StatusCode::CONFLICT, "Another backup is already running."));
+        }
+        let running = self.backup_running.clone();
+        let store = self.store.clone();
+        let backup = match tokio::task::spawn_blocking(move || store.begin_backup()).await {
+            Ok(Ok(b)) => b,
+            Ok(Err(e)) => {
+                running.store(false, Ordering::SeqCst);
+                return Err(e);
+            }
+            Err(e) => {
+                running.store(false, Ordering::SeqCst);
+                return Err(S3Error::internal(e));
+            }
+        };
+        let size = backup.plan.tar_size();
+        if !backup.plan.missing.is_empty() {
+            eprintln!(
+                "backup: {} data file(s) referenced by the metadata are missing and not included; run s3rs fsck",
+                backup.plan.missing.len()
+            );
+        }
+        eprintln!("backup: streaming {} file(s), {size} bytes", backup.plan.entries.len());
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        tokio::task::spawn_blocking(move || {
+            let mut out = crate::store::backup::ChunkSender::new(tx);
+            match crate::store::backup::write_tar(&backup.plan, &mut out) {
+                Ok(()) => eprintln!("backup: done"),
+                Err(e) => {
+                    eprintln!("backup: aborted: {e}");
+                    out.fail(e);
+                }
+            }
+            // Releases the hold on data file deletion and removes the snapshot.
+            drop(backup);
+            running.store(false, Ordering::SeqCst);
+        });
+        let mut r = Resp::ok();
+        r.set("content-type", "application/x-tar")
+            .set("content-length", &size.to_string())
+            .set("content-disposition", &format!("attachment; filename=\"s3rs-backup-{}.tar\"", now_ms() / 1000))
+            .set("cache-control", "no-store");
+        r.body = Body::Stream { rx, remaining: size };
+        Ok(r)
+    }
+
     /// Write out buffered access log lines (at shutdown).
     pub fn flush_logs(&self) {
         if let Some(log) = &self.access_log {
@@ -938,6 +1004,9 @@ impl Server {
             }
             r.body = Body::full(text);
             return Ok(r);
+        }
+        if !vhost && parts.uri.path() == "/_admin/backup" {
+            return self.admin_backup(&parts).await;
         }
         if !vhost && self.console && (parts.uri.path() == "/_console" || parts.uri.path().starts_with("/_console/")) {
             return self.console_asset(&parts);

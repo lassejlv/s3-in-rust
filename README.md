@@ -83,6 +83,7 @@ Each flag can also be set with the environment variable shown (switches take `1`
 | `--anonymous` | | off | Turns off authentication. Use it only on trusted networks. |
 | `--cors-origins` | `S3RS_CORS_ORIGINS` | | Comma-separated origins (e.g. `*`) allowed for buckets that have no CORS configuration of their own |
 | `--metrics-token` | `S3RS_METRICS_TOKEN` | | Requires `Authorization: Bearer <token>` on `/_metrics` |
+| `--admin-token` | `S3RS_ADMIN_TOKEN` | | Enables the admin API (`GET /_admin/backup`) for `Authorization: Bearer <token>` |
 | `--no-console` | `S3RS_NO_CONSOLE` | off | Turns off the web console at `/_console/` |
 | `--tls-cert`, `--tls-key` | `S3RS_TLS_CERT`, `S3RS_TLS_KEY` | | Serves HTTPS with this PEM certificate chain and key (needs a `--features tls` build; see [HTTPS](#https-tls)) |
 | `--behind-proxy` | `S3RS_BEHIND_PROXY` | off | Trusts `X-Forwarded-For` / `X-Forwarded-Proto` for policy conditions |
@@ -448,6 +449,42 @@ DELETE /photos?quota
 Reading usage needs `s3:GetBucketUsage`, and changing quotas needs `s3:PutBucketQuota`. Keys without
 a policy have both (read-only keys only the first). The console's bucket settings include quota
 fields.
+
+## Backup and restore
+
+Copying the data directory of a running server doesn't give a usable backup, because the metadata
+database changes underneath the copy. s3rs makes consistent backups itself, as a tar archive:
+
+```bash
+# A running server (needs --admin-token):
+curl -fsS -H "Authorization: Bearer $S3RS_ADMIN_TOKEN" -o backup.tar https://s3.example.com/_admin/backup
+
+# A stopped server:
+s3rs backup --data-dir /data -o backup.tar
+
+# Restore: extract into an empty directory and start the server on it.
+mkdir /data-restored && tar -xf backup.tar -C /data-restored
+s3rs fsck --data-dir /data-restored --deep --encryption-key-file /etc/s3rs.key   # optional
+s3rs --data-dir /data-restored ...
+```
+
+How it works:
+- The archive holds a snapshot of the metadata database, taken from a single read transaction
+  without blocking writes, plus exactly the data files that snapshot refers to.
+- Data files are immutable. While a backup streams, the server holds back deleting any of them, so
+  the archive matches the snapshot however long the download takes. The held-back deletes run
+  afterwards.
+- The response has an exact `Content-Length`. If the server hits an error midway, it aborts the
+  transfer, so a truncated download never looks complete (`curl -f` exits non-zero).
+- Only one backup runs at a time. A second request gets `409 BackupInProgress`.
+
+Encrypted objects stay encrypted in the archive. Restoring them needs the same `--encryption-key`,
+and SSE-C objects need their customer keys as before. Treat archives like the data itself: they
+include everything stored, including inline object contents, configurations and policies.
+
+CI takes a backup over a deliberately slow connection while other clients overwrite and delete the
+objects it contains. It then restores the backup, runs `fsck --deep` and compares every object
+(`tests/backup.py`).
 
 ## Integrity checks (`s3rs fsck`)
 

@@ -79,8 +79,12 @@ def finish(p, data, label):
 
 
 def fill_disk(path):
-    """Another process fills the filesystem completely."""
-    with open(path, "wb") as f:
+    """Another process fills the filesystem completely (it may be full already)."""
+    try:
+        f = open(path, "wb")
+    except OSError:
+        return
+    with f:
         chunk = b"\0" * (1 << 20)
         try:
             while True:
@@ -115,7 +119,8 @@ def scenario(label, extra, expect_ballast):
     log = open(data + ".log").read()
     if expect_ballast:
         assert "ballast file and retrying" in log, f"{label}: the disk never filled up:\n{log}"
-        os.remove(filler)
+        if os.path.exists(filler):
+            os.remove(filler)
     else:
         assert "metadata commit failed" not in log, f"{label}: the reserve did not protect the database:\n{log}"
     deadline = time.time() + 10

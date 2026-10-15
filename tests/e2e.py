@@ -75,7 +75,11 @@ def t_buckets():
     names = [b["Name"] for b in s3.list_buckets()["Buckets"]]
     assert B in names
     s3.head_bucket(Bucket=B)
-    expect_error("BucketAlreadyOwnedByYou", lambda: s3.create_bucket(Bucket=B))
+    # In us-east-1, S3 answers 200 to creating a bucket you already own, and keeps its contents.
+    s3.put_object(Bucket=B, Key="keep", Body=b"1")
+    s3.create_bucket(Bucket=B)
+    assert s3.get_object(Bucket=B, Key="keep")["Body"].read() == b"1"
+    s3.delete_object(Bucket=B, Key="keep")
     expect_error("InvalidBucketName", lambda: s3.create_bucket(Bucket="Bad_Name"))
     expect_error("404", lambda: s3.head_bucket(Bucket="does-not-exist-xyz"))
     loc = s3.get_bucket_location(Bucket=B)
@@ -232,6 +236,74 @@ def t_multipart():
     p2 = s3.get_object(Bucket=B, Key=key, PartNumber=2)
     assert p2["Body"].read() == parts_data[1] and p2["PartsCount"] == 3
     expect_error("NoSuchUpload", lambda: s3.list_parts(Bucket=B, Key=key, UploadId=uid))
+
+
+def t_multipart_checksums():
+    import base64
+    import zlib
+    parts_data = [os.urandom(5 * MB), os.urandom(4321)]
+    crc = lambda d: base64.b64encode(zlib.crc32(d).to_bytes(4, "big")).decode()
+    for kind in ("COMPOSITE", "FULL_OBJECT"):
+        key = f"mp-ck-{kind}"
+        up = s3.create_multipart_upload(Bucket=B, Key=key, ChecksumAlgorithm="CRC32", ChecksumType=kind)
+        assert up["ChecksumAlgorithm"] == "CRC32" and up["ChecksumType"] == kind, up
+        parts = []
+        for i, d in enumerate(parts_data, 1):
+            r = s3.upload_part(Bucket=B, Key=key, UploadId=up["UploadId"], PartNumber=i, Body=d, ChecksumAlgorithm="CRC32")
+            assert r["ChecksumCRC32"] == crc(d)
+            parts.append({"PartNumber": i, "ETag": r["ETag"], "ChecksumCRC32": r["ChecksumCRC32"]})
+        r = s3.complete_multipart_upload(Bucket=B, Key=key, UploadId=up["UploadId"], MultipartUpload={"Parts": parts})
+        if kind == "FULL_OBJECT":
+            assert r["ChecksumCRC32"] == crc(b"".join(parts_data)), r
+        else:
+            raw = b"".join(base64.b64decode(p["ChecksumCRC32"]) for p in parts)
+            assert r["ChecksumCRC32"] == f"{crc(raw)}-2", r
+        h = s3.head_object(Bucket=B, Key=key, ChecksumMode="ENABLED")
+        assert h["ChecksumCRC32"] == r["ChecksumCRC32"] and h["ChecksumType"] == kind, h
+        p2 = s3.get_object(Bucket=B, Key=key, PartNumber=2)
+        assert p2["ChecksumCRC32"] == crc(parts_data[1]) and p2["Body"].read() == parts_data[1]
+        attrs = s3.get_object_attributes(Bucket=B, Key=key, ObjectAttributes=["Checksum", "ObjectParts"])
+        assert [p["ChecksumCRC32"] for p in attrs["ObjectParts"]["Parts"]] == [crc(d) for d in parts_data], attrs
+        # Completing again (a retry after a lost response) returns the same result.
+        again = s3.complete_multipart_upload(Bucket=B, Key=key, UploadId=up["UploadId"], MultipartUpload={"Parts": parts})
+        assert again["ETag"] == r["ETag"]
+        s3.delete_object(Bucket=B, Key=key)
+    # A wrong part checksum at completion is refused.
+    up = s3.create_multipart_upload(Bucket=B, Key="mp-ck-bad", ChecksumAlgorithm="CRC32")
+    r = s3.upload_part(Bucket=B, Key="mp-ck-bad", UploadId=up["UploadId"], PartNumber=1, Body=b"abc", ChecksumAlgorithm="CRC32")
+    expect_error("BadDigest", lambda: s3.complete_multipart_upload(Bucket=B, Key="mp-ck-bad", UploadId=up["UploadId"],
+        MultipartUpload={"Parts": [{"PartNumber": 1, "ETag": r["ETag"], "ChecksumCRC32": crc(b"abd")}]}))
+    s3.abort_multipart_upload(Bucket=B, Key="mp-ck-bad", UploadId=up["UploadId"])
+
+
+def t_conditional_deletes():
+    etag = s3.put_object(Bucket=B, Key="cdel", Body=b"12345")["ETag"]
+    expect_error("PreconditionFailed", lambda: s3.delete_object(Bucket=B, Key="cdel", IfMatch='"nope"'))
+    r = s3.delete_objects(Bucket=B, Delete={"Objects": [{"Key": "cdel", "ETag": '"nope"'}]})
+    assert r["Errors"][0]["Code"] == "PreconditionFailed", r
+    s3.delete_object(Bucket=B, Key="cdel", IfMatch=etag)
+    expect_error("404", lambda: s3.head_object(Bucket=B, Key="cdel"))
+    # Deleting what isn't there still succeeds.
+    s3.delete_object(Bucket=B, Key="cdel", IfMatch='"nope"')
+    # If-None-Match with an ETag on writes.
+    etag = s3.put_object(Bucket=B, Key="cdel", Body=b"1")["ETag"]
+    expect_error("PreconditionFailed", lambda: s3.put_object(Bucket=B, Key="cdel", Body=b"2", IfNoneMatch=etag))
+    s3.put_object(Bucket=B, Key="cdel", Body=b"2", IfNoneMatch='"other"')
+    s3.delete_object(Bucket=B, Key="cdel")
+
+
+def t_list_buckets_paginated():
+    names = sorted(b["Name"] for b in s3.list_buckets()["Buckets"])
+    seen, token = [], None
+    while True:
+        args = {"MaxBuckets": 1} | ({"ContinuationToken": token} if token else {})
+        r = s3.list_buckets(**args)
+        seen += [b["Name"] for b in r["Buckets"]]
+        token = r.get("ContinuationToken")
+        if not token:
+            break
+    assert seen == names, (seen, names)
+    assert [b["Name"] for b in s3.list_buckets(Prefix=B)["Buckets"]] == [n for n in names if n.startswith(B)]
 
 
 def t_multipart_small_part():

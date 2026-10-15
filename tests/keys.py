@@ -139,6 +139,30 @@ try:
     assert denied(lambda: client("dup", "dupsecretA0123456").list_buckets())
     assert denied(lambda: client("dup", "dupsecretB0123456").list_buckets())
 
+    # A temporary key works until it expires, is then refused with ExpiredToken (which makes SDKs
+    # fetch new credentials), and is removed soon after.
+    status, tmp = admin("POST", body={"expires_in": 2, "description": "short-lived"})
+    assert status == 201 and "expires" in tmp, tmp
+    t = client(tmp["access_key"], tmp["secret_key"])
+    t.list_buckets()
+    time.sleep(2.2)
+    try:
+        t.list_buckets()
+        sys.exit("an expired key still works")
+    except ClientError as e:
+        assert e.response["Error"]["Code"] == "ExpiredToken", e.response
+    for _ in range(100):
+        if all(x["access_key"] != tmp["access_key"] for x in admin("GET")[1]["keys"]):
+            break
+        time.sleep(0.1)
+    else:
+        sys.exit("the expired key was not removed")
+    assert admin("POST", body={"expires_in": 0})[0] == 400
+
+    # Guessing the admin token is slowed down.
+    codes = [admin("GET", token=f"guess{i}")[0] for i in range(4)]
+    assert codes[0] == 403 and 503 in codes, codes
+
     log = open(f"{work}/log").read()
     assert k["secret_key"] not in log and "readersecret0123" not in log
     print("KEYS TEST OK")

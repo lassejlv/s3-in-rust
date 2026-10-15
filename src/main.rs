@@ -461,7 +461,14 @@ fn load_credentials(path: &std::path::Path, into: &mut Vec<auth::Credential>) ->
         if into.iter().any(|c| c.access_key == ak) {
             return Err(format!("{}:{}: duplicate access key `{ak}`", path.display(), n + 1));
         }
-        into.push(auth::Credential { access_key: ak.to_string(), secret: sk.to_string(), read_only, buckets, policy });
+        into.push(auth::Credential {
+            access_key: ak.to_string(),
+            secret: sk.to_string(),
+            read_only,
+            buckets,
+            policy,
+            expires_ms: None,
+        });
     }
     Ok(())
 }
@@ -476,6 +483,7 @@ fn collect_credentials(cfg: &Config) -> Result<Vec<auth::Credential>, String> {
             read_only: false,
             buckets: None,
             policy: None,
+            expires_ms: None,
         }),
         (None, None) => {}
         _ => return Err("both an access key and a secret key are required".into()),
@@ -1093,6 +1101,7 @@ async fn serve(
                     return;
                 }
                 server.flush_bucket_logs(false).await;
+                server.purge_expired_keys().await;
             }
         });
     }

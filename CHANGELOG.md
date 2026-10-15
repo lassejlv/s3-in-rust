@@ -33,6 +33,10 @@ First release.
   checksums, with per-part checksums), POST uploads, GetObjectAttributes.
 - CompleteMultipartUpload is idempotent: a client retrying after a lost response gets the same
   result.
+- Conditional deletes (`If-Match`, size and last-modified conditions, also per key in
+  DeleteObjects), `If-None-Match` with an ETag on writes, and paginated ListBuckets.
+- Bucket policies accept the ARN condition operators (`ArnLike`, `ArnEquals`, ...), so the
+  policies S3 documents for log delivery can be used as they are.
 - Authentication: SigV4 (headers, presigned URLs, streaming and trailers) and SigV2.
 
 **Access control**
@@ -40,7 +44,7 @@ First release.
   bucket-limited keys, and IAM-style policies per key or bucket (conditions, variables, explicit
   Deny).
 - Keys can also be created, listed and revoked at runtime through the admin API
-  (`/_admin/keys`).
+  (`/_admin/keys`), including temporary keys that expire on their own (`expires_in`).
 
 **Operations**
 - Web console at `/_console/`.

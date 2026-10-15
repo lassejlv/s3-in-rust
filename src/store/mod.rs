@@ -375,6 +375,26 @@ enum Gc {
     Sync(mpsc::Sender<()>),
 }
 
+/// Conditions on a delete (`If-Match`, and S3's `x-amz-if-match-size` and
+/// `x-amz-if-match-last-modified-time`): the delete fails with 412 unless the object or
+/// version it removes matches them. Deleting something that doesn't exist still succeeds.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct DeleteCond {
+    pub etag: Option<String>,
+    pub size: Option<u64>,
+    /// Unix seconds.
+    pub mtime: Option<u64>,
+}
+
+impl DeleteCond {
+    fn check(&self, m: &ObjectMeta) -> S3Result<()> {
+        let etag_ok = self.etag.as_ref().is_none_or(|e| e.trim() == "*" || norm_etag(e) == norm_etag(&m.etag));
+        let size_ok = self.size.is_none_or(|s| s == m.size);
+        let mtime_ok = self.mtime.is_none_or(|t| t == m.mtime_ms / 1000);
+        if etag_ok && size_ok && mtime_ok { Ok(()) } else { Err(err::PreconditionFailed()) }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum WriteCond {
     /// `If-None-Match: *` — only create.
@@ -401,6 +421,8 @@ pub enum Op {
     DeleteObjects {
         bucket: String,
         items: Vec<(String, Option<String>)>,
+        /// Conditions per item (none when shorter than `items`).
+        conds: Vec<Option<DeleteCond>>,
         bypass: bool,
         /// Made by replication from another server: not replicated again.
         replica: bool,
@@ -2530,13 +2552,27 @@ fn apply(tx: &mut Tables, op: Op, garbage: &mut Vec<u128>, last_seq: &mut u64) -
             }
             Ok(OpOut::Removed(out))
         }
-        Op::DeleteObjects { bucket, items, bypass, .. } => {
+        Op::DeleteObjects { bucket, items, conds, bypass, .. } => {
             if tx.buckets.get(bucket.as_str())?.is_none() {
                 return Err(err::NoSuchBucket());
             }
             let mut out = Vec::with_capacity(items.len());
-            for (key, version) in items {
-                let r = check_key_chars(&key).and_then(|_| match version {
+            for (i, (key, version)) in items.into_iter().enumerate() {
+                let cond = conds.get(i).cloned().flatten();
+                let r = check_key_chars(&key).and_then(|_| {
+                    if let Some(c) = &cond {
+                        let target = match &version {
+                            Some(v) if valid_version_id(v) => find_version(tx, &bucket, &key, v)?.map(|(_, _, m)| m),
+                            Some(_) => None,
+                            None => get_meta(tx, &obj_key(&bucket, &key))?.filter(|m| !m.delete_marker),
+                        };
+                        if let Some(m) = target {
+                            c.check(&m)?;
+                        }
+                    }
+                    Ok(())
+                });
+                let r = r.and_then(|_| match version {
                     Some(v) => delete_version(tx, &bucket, &key, &v, bypass, garbage).map(|mut o| {
                         if o.removed {
                             o.seq = next_seq(last_seq);
@@ -2884,7 +2920,13 @@ mod tests {
 
     async fn delete_version(store: &Store, vid: &str, bypass: bool) -> S3Result<DeleteOutcome> {
         match store
-            .submit(Op::DeleteObjects { bucket: "b".into(), items: vec![("k".into(), Some(vid.into()))], bypass, replica: false })
+            .submit(Op::DeleteObjects {
+                bucket: "b".into(),
+                items: vec![("k".into(), Some(vid.into()))],
+                conds: vec![],
+                bypass,
+                replica: false,
+            })
             .await
         {
             Ok(OpOut::Deleted(mut r)) => r.pop().unwrap(),
@@ -2941,7 +2983,13 @@ mod tests {
         assert!(delete_version(&store, &v2, true).await.is_ok());
         // Deleting without a version id only adds a delete marker.
         let OpOut::Deleted(r) = store
-            .submit(Op::DeleteObjects { bucket: "b".into(), items: vec![("k".into(), None)], bypass: false, replica: false })
+            .submit(Op::DeleteObjects {
+                bucket: "b".into(),
+                items: vec![("k".into(), None)],
+                conds: vec![],
+                bypass: false,
+                replica: false,
+            })
             .await
             .unwrap()
         else {
@@ -2966,6 +3014,7 @@ mod tests {
         let del = |key: &str, version: Option<String>| Op::DeleteObjects {
             bucket: "b".into(),
             items: vec![(key.into(), version)],
+            conds: vec![],
             bypass: false,
             replica: false,
         };
@@ -3152,7 +3201,13 @@ mod tests {
 
         // Delete marker, then removing it restores the object.
         let OpOut::Deleted(r) = store
-            .submit(Op::DeleteObjects { bucket: "b".into(), items: vec![("k".into(), None)], bypass: false, replica: false })
+            .submit(Op::DeleteObjects {
+                bucket: "b".into(),
+                items: vec![("k".into(), None)],
+                conds: vec![],
+                bypass: false,
+                replica: false,
+            })
             .await
             .unwrap()
         else {
@@ -3166,6 +3221,7 @@ mod tests {
             .submit(Op::DeleteObjects {
                 bucket: "b".into(),
                 items: vec![("k".into(), Some(marker))],
+                conds: vec![],
                 bypass: false,
                 replica: false,
             })
@@ -3178,6 +3234,7 @@ mod tests {
             .submit(Op::DeleteObjects {
                 bucket: "b".into(),
                 items: vec![("k".into(), Some(ids[4].clone()))],
+                conds: vec![],
                 bypass: false,
                 replica: false,
             })

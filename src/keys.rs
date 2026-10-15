@@ -18,6 +18,8 @@ pub struct Record {
     pub policy: Option<String>,
     pub created_ms: u64,
     pub description: String,
+    /// A temporary key stops working at this time (unix milliseconds) and is then removed.
+    pub expires_ms: Option<u64>,
 }
 
 fn strings(v: Option<&Json>) -> Option<Vec<String>> {
@@ -48,6 +50,9 @@ impl Record {
         if let Some(p) = &self.policy {
             o.push(("policy".into(), Json::Str(p.clone())));
         }
+        if let Some(t) = self.expires_ms {
+            o.push(("expires_ms".into(), Json::Num(t as f64)));
+        }
         Json::Obj(o).to_text().into_bytes()
     }
 
@@ -63,7 +68,15 @@ impl Record {
                 _ => 0,
             },
             description: text(j.get("description")).unwrap_or_default(),
+            expires_ms: match j.get("expires_ms") {
+                Some(Json::Num(n)) => Some(*n as u64),
+                _ => None,
+            },
         })
+    }
+
+    pub fn expired(&self, now_ms: u64) -> bool {
+        self.expires_ms.is_some_and(|t| now_ms >= t)
     }
 
     pub fn credential(&self, access_key: &str) -> Result<Credential, String> {
@@ -77,6 +90,7 @@ impl Record {
             read_only: self.read_only,
             buckets: self.buckets.clone(),
             policy,
+            expires_ms: self.expires_ms,
         })
     }
 }
@@ -113,14 +127,19 @@ pub fn valid_access_key(k: &str) -> bool {
     (3..=128).contains(&k.len()) && k.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
 }
 
-/// A create request: `{"access_key"?, "secret_key"?, "read_only"?, "buckets"?, "policy"?, "description"?}`.
+/// The longest a temporary key may live.
+const MAX_LIFETIME_SECS: u64 = 10 * 365 * 86_400;
+
+/// A create request: `{"access_key"?, "secret_key"?, "read_only"?, "buckets"?, "policy"?,
+/// "description"?, "expires_in"?}` (`expires_in` in seconds makes a temporary key).
 /// Missing keys and secrets are generated. Returns the access key and the record to store.
 pub fn parse_request(body: &str, now_ms: u64) -> S3Result<(String, Record)> {
     let bad = |m: &str| err::InvalidArgument().with_message(m.to_string());
     let j = parse_json(body).ok_or_else(|| bad("The request body must be a JSON object"))?;
     let Json::Obj(fields) = &j else { return Err(bad("The request body must be a JSON object")) };
     for (k, _) in fields {
-        if !matches!(k.as_str(), "access_key" | "secret_key" | "read_only" | "buckets" | "policy" | "description") {
+        if !matches!(k.as_str(), "access_key" | "secret_key" | "read_only" | "buckets" | "policy" | "description" | "expires_in")
+        {
             return Err(bad(&format!("Unknown field {k}")));
         }
     }
@@ -163,7 +182,12 @@ pub fn parse_request(body: &str, now_ms: u64) -> S3Result<(String, Record)> {
         Some(Json::Str(d)) if d.len() <= 256 => d.clone(),
         _ => return Err(bad("description must be a string of at most 256 characters")),
     };
-    Ok((access_key, Record { secret, read_only, buckets, policy, created_ms: now_ms, description }))
+    let expires_ms = match j.get("expires_in") {
+        None | Some(Json::Null) => None,
+        Some(Json::Num(n)) if *n >= 1.0 && *n <= MAX_LIFETIME_SECS as f64 && n.fract() == 0.0 => Some(now_ms + *n as u64 * 1000),
+        _ => return Err(bad("expires_in must be a number of seconds, at most ten years")),
+    };
+    Ok((access_key, Record { secret, read_only, buckets, policy, created_ms: now_ms, description, expires_ms }))
 }
 
 /// The keys in effect: those from the command line and credentials file, then stored ones.
@@ -201,6 +225,9 @@ pub fn describe(access_key: &str, source: &str, record: Option<&Record>, c: Opti
     if let Some(r) = record {
         o.push(("created".into(), Json::Str(crate::util::iso8601(r.created_ms))));
         o.push(("description".into(), Json::Str(r.description.clone())));
+        if let Some(t) = r.expires_ms {
+            o.push(("expires".into(), Json::Str(crate::util::iso8601(t))));
+        }
     }
     Json::Obj(o)
 }
@@ -241,14 +268,33 @@ mod tests {
             r#"{"policy":{"Statement":"nope"}}"#,
             r#"{"unknown":1}"#,
             r#"{"read_only":true,"policy":{"Version":"2012-10-17","Statement":[]}}"#,
+            r#"{"expires_in":0}"#,
+            r#"{"expires_in":1.5}"#,
+            r#"{"expires_in":"1h"}"#,
         ] {
             assert!(parse_request(bad, 0).is_err(), "{bad}");
         }
     }
 
     #[test]
+    fn temporary_keys() {
+        let (_, r) = parse_request(r#"{"expires_in":3600}"#, 1_000).unwrap();
+        assert_eq!(r.expires_ms, Some(3_601_000));
+        assert_eq!(Record::decode(&r.encode()).unwrap(), r);
+        assert!(!r.expired(3_600_999) && r.expired(3_601_000));
+        assert_eq!(r.credential("t").unwrap().expires_ms, Some(3_601_000));
+    }
+
+    #[test]
     fn file_keys_win() {
-        let file = vec![Credential { access_key: "a".into(), secret: "s".into(), read_only: false, buckets: None, policy: None }];
+        let file = vec![Credential {
+            access_key: "a".into(),
+            secret: "s".into(),
+            read_only: false,
+            buckets: None,
+            policy: None,
+            expires_ms: None,
+        }];
         let (_, r) = parse_request(r#"{"secret_key":"0123456789abcdef0","read_only":true}"#, 0).unwrap();
         let stored = vec![("a".to_string(), r.encode()), ("b".to_string(), r.encode()), ("c".to_string(), b"junk".to_vec())];
         let all = merge(&file, &stored);

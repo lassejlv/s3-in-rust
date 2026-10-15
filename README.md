@@ -294,6 +294,9 @@ curl -fsS -H "$H" -X POST https://s3.example.com/_admin/keys \
 curl -fsS -H "$H" -X POST https://s3.example.com/_admin/keys -d '{"read_only": true}'
 curl -fsS -H "$H" -X POST https://s3.example.com/_admin/keys -d '{"policy": {"Version": "2012-10-17", "Statement": [...]}}'
 
+# Temporary: stops working after an hour (requests then get ExpiredToken) and is removed.
+curl -fsS -H "$H" -X POST https://s3.example.com/_admin/keys -d '{"expires_in": 3600, "buckets": ["uploads"]}'
+
 curl -fsS -H "$H" https://s3.example.com/_admin/keys                       # list (no secrets)
 curl -fsS -H "$H" -X DELETE https://s3.example.com/_admin/keys/S3RSK7Q2...  # revoke
 ```
@@ -802,15 +805,15 @@ direct uploads from web apps.
 
 | Area | Operations |
 |---|---|
-| Buckets | ListBuckets, CreateBucket (with canned ACL), DeleteBucket, HeadBucket, GetBucketLocation, Get/PutBucketVersioning, Get/PutBucketAcl, Get/Put/DeleteBucketPolicy, GetBucketPolicyStatus, Get/Put/DeleteBucketCors, Get/Put/DeleteBucketTagging, Get/Put/DeleteBucketEncryption, Get/PutObjectLockConfiguration, Get/Put/DeleteBucketWebsite, Get/PutBucketNotificationConfiguration, Get/Put/DeleteBucketReplication, Get/PutBucketLogging, ListenBucketNotification (MinIO) |
-| Objects | PutObject, GetObject, HeadObject, GetObjectAttributes, DeleteObject, DeleteObjects, CopyObject (COPY/REPLACE for metadata and tags), Get/Put/DeleteObjectTagging, `x-amz-tagging` on upload, GetObjectAcl, Get/PutObjectRetention, Get/PutObjectLegalHold, SSE-S3 and SSE-C on every read/write/copy path |
+| Buckets | ListBuckets (with `max-buckets`, continuation tokens and `prefix`), CreateBucket (with canned ACL), DeleteBucket, HeadBucket, GetBucketLocation, Get/PutBucketVersioning, Get/PutBucketAcl, Get/Put/DeleteBucketPolicy, GetBucketPolicyStatus, Get/Put/DeleteBucketCors, Get/Put/DeleteBucketTagging, Get/Put/DeleteBucketEncryption, Get/PutObjectLockConfiguration, Get/Put/DeleteBucketWebsite, Get/PutBucketNotificationConfiguration, Get/Put/DeleteBucketReplication, Get/PutBucketLogging, ListenBucketNotification (MinIO) |
+| Objects | PutObject, GetObject, HeadObject, GetObjectAttributes, DeleteObject and DeleteObjects (also conditional: `If-Match`, `x-amz-if-match-size`, `x-amz-if-match-last-modified-time`), CopyObject (COPY/REPLACE for metadata and tags), Get/Put/DeleteObjectTagging, `x-amz-tagging` on upload, GetObjectAcl, Get/PutObjectRetention, Get/PutObjectLegalHold, SSE-S3 and SSE-C on every read/write/copy path |
 | Listing | ListObjects (v1), ListObjectsV2, ListObjectVersions (versions and delete markers); prefix, delimiter, pagination, `start-after`, `encoding-type=url` |
 | Multipart | CreateMultipartUpload, UploadPart, UploadPartCopy (with ranges), CompleteMultipartUpload, AbortMultipartUpload, ListParts, ListMultipartUploads |
-| Lifecycle | Get/Put/DeleteBucketLifecycleConfiguration (expiration, abort incomplete uploads) |
+| Lifecycle | Get/Put/DeleteBucketLifecycleConfiguration (expiration, abort incomplete uploads), `x-amz-expiration` on PUT/GET/HEAD |
 | Forms | POST Object (browser uploads with POST policies) |
 | Reads | Single `Range` requests, `partNumber` reads, `If-Match` / `If-None-Match` / `If-Modified-Since` / `If-Unmodified-Since`, `response-*` header overrides |
-| Writes | Conditional writes (`If-None-Match: *`, `If-Match`), `Content-MD5`, `x-amz-content-sha256` verification, user metadata (`x-amz-meta-*`) and standard headers |
-| Checksums | CRC32, CRC32C, CRC64NVME, SHA1 and SHA256, sent as headers or as aws-chunked trailers. They are verified on upload and returned with `x-amz-checksum-mode: ENABLED`. |
+| Writes | Conditional writes (`If-None-Match: *` or an ETag, `If-Match`), `Content-MD5`, `x-amz-content-sha256` verification, user metadata (`x-amz-meta-*`) and standard headers |
+| Checksums | CRC32, CRC32C, CRC64NVME, SHA1 and SHA256, sent as headers or as aws-chunked trailers. They are verified on upload and returned with `x-amz-checksum-mode: ENABLED`. Multipart uploads get COMPOSITE or FULL_OBJECT checksums, and their parts keep their own. |
 | Auth | SigV4 headers, SigV4 presigned URLs, SigV4 streaming (`STREAMING-AWS4-HMAC-SHA256-PAYLOAD[-TRAILER]`, `STREAMING-UNSIGNED-PAYLOAD-TRAILER`), SigV2 headers and presigned URLs |
 | Transport | HTTP/1.1 keep-alive, HTTP/2 (h2c), path-style and virtual-hosted-style addressing |
 

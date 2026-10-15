@@ -26,6 +26,9 @@ pub struct Target {
     pub prefix: String,
     /// `PartitionedPrefix`: keys `<prefix>s3rs/<region>/<source bucket>/YYYY/MM/DD/<name>`.
     pub partitioned: bool,
+    /// `PartitionDateSource` is `DeliveryTime` (else `EventTime`). Lines are written within a
+    /// minute of their request, so both date the partition by the time the object is written.
+    pub delivery_time: bool,
 }
 
 /// Parse a BucketLoggingStatus document: `None` turns logging off.
@@ -42,8 +45,13 @@ pub fn parse_config(doc: &xml::Node) -> S3Result<Option<Target>> {
     if e.child("TargetGrants").is_some_and(|g| !g.children.is_empty()) {
         return Err(err::NotImplemented().with_message("TargetGrants are not supported; use the target bucket's policy"));
     }
-    let partitioned = e.child("TargetObjectKeyFormat").is_some_and(|f| f.child("PartitionedPrefix").is_some());
-    Ok(Some(Target { bucket: bucket.to_string(), prefix, partitioned }))
+    let part = e.child("TargetObjectKeyFormat").and_then(|f| f.child("PartitionedPrefix"));
+    let delivery_time = match part.and_then(|p| p.child_text("PartitionDateSource")).map(str::trim) {
+        None | Some("EventTime") => false,
+        Some("DeliveryTime") => true,
+        Some(_) => return Err(err::MalformedXML().with_message("PartitionDateSource must be EventTime or DeliveryTime")),
+    };
+    Ok(Some(Target { bucket: bucket.to_string(), prefix, partitioned: part.is_some(), delivery_time }))
 }
 
 pub fn config_xml(t: Option<&Target>) -> String {
@@ -52,7 +60,8 @@ pub fn config_xml(t: Option<&Target>) -> String {
         x.open("LoggingEnabled").elem("TargetBucket", &t.bucket).elem("TargetPrefix", &t.prefix);
         x.open("TargetObjectKeyFormat");
         if t.partitioned {
-            x.open("PartitionedPrefix").elem("PartitionDateSource", "EventTime").close("PartitionedPrefix");
+            let source = if t.delivery_time { "DeliveryTime" } else { "EventTime" };
+            x.open("PartitionedPrefix").elem("PartitionDateSource", source).close("PartitionedPrefix");
         } else {
             x.open("SimplePrefix").close("SimplePrefix");
         }

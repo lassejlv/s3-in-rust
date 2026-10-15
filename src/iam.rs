@@ -32,6 +32,10 @@ enum Op {
     StringNotEqualsIgnoreCase,
     StringLike,
     StringNotLike,
+    ArnEquals,
+    ArnNotEquals,
+    ArnLike,
+    ArnNotLike,
     NumericEquals,
     NumericNotEquals,
     NumericLessThan,
@@ -60,6 +64,10 @@ impl Op {
             "StringNotEqualsIgnoreCase" => StringNotEqualsIgnoreCase,
             "StringLike" => StringLike,
             "StringNotLike" => StringNotLike,
+            "ArnEquals" => ArnEquals,
+            "ArnNotEquals" => ArnNotEquals,
+            "ArnLike" => ArnLike,
+            "ArnNotLike" => ArnNotLike,
             "NumericEquals" => NumericEquals,
             "NumericNotEquals" => NumericNotEquals,
             "NumericLessThan" => NumericLessThan,
@@ -85,7 +93,14 @@ impl Op {
         use Op::*;
         matches!(
             self,
-            StringNotEquals | StringNotEqualsIgnoreCase | StringNotLike | NumericNotEquals | DateNotEquals | NotIpAddress
+            StringNotEquals
+                | StringNotEqualsIgnoreCase
+                | StringNotLike
+                | ArnNotEquals
+                | ArnNotLike
+                | NumericNotEquals
+                | DateNotEquals
+                | NotIpAddress
         )
     }
 
@@ -96,7 +111,10 @@ impl Op {
         match self {
             StringEquals | StringNotEquals => actual == expected,
             StringEqualsIgnoreCase | StringNotEqualsIgnoreCase => actual.eq_ignore_ascii_case(expected),
-            StringLike | StringNotLike => pattern.is_some_and(|p| p.matches(actual)),
+            // ARNs compare like strings (ArnEquals also allows wildcards, as in IAM).
+            StringLike | StringNotLike | ArnEquals | ArnNotEquals | ArnLike | ArnNotLike => {
+                pattern.is_some_and(|p| p.matches(actual))
+            }
             NumericEquals
             | NumericNotEquals
             | NumericLessThan
@@ -241,6 +259,10 @@ pub struct Ctx<'a> {
 /// since a condition on a key we never set would silently never match.
 const KNOWN_KEYS: &[&str] = &[
     "aws:sourceip",
+    // Set only for requests made on behalf of an AWS service, which never happen here: listed
+    // so that policies written for S3 (such as server access log delivery) are accepted.
+    "aws:sourcearn",
+    "aws:sourceaccount",
     "aws:securetransport",
     "aws:username",
     "aws:userid",
@@ -596,7 +618,10 @@ impl Condition {
         let Some(actual) = actual else {
             return self.if_exists || self.op.negated() || self.set == SetQualifier::ForAllValues;
         };
-        let like = matches!(self.op, Op::StringLike | Op::StringNotLike);
+        let like = matches!(
+            self.op,
+            Op::StringLike | Op::StringNotLike | Op::ArnEquals | Op::ArnNotEquals | Op::ArnLike | Op::ArnNotLike
+        );
         let expected: Vec<(String, Option<Pattern>)> = self
             .values
             .iter()
@@ -779,6 +804,39 @@ mod tests {
         let lock = Policy::lockdown("b");
         assert_eq!(lock.evaluate("s3:GetObject", "arn:aws:s3:::b/x", &c), Decision::Deny);
         assert_eq!(lock.evaluate("s3:PutBucketPolicy", "arn:aws:s3:::b", &c), Decision::NotApplicable);
+    }
+
+    #[test]
+    fn log_delivery_policy() {
+        // The policy AWS documents for server access log delivery: accepted, and it never
+        // grants anything to ordinary callers.
+        let p = Policy::parse(
+            r#"{"Version":"2012-10-17","Statement":[{"Sid":"S3ServerAccessLogsPolicy","Effect":"Allow",
+                "Principal":{"Service":"logging.s3.amazonaws.com"},"Action":["s3:PutObject"],
+                "Resource":"arn:aws:s3:::logs/site/*",
+                "Condition":{"ArnLike":{"aws:SourceArn":"arn:aws:s3:::site"},"StringEquals":{"aws:SourceAccount":"123456789012"}}}]}"#,
+            Kind::Bucket,
+            Some("logs"),
+        )
+        .unwrap();
+        let h = HeaderMap::new();
+        let c = ctx(Some("u"), "1.2.3.4", &h, &[]);
+        assert_eq!(p.evaluate("s3:PutObject", "arn:aws:s3:::logs/site/x", &c), Decision::NotApplicable);
+        let arn = |op: &str, v: &str| {
+            let doc = format!(
+                r#"{{"Statement":{{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::b/*","Condition":{{"{op}":{{"aws:UserAgent":"{v}"}}}}}}}}"#
+            );
+            Policy::parse(&doc, Kind::Bucket, Some("b")).unwrap()
+        };
+        let mut h = HeaderMap::new();
+        h.insert("user-agent", "arn:aws:s3:::site".parse().unwrap());
+        let c = ctx(Some("u"), "1.2.3.4", &h, &[]);
+        assert_eq!(arn("ArnLike", "arn:aws:s3:::si*").evaluate("s3:GetObject", "arn:aws:s3:::b/x", &c), Decision::Allow);
+        assert_eq!(
+            arn("ArnNotLike", "arn:aws:s3:::si*").evaluate("s3:GetObject", "arn:aws:s3:::b/x", &c),
+            Decision::NotApplicable
+        );
+        assert_eq!(arn("ArnEquals", "arn:aws:s3:::site").evaluate("s3:GetObject", "arn:aws:s3:::b/x", &c), Decision::Allow);
     }
 
     #[test]

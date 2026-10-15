@@ -92,9 +92,13 @@ pub struct Server {
     /// Per-bucket server access logs (PutBucketLogging).
     pub bucket_log: Arc<crate::bucketlog::Logger>,
     key_limit: Option<crate::ratelimit::Limiter>,
+    /// Failed admin API logins per client address (against guessing the token).
+    admin_failures: crate::ratelimit::Limiter,
     /// Keys from the command line and credentials file; merged with the stored ones.
     file_creds: RwLock<Vec<auth::Credential>>,
     keys_reload: Mutex<()>,
+    /// When the next temporary key expires (unix ms; u64::MAX: none).
+    next_key_expiry: AtomicU64,
     completed: std::sync::Mutex<Completed>,
     anon_limit: Option<crate::ratelimit::Limiter>,
     /// Weak self-reference, for background tasks that must re-check permissions.
@@ -326,7 +330,7 @@ fn stored_headers(h: &HeaderMap) -> S3Result<Vec<(String, String)>> {
         } else if n == "content-encoding" {
             let enc: Vec<&str> = v.split(',').map(str::trim).filter(|e| !e.is_empty() && *e != "aws-chunked").collect();
             if !enc.is_empty() {
-                out.push((n.to_string(), enc.join(",")));
+                out.push((n.to_string(), enc.join(", ")));
             }
         }
     }
@@ -340,6 +344,9 @@ pub(crate) fn valid_bucket_name(b: &str) -> bool {
         && bytes[0].is_ascii_alphanumeric()
         && bytes[b.len() - 1].is_ascii_alphanumeric()
         && !b.contains("..")
+        // Each dot-separated label starts and ends with a letter or digit.
+        && !b.contains(".-")
+        && !b.contains("-.")
         && !b.split('.').all(|p| p.parse::<u8>().is_ok())
 }
 
@@ -412,8 +419,10 @@ impl Server {
             replication: opts.replication,
             bucket_log,
             key_limit: opts.rate_limit.map(crate::ratelimit::Limiter::new),
+            admin_failures: crate::ratelimit::Limiter::new(1),
             file_creds: RwLock::new(Vec::new()),
             keys_reload: Mutex::new(()),
+            next_key_expiry: AtomicU64::new(u64::MAX),
             completed: std::sync::Mutex::new(Completed::default()),
             anon_limit: opts.rate_limit_anonymous.map(crate::ratelimit::Limiter::new),
             me: std::sync::OnceLock::new(),
@@ -957,12 +966,19 @@ impl Server {
 
     /// `GET /_admin/backup`: a tar of a consistent snapshot of the data directory.
     /// The admin API requires `Authorization: Bearer <--admin-token>`.
-    fn check_admin(&self, parts: &Parts) -> S3Result<()> {
+    fn check_admin(&self, parts: &Parts, peer: SocketAddr) -> S3Result<()> {
         let Some(token) = &self.admin_token else {
             return Err(err::AccessDenied().with_message("The admin API is disabled; start the server with --admin-token"));
         };
         let given = header(&parts.headers, "authorization").and_then(|h| h.strip_prefix("Bearer ")).map(str::trim);
         if !given.is_some_and(|g| !token.is_empty() && util::ct_eq(g.as_bytes(), token.as_bytes())) {
+            // About one wrong token per second per client address.
+            let ip = self.client(&parts.headers, peer).ip;
+            if let Err(wait) = self.admin_failures.check(&ip.to_string()) {
+                self.metrics.throttled.fetch_add(1, Ordering::Relaxed);
+                return Err(S3Error::new("SlowDown", StatusCode::SERVICE_UNAVAILABLE, "Please reduce your request rate.")
+                    .with_header("retry-after", wait.as_secs().max(1).to_string()));
+            }
             return Err(err::AccessDenied());
         }
         Ok(())
@@ -980,17 +996,43 @@ impl Server {
         // One reload at a time, so one that read the keys earlier can't overwrite a later one.
         let _one = self.keys_reload.lock().unwrap();
         let stored = self.store.access_keys()?;
+        let next = stored.iter().filter_map(|(_, raw)| crate::keys::Record::decode(raw)?.expires_ms).min().unwrap_or(u64::MAX);
+        self.next_key_expiry.store(next, Ordering::SeqCst);
         let all = crate::keys::merge(&self.file_creds.read().unwrap(), &stored);
         let n = all.len();
         a.replace(all);
         Ok(n)
     }
 
+    /// Remove temporary keys that have expired (they already stopped working).
+    pub async fn purge_expired_keys(&self) {
+        let now = now_ms();
+        if self.auth.is_none() || now < self.next_key_expiry.load(Ordering::SeqCst) {
+            return;
+        }
+        let expired: Vec<String> = match self.store.access_keys() {
+            Ok(keys) => keys
+                .into_iter()
+                .filter(|(_, raw)| crate::keys::Record::decode(raw).is_some_and(|r| r.expired(now)))
+                .map(|(k, _)| k)
+                .collect(),
+            Err(_) => return,
+        };
+        for k in &expired {
+            if self.store.submit(Op::DeleteKey(k.clone())).await.is_ok() {
+                elog!("admin: temporary access key {k} expired and was removed");
+            }
+        }
+        if let Err(e) = self.reload_keys() {
+            elog!("warning: reloading access keys failed: {}", e.message);
+        }
+    }
+
     /// `GET /_admin/keys` lists keys; `POST /_admin/keys` creates one (JSON body, see
     /// crate::keys::parse_request) and returns its secret, once; `DELETE /_admin/keys/<key>`
     /// revokes one created this way.
-    async fn admin_keys(&self, parts: &Parts, body: Incoming) -> S3Result<Resp> {
-        self.check_admin(parts)?;
+    async fn admin_keys(&self, parts: &Parts, body: Incoming, peer: SocketAddr) -> S3Result<Resp> {
+        self.check_admin(parts, peer)?;
         if self.auth.is_none() {
             return Err(err::InvalidRequest().with_message("Authentication is disabled (--anonymous)"));
         }
@@ -1058,8 +1100,8 @@ impl Server {
         }
     }
 
-    async fn admin_backup(&self, parts: &Parts) -> S3Result<Resp> {
-        self.check_admin(parts)?;
+    async fn admin_backup(&self, parts: &Parts, peer: SocketAddr) -> S3Result<Resp> {
+        self.check_admin(parts, peer)?;
         if parts.method != Method::GET {
             return Err(err::MethodNotAllowed());
         }
@@ -1162,10 +1204,10 @@ impl Server {
             return Ok(r);
         }
         if !vhost && parts.uri.path() == "/_admin/backup" {
-            return self.admin_backup(&parts).await;
+            return self.admin_backup(&parts, peer).await;
         }
         if !vhost && (parts.uri.path() == "/_admin/keys" || parts.uri.path().starts_with("/_admin/keys/")) {
-            return self.admin_keys(&parts, body).await;
+            return self.admin_keys(&parts, body, peer).await;
         }
         if !vhost && self.console && (parts.uri.path() == "/_console" || parts.uri.path().starts_with("/_console/")) {
             return self.console_asset(&parts);
@@ -1587,7 +1629,16 @@ impl Server {
                 let acl = r.header("x-amz-acl").map(CannedAcl::parse).transpose()?;
                 let with_lock = r.header("x-amz-bucket-object-lock-enabled").is_some_and(|v| v.eq_ignore_ascii_case("true"));
                 let _ = r.body.read_all(MAX_XML_BODY).await?;
-                self.store.submit(Op::CreateBucket(bucket.to_string())).await?;
+                match self.store.submit(Op::CreateBucket(bucket.to_string())).await {
+                    // As S3 does in us-east-1: creating a bucket you already own succeeds (and
+                    // changes nothing).
+                    Err(e) if e.code == "BucketAlreadyOwnedByYou" && self.region == "us-east-1" => {
+                        let mut resp = Resp::ok();
+                        resp.set("location", &format!("/{bucket}"));
+                        return Ok(resp);
+                    }
+                    r => r?,
+                };
                 self.invalidate_access(bucket);
                 if with_lock {
                     self.set_bucket_config(bucket, "versioning", Some(b"Enabled".to_vec())).await?;
@@ -1785,6 +1836,11 @@ impl Server {
                     .submit(Op::DeleteObjects {
                         bucket: bucket.into(),
                         items: vec![(key.into(), version.clone())],
+                        conds: vec![delete_cond(
+                            r.header("if-match"),
+                            r.header("x-amz-if-match-size"),
+                            r.header("x-amz-if-match-last-modified-time"),
+                        )?],
                         bypass: self.bypass_governance(r, bucket, key),
                         replica: r.replica,
                     })
@@ -2611,6 +2667,12 @@ impl Server {
 
     async fn get_object(&self, r: &Req, bucket: &str, key: &str, head: bool) -> S3Result<Resp> {
         let h = &r.parts.headers;
+        // SSE-S3 is chosen when writing; reads that ask for it are refused, as on S3.
+        if header(h, SSE).is_some() {
+            return Err(
+                err::InvalidArgument().with_message("x-amz-server-side-encryption header is not supported for this operation.")
+            );
+        }
         let key_name = key;
         for attempt in 0..3 {
             let (meta, inline) = self.lookup(bucket, key, r.q("versionId").filter(|v| !v.is_empty()))?;
@@ -3278,31 +3340,34 @@ impl Server {
             return Err(err::MalformedXML());
         }
         let quiet = doc.child_text("Quiet").is_some_and(|q| q.trim().eq_ignore_ascii_case("true"));
-        let objects: Vec<(String, Option<String>)> = doc
-            .children_named("Object")
-            .filter_map(|o| {
-                let key = o.child_text("Key")?.to_string();
-                let version = o.child_text("VersionId").map(str::trim).filter(|v| !v.is_empty()).map(str::to_string);
-                Some((key, version))
-            })
-            .collect();
+        let mut objects: Vec<(String, Option<String>, Option<store::DeleteCond>)> = Vec::new();
+        for o in doc.children_named("Object") {
+            let Some(key) = o.child_text("Key") else { continue };
+            let version = o.child_text("VersionId").map(str::trim).filter(|v| !v.is_empty()).map(str::to_string);
+            let cond = delete_cond(o.child_text("ETag"), o.child_text("Size"), o.child_text("LastModifiedTime"))?;
+            objects.push((key.to_string(), version, cond));
+        }
         if objects.len() > 1000 {
             return Err(err::MalformedXML().with_message("The request must contain no more than 1000 keys"));
         }
-        let (valid, invalid): (Vec<_>, Vec<_>) = objects.into_iter().partition(|(k, _)| !k.is_empty() && check_key(k).is_ok());
+        let (valid, invalid): (Vec<_>, Vec<_>) = objects.into_iter().partition(|(k, _, _)| !k.is_empty() && check_key(k).is_ok());
         // Each key is authorized on its own, as on S3; refused keys are reported as errors.
         let ctx = self.req_ctx(r);
-        let (valid, denied): (Vec<_>, Vec<_>) = valid.into_iter().partition(|(k, v)| {
+        let (valid, denied): (Vec<_>, Vec<_>) = valid.into_iter().partition(|(k, v, _)| {
             let action = if v.is_some() { "s3:DeleteObjectVersion" } else { "s3:DeleteObject" };
             self.authorize(&r.principal, action, Some(bucket), Some(k), &ctx).is_ok()
         });
+        let conds = valid.iter().map(|(_, _, c)| c.clone()).collect();
+        let valid: Vec<(String, Option<String>)> = valid.into_iter().map(|(k, v, _)| (k, v)).collect();
         let bypass = wants_bypass(r)
             && !matches!(r.principal, Principal::Anonymous)
             && valid
                 .iter()
                 .all(|(k, _)| self.authorize(&r.principal, "s3:BypassGovernanceRetention", Some(bucket), Some(k), &ctx).is_ok());
-        let OpOut::Deleted(results) =
-            self.store.submit(Op::DeleteObjects { bucket: bucket.into(), items: valid.clone(), bypass, replica: false }).await?
+        let OpOut::Deleted(results) = self
+            .store
+            .submit(Op::DeleteObjects { bucket: bucket.into(), items: valid.clone(), conds, bypass, replica: false })
+            .await?
         else {
             return Err(S3Error::internal("unexpected writer reply"));
         };
@@ -3335,15 +3400,33 @@ impl Server {
                 }
             }
         }
-        for (k, v) in denied {
+        for (k, v, _) in denied {
             x.open("Error").elem("Key", &k).opt("VersionId", v.as_deref());
             x.elem("Code", "AccessDenied").elem("Message", "Access Denied").close("Error");
         }
-        for (k, _) in invalid {
+        for (k, _, _) in invalid {
             x.open("Error").elem("Key", &k).elem("Code", "InvalidArgument").elem("Message", "Invalid key").close("Error");
         }
         Ok(Resp::xml(x.finish("DeleteResult")))
     }
+}
+
+/// Conditions on a delete, from headers or a DeleteObjects entry.
+fn delete_cond(etag: Option<&str>, size: Option<&str>, mtime: Option<&str>) -> S3Result<Option<store::DeleteCond>> {
+    let size = match size {
+        Some(v) => Some(v.trim().parse().map_err(|_| err::InvalidArgument().with_message("Invalid size condition"))?),
+        None => None,
+    };
+    let mtime = match mtime {
+        Some(v) => Some(
+            util::parse_http_date(v)
+                .or_else(|| util::parse_iso8601(v.trim()))
+                .ok_or_else(|| err::InvalidArgument().with_message("Invalid last-modified-time condition"))?,
+        ),
+        None => None,
+    };
+    let etag = etag.map(str::to_string);
+    Ok((etag.is_some() || size.is_some() || mtime.is_some()).then_some(store::DeleteCond { etag, size, mtime }))
 }
 
 /// HTML error page for the website endpoint.
@@ -3380,7 +3463,6 @@ fn etag_of(md5: [u8; 16], key: Option<&WrapKey>) -> String {
     format!("\"{}\"", util::hex(&crypt::etag_digest(key, md5)))
 }
 
-/// Stored headers a copy takes over from its source (not encryption or Object Lock state).
 /// The checksums of a multipart object's parts, in order (empty when they are not known).
 fn part_checksums(meta: &ObjectMeta) -> Vec<&str> {
     meta.headers
@@ -3390,6 +3472,7 @@ fn part_checksums(meta: &ObjectMeta) -> Vec<&str> {
         .unwrap_or_default()
 }
 
+/// Stored headers a copy takes over from its source (not encryption or Object Lock state).
 fn inheritable(h: &[(String, String)]) -> Vec<(String, String)> {
     h.iter()
         .filter(|(k, _)| {
@@ -3530,6 +3613,7 @@ mod tests {
     #[test]
     fn bucket_names() {
         assert!(valid_bucket_name("my-bucket.data"));
+        assert!(!valid_bucket_name("foo-.bar") && !valid_bucket_name("foo.-bar"));
         assert!(!valid_bucket_name("ab"));
         assert!(!valid_bucket_name("Upper"));
         assert!(!valid_bucket_name("-dash"));

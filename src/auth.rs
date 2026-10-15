@@ -1,8 +1,9 @@
 //! AWS Signature Version 4: header auth, presigned URLs and streaming (aws-chunked) payloads.
 
-use crate::error::{S3Result, err};
+use crate::error::{S3Error, S3Result, err};
 use crate::util::{self, ct_eq, hex, uri_decode, uri_encode};
 use hmac::{KeyInit, Mac};
+use hyper::StatusCode;
 use hyper::http::request::Parts;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -90,6 +91,8 @@ pub struct Credential {
     pub buckets: Option<Vec<String>>,
     /// With a policy, the key may do only what the policy (or a bucket policy) allows.
     pub policy: Option<Arc<crate::iam::Policy>>,
+    /// A temporary key stops working at this time (unix milliseconds).
+    pub expires_ms: Option<u64>,
 }
 
 impl Credential {
@@ -193,7 +196,12 @@ impl Auth {
     }
 
     fn credential(&self, access_key: &str) -> S3Result<Arc<Credential>> {
-        self.creds.read().unwrap().get(access_key).cloned().ok_or_else(err::InvalidAccessKeyId)
+        let c = self.creds.read().unwrap().get(access_key).cloned().ok_or_else(err::InvalidAccessKeyId)?;
+        if c.expires_ms.is_some_and(|t| util::now_ms() >= t) {
+            // The code SDKs answer by fetching fresh credentials.
+            return Err(S3Error::new("ExpiredToken", StatusCode::BAD_REQUEST, "The provided token has expired."));
+        }
+        Ok(c)
     }
 
     fn principal(&self, access_key: &str) -> Principal {
@@ -479,6 +487,9 @@ impl Auth {
         let amz_date = field("X-Amz-Date")?;
         let t = util::parse_amz_date(amz_date).ok_or_else(|| err::AccessDenied().with_message("Invalid X-Amz-Date"))?;
         let expires: u64 = field("X-Amz-Expires")?.parse().map_err(|_| err::AccessDenied())?;
+        if expires == 0 {
+            return Err(err::AccessDenied().with_message("Request has expired"));
+        }
         if expires > 604_800 {
             return Err(err::AccessDenied().with_message("X-Amz-Expires must be less than a week (in seconds)"));
         }
@@ -649,6 +660,7 @@ mod tests {
             read_only: false,
             buckets: None,
             policy: None,
+            expires_ms: None,
         }])
     }
 
@@ -660,6 +672,7 @@ mod tests {
             read_only: false,
             buckets: Some(vec!["team-a-*".into(), "shared".into()]),
             policy: None,
+            expires_ms: None,
         };
         assert!(c.can_access("team-a-logs") && c.can_access("shared"));
         assert!(!c.can_access("team-b") && !c.can_access("shared2"));

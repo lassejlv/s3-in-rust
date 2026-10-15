@@ -1207,6 +1207,7 @@ mod tests {
             read_only: false,
             buckets: None,
             policy: None,
+            expires_ms: None,
         }]);
         let q = query(&[("uploadId", "a b/c"), ("partNumber", "3")]);
         let path = format!("/bkt/{}", uri_encode("dir/ä €+x", true));

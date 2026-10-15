@@ -2933,8 +2933,18 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
         let store = open().unwrap();
         drop(store);
-        std::thread::sleep(Duration::from_millis(200));
-        let db = Database::create(dir.join("meta.redb")).unwrap();
+        // The writer thread lets go of the database shortly after the store is dropped.
+        let mut tries = 0;
+        let db = loop {
+            match Database::create(dir.join("meta.redb")) {
+                Ok(db) => break db,
+                Err(_) if tries < 100 => {
+                    tries += 1;
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                Err(e) => panic!("database still in use: {e}"),
+            }
+        };
         let txn = db.begin_read().unwrap();
         assert_eq!(txn.open_table(STATE).unwrap().get("format").unwrap().unwrap().value(), FORMAT);
         drop(txn);

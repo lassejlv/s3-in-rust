@@ -800,6 +800,22 @@ s3.put_bucket_notification_configuration(Bucket="photos", NotificationConfigurat
     "Filter": {"Key": {"FilterRules": [{"Name": "prefix", "Value": "uploads/"}, {"Name": "suffix", "Value": ".jpg"}]}}}]})
 ```
 
+**NATS and Redis** targets take the same `--webhook ID=URL` option and the same ARN form:
+
+```bash
+s3rs ... --webhook bus=nats://user:pass@nats.internal:4222/s3.events \
+         --webhook jobs=redis://:password@redis.internal:6379/s3-events?db=0 \
+         --webhook live=redis://redis.internal/s3-live?publish
+```
+
+- `nats://[user:pass@ | token@]host[:4222]/subject` publishes each event to the subject. An
+  event counts as delivered once the NATS server has answered the `PING` sent after it (for
+  persistence, point the subject at a JetStream stream).
+- `redis://[[user]:pass@]host[:6379]/key[?db=N]` appends each event to the list `key`
+  (`RPUSH`), for workers to `BLPOP`; with `?publish` it is published on the channel `key`
+  instead (`PUBLISH`, which only reaches subscribers connected at the time).
+- Connections are plain TCP (use them on a private network); passwords are not logged.
+
 How delivery works:
 - **Body:** each event is POSTed as `{"Records":[...]}`, the same JSON S3 sends to SQS/SNS/Lambda.
   Object keys are URL-encoded, and the body includes the size, ETag, version id and a sequencer.

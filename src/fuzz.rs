@@ -235,6 +235,7 @@ fn small_grammars() {
         let _ = util::uri_decode(&s, false);
         let _ = util::parse_id_hex(&s);
         let _ = events::Url::parse(&s);
+        let _ = events::Endpoint::parse(&s);
         let _ = access::CannedAcl::parse(&s);
         let _ = lock::Mode::parse(&s);
         let _ = lock::parse_legal_hold(&s);

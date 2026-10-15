@@ -179,6 +179,15 @@ jobs:
         run: python3 tests/kms.py ./target/release/s3rs
       - name: object ACL test
         run: python3 tests/objacl.py ./target/release/s3rs
+      - name: NATS and Redis event targets (protocol fakes)
+        run: python3 tests/eventtargets.py ./target/release/s3rs
+      - name: NATS and Redis event targets (real servers)
+        run: |
+          docker run -d --name redis -p 16379:6379 redis:7.4 redis-server --requirepass redispw
+          docker run -d --name nats -p 14222:4222 nats:2.10 --user alice --pass natspw
+          for i in $(seq 50); do (echo > /dev/tcp/127.0.0.1/16379) 2>/dev/null && (echo > /dev/tcp/127.0.0.1/14222) 2>/dev/null && break; sleep 0.2; done
+          sleep 1
+          python3 tests/eventtargets_real.py ./target/release/s3rs 14222 16379
       - name: scrub test
         run: python3 tests/scrub.py ./target/release/s3rs
       - name: server-wide public access block test

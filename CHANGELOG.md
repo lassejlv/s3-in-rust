@@ -65,6 +65,8 @@ First release.
 - Web console at `/_console/`, including object version history (download, restore, delete). It
   works with STS session credentials, so a signed-in tab never stores the key's secret.
 - Per-bucket server access logs in S3's format (PutBucketLogging), written to a target bucket.
+- Event notifications can also go to NATS subjects and Redis lists or channels
+  (`--webhook id=nats://...`, `redis://...`), with the same durable queue as webhooks.
 - Prometheus metrics (also per bucket: objects, bytes, requests and traffic), JSON access logs, event notifications (webhooks and live streams). Webhook
   events are queued on disk with the write they describe and delivered in order, at least once,
   across outages and restarts. A receiver's `4xx` drops the event instead of blocking the queue.

@@ -324,7 +324,7 @@ impl Bus {
     pub fn new(
         store: Arc<Store>,
         region: String,
-        targets: Vec<(String, Url)>,
+        targets: Vec<(String, Endpoint)>,
         secret: Option<String>,
         tls: Option<Arc<crate::tls::ClientConfig>>,
         timeout: Duration,
@@ -348,15 +348,15 @@ impl Bus {
             }
         }
         let mut queues = HashMap::new();
-        for (id, url) in targets {
+        for (id, endpoint) in targets {
             let (n, bytes, _) = counts.get(&id).copied().unwrap_or_default();
             if n > 0 {
                 elog!("webhook {id}: {n} queued event(s) from before the restart");
             }
             let queue = Arc::new(Queue { len: AtomicU64::new(0), bytes: AtomicU64::new(0) });
             queue.add(&stats, n, bytes);
-            let tls = if url.tls { tls.clone() } else { None };
-            let target = Target { id: id.clone(), url, tls, secret: secret.clone(), timeout };
+            let tls = if endpoint.tls() { tls.clone() } else { None };
+            let target = Target { id: id.clone(), endpoint, tls, secret: secret.clone(), timeout };
             tokio::spawn(deliver(target, store.clone(), queue.clone(), stats.clone()));
             queues.insert(id, queue);
         }
@@ -580,6 +580,35 @@ impl Url {
     }
 }
 
+/// Where a target's events go: a webhook URL, or a NATS subject / Redis list or channel.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Endpoint {
+    Http(Url),
+    Other(crate::targets::Endpoint),
+}
+
+impl Endpoint {
+    pub fn parse(s: &str) -> Result<Endpoint, String> {
+        match crate::targets::Endpoint::parse(s) {
+            Some(e) => e.map(Endpoint::Other),
+            None => Url::parse(s).map(Endpoint::Http).map_err(|e| format!("{e} (or nats://, redis://)")),
+        }
+    }
+
+    /// Needs the TLS client configuration (https:// webhooks).
+    pub fn tls(&self) -> bool {
+        matches!(self, Endpoint::Http(u) if u.tls)
+    }
+
+    /// For logs (without credentials).
+    pub fn describe(&self) -> String {
+        match self {
+            Endpoint::Http(u) => format!("{}://{}:{}{}", if u.tls { "https" } else { "http" }, u.host, u.port, u.path),
+            Endpoint::Other(e) => e.describe(),
+        }
+    }
+}
+
 type Sender = hyper::client::conn::http1::SendRequest<Full<Bytes>>;
 
 /// Open an HTTP/1.1 connection to `url`'s host (with TLS for https://).
@@ -615,27 +644,51 @@ where
     Ok(sender)
 }
 
-/// A webhook target and how to reach it.
+/// A notification target and how to reach it.
 struct Target {
     id: String,
-    url: Url,
+    endpoint: Endpoint,
     tls: Option<Arc<crate::tls::ClientConfig>>,
     secret: Option<String>,
     /// How long the receiver may take to answer.
     timeout: Duration,
 }
 
-async fn post(sender: &mut Option<Sender>, t: &Target, body: &Bytes) -> Result<u16, String> {
+async fn post(sender: &mut Option<Sender>, t: &Target, url: &Url, body: &Bytes) -> Result<u16, String> {
     let reused = sender.as_ref().is_some_and(|s| !s.is_closed());
-    match post_once(sender, t, body).await {
+    match post_once(sender, t, url, body).await {
         // A kept-alive connection the receiver had already closed: try a fresh one at once.
-        Err(_) if reused => post_once(sender, t, body).await,
+        Err(_) if reused => post_once(sender, t, url, body).await,
         r => r,
     }
 }
 
-async fn post_once(sender: &mut Option<Sender>, t: &Target, body: &Bytes) -> Result<u16, String> {
-    let url = &t.url;
+/// Send one event to the target.
+async fn send(
+    sender: &mut Option<Sender>,
+    other: &mut Option<crate::targets::Conn>,
+    t: &Target,
+    body: &Bytes,
+) -> Result<crate::targets::Answer, String> {
+    use crate::targets::Answer;
+    match &t.endpoint {
+        Endpoint::Http(url) => match post(sender, t, url, body).await? {
+            s if (200..300).contains(&s) => Ok(Answer::Accepted),
+            s if rejected(s) => Ok(Answer::Rejected(format!("HTTP {s}"))),
+            s => Err(format!("HTTP {s}")),
+        },
+        Endpoint::Other(ep) => {
+            let reused = other.is_some();
+            match crate::targets::send(other, ep, body, t.timeout).await {
+                // A kept-alive connection the server had closed: try a fresh one at once.
+                Err(_) if reused => crate::targets::send(other, ep, body, t.timeout).await,
+                r => r,
+            }
+        }
+    }
+}
+
+async fn post_once(sender: &mut Option<Sender>, t: &Target, url: &Url, body: &Bytes) -> Result<u16, String> {
     let signature = t.secret.as_ref().map(|k| format!("sha256={}", util::hex(&crate::auth::hmac(k.as_bytes(), body))));
     if sender.as_ref().is_none_or(|s| s.is_closed()) {
         *sender = Some(connect(url, t.tls.as_ref()).await?);
@@ -679,6 +732,7 @@ fn rejected(status: u16) -> bool {
 async fn deliver(t: Target, store: Arc<Store>, queue: Arc<Queue>, stats: Arc<Stats>) {
     let id = &t.id;
     let mut sender: Option<Sender> = None;
+    let mut other: Option<crate::targets::Conn> = None;
     let (mut warned_at, mut rejected_at) = (0u64, 0u64);
     let mut backoff = Duration::from_millis(500);
     let mut failing = false;
@@ -710,19 +764,15 @@ async fn deliver(t: Target, store: Arc<Store>, queue: Arc<Queue>, stats: Arc<Sta
         for (key, body) in batch {
             let len = body.len() as u64;
             let body = Bytes::from(body);
-            match post(&mut sender, &t, &body).await {
-                Ok(status) if (200..300).contains(&status) => delivered += 1,
-                Ok(status) if rejected(status) => {
+            match send(&mut sender, &mut other, &t, &body).await {
+                Ok(crate::targets::Answer::Accepted) => delivered += 1,
+                Ok(crate::targets::Answer::Rejected(why)) => {
                     stats.rejected.fetch_add(1, Ordering::Relaxed);
                     let now = now_ms() / 60_000;
                     if now != rejected_at {
                         rejected_at = now;
-                        elog!("webhook {id}: the receiver rejected an event with HTTP {status}; dropping it");
+                        elog!("webhook {id}: the receiver rejected an event ({why}); dropping it");
                     }
-                }
-                Ok(status) => {
-                    error = Some(format!("HTTP {status}"));
-                    break;
                 }
                 Err(e) => {
                     error = Some(e);

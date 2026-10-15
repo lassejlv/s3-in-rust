@@ -38,6 +38,7 @@ mod s3;
 mod scrub;
 mod store;
 mod sts;
+mod targets;
 mod tls;
 mod util;
 mod website;
@@ -162,7 +163,7 @@ struct Config {
     admin_token: Option<String>,
     console: bool,
     behind_proxy: bool,
-    webhooks: Vec<(String, events::Url)>,
+    webhooks: Vec<(String, events::Endpoint)>,
     webhook_secret: Option<String>,
     webhook_timeout: u64,
     webhook_ca: Option<PathBuf>,
@@ -405,8 +406,8 @@ fn parse_rate(what: &str, v: &str) -> Result<Option<u32>, String> {
     Ok((n > 0).then_some(n))
 }
 
-fn parse_webhooks(v: &str) -> Result<Vec<(String, events::Url)>, String> {
-    let mut out: Vec<(String, events::Url)> = Vec::new();
+fn parse_webhooks(v: &str) -> Result<Vec<(String, events::Endpoint)>, String> {
+    let mut out: Vec<(String, events::Endpoint)> = Vec::new();
     for w in split_list(v) {
         let w = parse_webhook(&w)?;
         if out.iter().any(|(id, _)| *id == w.0) {
@@ -418,13 +419,13 @@ fn parse_webhooks(v: &str) -> Result<Vec<(String, events::Url)>, String> {
 }
 
 /// `id=http://host[:port]/path`
-fn parse_webhook(s: &str) -> Result<(String, events::Url), String> {
+fn parse_webhook(s: &str) -> Result<(String, events::Endpoint), String> {
     let (id, url) = s.split_once('=').ok_or_else(|| format!("--webhook {s}: expected ID=URL"))?;
     let id = id.trim();
     if id.is_empty() || !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
         return Err(format!("--webhook {s}: the id may only contain letters, digits, '-' and '_'"));
     }
-    Ok((id.to_string(), events::Url::parse(url.trim()).map_err(|e| format!("--webhook: {e}"))?))
+    Ok((id.to_string(), events::Endpoint::parse(url.trim()).map_err(|e| format!("--webhook: {e}"))?))
 }
 
 /// A 256-bit key given as 64 hex characters or base64.
@@ -824,11 +825,11 @@ fn main() {
             std::process::exit(2);
         }
     };
-    let webhook_tls = if cfg.webhooks.iter().any(|(_, u)| u.tls) || cfg.webhook_ca.is_some() {
+    let webhook_tls = if cfg.webhooks.iter().any(|(_, u)| u.tls()) || cfg.webhook_ca.is_some() {
         match tls::client_config(cfg.webhook_ca.as_deref()) {
             Ok(c) => Some(c),
             Err(e) => {
-                let what = if cfg.webhooks.iter().any(|(_, u)| u.tls) { "https:// webhooks" } else { "--webhook-ca" };
+                let what = if cfg.webhooks.iter().any(|(_, u)| u.tls()) { "https:// webhooks" } else { "--webhook-ca" };
                 elog!("error: {what}: {e}");
                 std::process::exit(2);
             }
@@ -1036,9 +1037,8 @@ async fn serve(
     if cfg.console {
         elog!("s3rs web console on {scheme}://{}/_console/", cfg.listen);
     }
-    for (id, url) in &cfg.webhooks {
-        let s = if url.tls { "https" } else { "http" };
-        elog!("webhook target {id}: {s}://{}:{}{} (arn:s3rs:webhook::{id})", url.host, url.port, url.path);
+    for (id, endpoint) in &cfg.webhooks {
+        elog!("event target {id}: {} (arn:s3rs:webhook::{id})", endpoint.describe());
     }
     for t in &repl_targets {
         let s = if t.url.tls { "https" } else { "http" };

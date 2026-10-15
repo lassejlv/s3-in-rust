@@ -1974,6 +1974,7 @@ impl Server {
                 Ok(resp)
             }
             ObjectOp::Copy => self.copy_object(r, bucket, key).await,
+            ObjectOp::Rename => self.rename_object(r, bucket, key).await,
             ObjectOp::Put => self.put_object(r, bucket, key).await,
             ObjectOp::CreateUpload => self.create_upload(r, bucket, key).await,
             ObjectOp::CompleteUpload => self.complete_upload(r, bucket, key).await,
@@ -2994,6 +2995,63 @@ impl Server {
                     .with_message("Copy Source must mention the source bucket and key: sourcebucket/sourcekey"))
             }
         }
+    }
+
+    /// RenameObject: move an object to `key` within its bucket. Only metadata changes; the data
+    /// stays where it is, so renaming takes the same time whatever the object's size.
+    async fn rename_object(&self, r: &mut Req, bucket: &str, key: &str) -> S3Result<Resp> {
+        let raw = r
+            .header("x-amz-rename-source")
+            .ok_or_else(|| err::InvalidRequest().with_message("x-amz-rename-source is required"))?;
+        let decoded =
+            uri_decode(raw.trim(), false).ok_or_else(|| err::InvalidArgument().with_message("Invalid rename source"))?;
+        let src = decoded
+            .strip_prefix('/')
+            .unwrap_or(&decoded)
+            .strip_prefix(bucket)
+            .and_then(|s| s.strip_prefix('/'))
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                err::InvalidRequest().with_message("x-amz-rename-source must name an object in the same bucket (bucket/key)")
+            })?
+            .to_string();
+        check_key(&src)?;
+        let ctx = self.req_ctx(r);
+        for action in ["s3:GetObject", "s3:DeleteObject"] {
+            self.authorize(&r.principal, action, Some(bucket), Some(&src), &ctx)?;
+        }
+        let cond = |prefix: &str| -> S3Result<store::ObjCond> {
+            let h = |n: &str| r.header(&format!("{prefix}{n}")).map(str::to_string);
+            let date = |n: &str| -> S3Result<Option<u64>> {
+                h(n).map(|v| {
+                    util::parse_http_date(&v).ok_or_else(|| err::InvalidArgument().with_message(format!("Invalid {prefix}{n}")))
+                })
+                .transpose()
+            };
+            Ok(store::ObjCond {
+                if_match: h("if-match"),
+                if_none_match: h("if-none-match"),
+                modified_since: date("if-modified-since")?,
+                unmodified_since: date("if-unmodified-since")?,
+            })
+        };
+        let (src_cond, dst_cond) = (cond("x-amz-rename-source-")?, cond("")?);
+        let _ = r.body.read_all(MAX_XML_BODY).await?;
+        let created = self.event(&r.principal, r.client.ip, &r.rid, "ObjectCreated:Copy", bucket, key);
+        let removed = self.event(&r.principal, r.client.ip, &r.rid, "ObjectRemoved:Delete", bucket, &src);
+        let op = Op::Rename { bucket: bucket.into(), src, dst: key.into(), src_cond, dst_cond };
+        let (op, notify) = self.events.wrap(bucket, op, move |out| match out {
+            OpOut::Renamed(m, src_seq) if *src_seq > 0 => vec![
+                events::Event { sequencer: *src_seq, time_ms: now_ms(), ..removed.clone() },
+                events::Event { size: m.size, etag: m.etag.clone(), sequencer: m.seq, time_ms: now_ms(), ..created.clone() },
+            ],
+            _ => Vec::new(),
+        });
+        self.store.submit(op).await?;
+        if let Some(n) = notify {
+            n.done();
+        }
+        Ok(Resp::ok())
     }
 
     async fn copy_object(&self, r: &mut Req, bucket: &str, key: &str) -> S3Result<Resp> {

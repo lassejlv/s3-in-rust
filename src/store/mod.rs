@@ -434,6 +434,30 @@ pub enum WriteCond {
     All(Vec<WriteCond>),
 }
 
+/// Preconditions on an object (RenameObject's source and destination headers).
+#[derive(Debug, Clone, Default)]
+pub struct ObjCond {
+    /// ETags (or `*`), one of which the object must have; it must exist.
+    pub if_match: Option<String>,
+    /// ETags (or `*`) the object must not have.
+    pub if_none_match: Option<String>,
+    /// Seconds since the epoch.
+    pub modified_since: Option<u64>,
+    pub unmodified_since: Option<u64>,
+}
+
+impl ObjCond {
+    fn check(&self, m: Option<&ObjectMeta>) -> S3Result<()> {
+        let m = m.filter(|m| !m.delete_marker);
+        let any = |list: &str, m: &ObjectMeta| list.split(',').any(|e| e.trim() == "*" || norm_etag(e) == norm_etag(&m.etag));
+        let ok = self.if_match.as_deref().is_none_or(|l| m.is_some_and(|m| any(l, m)))
+            && self.if_none_match.as_deref().is_none_or(|l| m.is_none_or(|m| !any(l, m)))
+            && self.modified_since.is_none_or(|t| m.is_none_or(|m| m.mtime_ms / 1000 > t))
+            && self.unmodified_since.is_none_or(|t| m.is_none_or(|m| m.mtime_ms / 1000 <= t));
+        if ok { Ok(()) } else { Err(err::PreconditionFailed()) }
+    }
+}
+
 /// Builds the event queue rows (key, body) for an operation's result. It runs inside the
 /// operation's own transaction, so the events are committed together with the change they
 /// describe, and their queue keys follow commit order.
@@ -552,6 +576,15 @@ pub enum Op {
         bucket: String,
         limit: usize,
     },
+    /// Move an object to another key in the same (unversioned) bucket without copying data;
+    /// an object already at `dst` is replaced.
+    Rename {
+        bucket: String,
+        src: String,
+        dst: String,
+        src_cond: ObjCond,
+        dst_cond: ObjCond,
+    },
     /// Remove delivered (or abandoned) event notifications.
     DeleteEvents(Vec<Vec<u8>>),
     /// Store an access key created through the admin API (refused if it exists).
@@ -579,6 +612,8 @@ pub enum OpOut {
     Deleted(Vec<S3Result<DeleteOutcome>>),
     /// What lifecycle operations removed.
     Removed(Vec<Removed>),
+    /// The renamed object at its new key, and the commit order of its removal from the old one.
+    Renamed(ObjectMeta, u64),
 }
 
 /// An object version (or delete marker) removed by lifecycle, or the delete marker it created.
@@ -2453,6 +2488,7 @@ fn repl_touched(tx: &mut Tables, rules: &mut HashMap<String, Vec<String>>, op: &
         Op::PutObject { bucket, key, .. } | Op::Complete { bucket, key, .. } | Op::SetObjectTags { bucket, key, .. } => {
             (bucket, vec![key.as_str()])
         }
+        Op::Rename { bucket, src, dst, .. } => (bucket, vec![src.as_str(), dst.as_str()]),
         Op::DeleteObjects { bucket, items, .. } => {
             (bucket, items.iter().filter(|(_, v)| v.is_none()).map(|(k, _)| k.as_str()).collect())
         }
@@ -2644,6 +2680,30 @@ fn apply(tx: &mut Tables, op: Op, garbage: &mut Vec<u128>, last_seq: &mut u64) -
                 tx.inline.insert(*id, data.as_ref())?;
             }
             Ok(OpOut::Object(put_version(tx, last_seq, &bucket, &key, meta, garbage)?))
+        }
+        Op::Rename { bucket, src, dst, src_cond, dst_cond } => {
+            check_key_chars(&dst)?;
+            if tx.buckets.get(bucket.as_str())?.is_none() {
+                return Err(err::NoSuchBucket());
+            }
+            // With versioning, the old key would keep versions sharing the moved data files.
+            if versioning_state(tx, &bucket)? != Versioning::Unversioned {
+                return Err(err::InvalidRequest().with_message("RenameObject is not supported in buckets that have versioning"));
+            }
+            let (sk, dk) = (obj_key(&bucket, &src), obj_key(&bucket, &dst));
+            let Some(mut meta) = get_meta(tx, &sk)? else { return Err(err::NoSuchKey()) };
+            src_cond.check(Some(&meta))?;
+            dst_cond.check(get_meta(tx, &dk)?.as_ref())?;
+            if src == dst {
+                return Ok(OpOut::Renamed(meta, 0));
+            }
+            tx.objects.remove(sk.as_slice())?;
+            let src_seq = next_seq(last_seq);
+            // Frees what was at the destination; the moved object keeps its data and usage.
+            retire_current(tx, Versioning::Unversioned, &bucket, &dst, garbage)?;
+            meta.seq = alloc_seq(tx, last_seq, &bucket, &dst, None)?;
+            tx.objects.insert(dk.as_slice(), meta.encode().as_slice())?;
+            Ok(OpOut::Renamed(meta, src_seq))
         }
         Op::Expire { bucket, items } => {
             let mut out = Vec::new();

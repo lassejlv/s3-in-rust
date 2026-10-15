@@ -221,7 +221,10 @@ wait_for(lambda: b.get_object(Bucket="dst", Key="small")["Body"].read() == b"hel
 wait_for(lambda: b.get_object_tagging(Bucket="dst", Key="big")["TagSet"] == [{"Key": "env", "Value": "dev"}],
          "tag change replicated")
 wait_for(lambda: absent(b, "dst", "old/0"), "delete replicated")
-print("overwrites, tag changes and deletes replicated")
+a.rename_object(Bucket="src", Key="renamed/1", RenameSource="src/old/1")
+wait_for(lambda: b.get_object(Bucket="dst", Key="renamed/1")["Body"].read() == before["old/1"] and absent(b, "dst", "old/1"),
+         "rename replicated")
+print("overwrites, tag changes, deletes and renames replicated")
 
 # Target down: changes queue up durably, survive a SIGKILL of the source, and arrive later.
 stop("b")

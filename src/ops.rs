@@ -195,6 +195,7 @@ pub enum ObjectOp {
     AbortUpload,
     DeleteTagging,
     Delete,
+    Rename,
     /// Recognized but not implemented (select, restore, torrent, ...).
     Unsupported,
 }
@@ -216,7 +217,7 @@ const OBJECT_SUBS: &[&str] = &[
 pub fn classify_object(m: &Method, query: &[(String, String)], copy_source: bool) -> S3Result<ObjectOp> {
     let sub = one_subresource(OBJECT_SUBS.iter().copied().filter(|s| has(query, s)).collect())?;
     let part = has(query, "partNumber");
-    if matches!(sub, Some("torrent" | "restore" | "select" | "renameObject")) {
+    if matches!(sub, Some("torrent" | "restore" | "select")) {
         return Ok(ObjectOp::Unsupported);
     }
     let missing = |msg: &str| Err(err::InvalidRequest().with_message(msg.to_string()));
@@ -239,6 +240,7 @@ pub fn classify_object(m: &Method, query: &[(String, String)], copy_source: bool
         (&Method::PUT, Some("tagging")) => ObjectOp::PutTagging,
         (&Method::PUT, Some("retention")) => ObjectOp::PutRetention,
         (&Method::PUT, Some("legal-hold")) => ObjectOp::PutLegalHold,
+        (&Method::PUT, Some("renameObject")) => ObjectOp::Rename,
         (&Method::POST, Some("uploads")) => ObjectOp::CreateUpload,
         (&Method::POST, Some("uploadId")) => ObjectOp::CompleteUpload,
         (&Method::DELETE, None) => ObjectOp::Delete,
@@ -265,7 +267,9 @@ impl ObjectOp {
             | ObjectOp::UploadPart
             | ObjectOp::UploadPartCopy
             | ObjectOp::CreateUpload
-            | ObjectOp::CompleteUpload => Some("s3:PutObject"),
+            | ObjectOp::CompleteUpload
+            // Of the destination; the source also needs s3:GetObject and s3:DeleteObject.
+            | ObjectOp::Rename => Some("s3:PutObject"),
             ObjectOp::PutAcl => v("s3:PutObjectAcl", "s3:PutObjectVersionAcl"),
             ObjectOp::PutTagging => v("s3:PutObjectTagging", "s3:PutObjectVersionTagging"),
             ObjectOp::PutRetention => Some("s3:PutObjectRetention"),

@@ -34,7 +34,10 @@ First release.
   (CRC32/CRC32C/CRC64NVME/SHA1/SHA256, also for multipart uploads as COMPOSITE or FULL_OBJECT
   checksums, with per-part checksums), POST uploads, GetObjectAttributes.
 - CompleteMultipartUpload is idempotent: a client retrying after a lost response gets the same
-  result.
+  result, as do concurrent requests completing the same upload.
+- RenameObject moves an object to another key in its bucket by changing only metadata, so it
+  takes milliseconds whatever the size (unversioned buckets; source and destination
+  conditions; replicated and notified as a copy plus a delete).
 - Conditional deletes (`If-Match`, size and last-modified conditions, also per key in
   DeleteObjects), `If-None-Match` with an ETag on writes, and paginated ListBuckets.
 - Bucket policies accept the ARN condition operators (`ArnLike`, `ArnEquals`, ...), so the

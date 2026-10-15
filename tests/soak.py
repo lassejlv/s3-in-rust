@@ -112,8 +112,9 @@ def worker(n):
     while time.time() < stop:
         bucket = rng.choice(BUCKETS)
         key = rng.choice(KEYS)
-        op = rng.choices(["put", "get", "range", "delete", "copy", "multipart", "head", "list", "tags"],
-                         [30, 30, 8, 8, 8, 3, 6, 4, 3])[0]
+        op = rng.choices(["put", "get", "range", "delete", "copy", "multipart", "head", "list", "tags",
+                          "delete_version", "multi_delete", "part_copy", "double_complete", "get_version"],
+                         [30, 30, 8, 8, 8, 3, 6, 4, 3, 4, 3, 2, 1, 4])[0]
         try:
             if op == "put":
                 c.put_object(Bucket=bucket, Key=key, Body=body(rng))
@@ -156,6 +157,54 @@ def worker(n):
                         raise
             elif op == "list":
                 c.list_objects_v2(Bucket=bucket)
+            elif op == "delete_version":
+                vs = c.list_object_versions(Bucket=bucket, Prefix=key).get("Versions", [])
+                if vs:
+                    v = rng.choice(vs)
+                    c.delete_object(Bucket=bucket, Key=v["Key"], VersionId=v["VersionId"])
+            elif op == "get_version":
+                vs = c.list_object_versions(Bucket=bucket, Prefix=key).get("Versions", [])
+                if vs:
+                    v = rng.choice(vs)
+                    check_get(c, bucket, v["Key"], None if v["VersionId"] == "null" else v["VersionId"])
+            elif op == "multi_delete":
+                keys = rng.sample(KEYS, 3)
+                r = c.delete_objects(Bucket=bucket, Delete={"Objects": [{"Key": k} for k in keys]})
+                if r.get("Errors"):
+                    fail(f"multi_delete errors: {r['Errors']}")
+            elif op == "part_copy":
+                src = rng.choice(KEYS)
+                up = c.create_multipart_upload(Bucket=bucket, Key=key)
+                try:
+                    etag = c.upload_part_copy(Bucket=bucket, Key=key, UploadId=up["UploadId"], PartNumber=1,
+                                              CopySource={"Bucket": bucket, "Key": src})["CopyPartResult"]["ETag"]
+                    c.complete_multipart_upload(Bucket=bucket, Key=key, UploadId=up["UploadId"],
+                                                MultipartUpload={"Parts": [{"PartNumber": 1, "ETag": etag}]})
+                except ClientError as e:
+                    c.abort_multipart_upload(Bucket=bucket, Key=key, UploadId=up["UploadId"])
+                    if e.response["Error"]["Code"] not in ("NoSuchKey", "InvalidRequest"):
+                        raise
+            elif op == "double_complete":
+                # Two clients complete the same upload at once: both get the same answer.
+                up = c.create_multipart_upload(Bucket=bucket, Key=key)
+                etag = c.upload_part(Bucket=bucket, Key=key, UploadId=up["UploadId"], PartNumber=1, Body=body(rng))["ETag"]
+                results = []
+
+                def complete():
+                    try:
+                        results.append(client().complete_multipart_upload(
+                            Bucket=bucket, Key=key, UploadId=up["UploadId"],
+                            MultipartUpload={"Parts": [{"PartNumber": 1, "ETag": etag}]})["ETag"])
+                    except ClientError as e:
+                        results.append(e.response["Error"]["Code"])
+
+                ts = [threading.Thread(target=complete) for _ in range(2)]
+                for t in ts:
+                    t.start()
+                for t in ts:
+                    t.join()
+                if len(set(results)) != 1 or not results[0].startswith('"'):
+                    fail(f"double complete: {results}")
             elif op == "tags":
                 try:
                     c.put_object_tagging(Bucket=bucket, Key=key, Tagging={"TagSet": [{"Key": "w", "Value": str(n)}]})

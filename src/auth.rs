@@ -81,7 +81,7 @@ impl ChunkSigner {
 
 /// One access key: its secret, whether it may only read, which buckets it may use, and an
 /// optional IAM-style policy that decides what it may do.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Credential {
     pub access_key: String,
     pub secret: String,

@@ -27,6 +27,45 @@ impl Json {
             _ => None,
         }
     }
+
+    /// Serialize (compactly).
+    pub fn write(&self, out: &mut String) {
+        match self {
+            Json::Null => out.push_str("null"),
+            Json::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
+            Json::Num(n) if n.fract() == 0.0 && n.abs() < 1e15 => out.push_str(&(*n as i64).to_string()),
+            Json::Num(n) => out.push_str(&n.to_string()),
+            Json::Str(s) => crate::accesslog::json_str(out, s),
+            Json::Arr(a) => {
+                out.push('[');
+                for (i, v) in a.iter().enumerate() {
+                    if i > 0 {
+                        out.push(',');
+                    }
+                    v.write(out);
+                }
+                out.push(']');
+            }
+            Json::Obj(m) => {
+                out.push('{');
+                for (i, (k, v)) in m.iter().enumerate() {
+                    if i > 0 {
+                        out.push(',');
+                    }
+                    crate::accesslog::json_str(out, k);
+                    out.push(':');
+                    v.write(out);
+                }
+                out.push('}');
+            }
+        }
+    }
+
+    pub fn to_text(&self) -> String {
+        let mut s = String::new();
+        self.write(&mut s);
+        s
+    }
 }
 
 struct JsonParser<'a> {

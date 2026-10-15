@@ -24,6 +24,7 @@ mod events;
 mod fuzz;
 mod iam;
 mod io;
+mod keys;
 mod lifecycle;
 mod lock;
 mod metrics;
@@ -736,7 +737,7 @@ fn main() {
         }
     };
     let auth = if !creds.is_empty() {
-        Some(auth::Auth::new(creds))
+        Some(auth::Auth::new(creds.clone()))
     } else if cfg.anonymous {
         None
     } else {
@@ -921,8 +922,18 @@ async fn serve(
         rate_limit: cfg.rate_limit,
         rate_limit_anonymous: cfg.rate_limit_anonymous,
     };
+    let file_keys = auth.as_ref().map(|_| collect_credentials(&cfg).unwrap_or_default()).unwrap_or_default();
     let server = Arc::new(s3::Server::new(store.clone(), auth, opts));
     server.set_self();
+    // Keys created through the admin API are stored in the database.
+    match server.set_file_credentials(file_keys) {
+        Ok(n) if server.auth.is_some() => elog!("{n} access key(s) in effect"),
+        Ok(_) => {}
+        Err(e) => {
+            elog!("error: cannot read the stored access keys: {e}");
+            std::process::exit(2);
+        }
+    }
     if cfg.lifecycle_interval > 0 {
         tokio::spawn(lifecycle::run(
             store.clone(),
@@ -1020,12 +1031,8 @@ async fn serve(
                 if server.auth.is_none() {
                     continue;
                 }
-                match collect_credentials(&cfg) {
-                    Ok(creds) => {
-                        let n = creds.len();
-                        if let Some(a) = &server.auth {
-                            a.replace(creds);
-                        }
+                match collect_credentials(&cfg).and_then(|creds| server.set_file_credentials(creds).map_err(|e| e.to_string())) {
+                    Ok(n) => {
                         if n == 0 {
                             elog!("reloaded: NO access keys are configured now; every signed request will be refused");
                         } else {

@@ -253,6 +253,28 @@ server `SIGHUP` to reload the credentials file and policies without a restart. I
 invalid, the server logs `RELOAD FAILED` and keeps the previous keys, including any you meant to
 remove. A valid but empty file revokes every key in it.
 
+**Keys through the admin API.** With `--admin-token`, keys can also be created and revoked at
+runtime, without editing files. They are stored in the metadata database, so backups contain
+them. They take effect immediately and survive restarts:
+
+```bash
+H="Authorization: Bearer $S3RS_ADMIN_TOKEN"
+# Create a key (generated, or choose "access_key"/"secret_key"). The secret is shown only here.
+curl -fsS -H "$H" -X POST https://s3.example.com/_admin/keys \
+  -d '{"buckets": ["team-a-*"], "description": "team A deploys"}'
+# {"access_key":"S3RSK7Q2...","secret_key":"...","source":"api","read_only":false,"buckets":["team-a-*"],...}
+
+# Read-only, or limited by an IAM-style policy (the same format as policy files):
+curl -fsS -H "$H" -X POST https://s3.example.com/_admin/keys -d '{"read_only": true}'
+curl -fsS -H "$H" -X POST https://s3.example.com/_admin/keys -d '{"policy": {"Version": "2012-10-17", "Statement": [...]}}'
+
+curl -fsS -H "$H" https://s3.example.com/_admin/keys                       # list (no secrets)
+curl -fsS -H "$H" -X DELETE https://s3.example.com/_admin/keys/S3RSK7Q2...  # revoke
+```
+
+Keys from the command line and the credentials file are listed with `"source": "file"`. They can
+only be changed there. If both define the same access key, the file wins.
+
 **Per-key policies** use IAM's JSON format. Paths are relative to the credentials file. For example,
 this policy gives every key using it a private home prefix:
 

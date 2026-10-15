@@ -36,6 +36,8 @@ First release.
 - Several access keys from a credentials file (reloaded on SIGHUP): read-only keys,
   bucket-limited keys, and IAM-style policies per key or bucket (conditions, variables, explicit
   Deny).
+- Keys can also be created, listed and revoked at runtime through the admin API
+  (`/_admin/keys`).
 
 **Operations**
 - Web console at `/_console/`.

@@ -89,6 +89,8 @@ const PART_BYTES: TableDefinition<&str, u64> = TableDefinition::new("part_bytes"
 /// time in ms of the oldest change not yet replicated). Written in the same transaction as the
 /// change, so a crash never loses one; see crate::replication.
 const REPL: TableDefinition<&[u8], (u64, u64)> = TableDefinition::new("replication_queue");
+/// Access keys created through the admin API: access key -> record (see crate::keys).
+const KEYS: TableDefinition<&str, &[u8]> = TableDefinition::new("access_keys");
 const USAGE_VERSION: u64 = 2;
 /// Contents of the clean-shutdown marker. Older releases wrote an empty marker without
 /// maintaining usage, so any other content (or none) makes the next start recompute usage.
@@ -459,6 +461,13 @@ pub enum Op {
         bucket: String,
         limit: usize,
     },
+    /// Store an access key created through the admin API (refused if it exists).
+    CreateKey {
+        access_key: String,
+        record: Vec<u8>,
+    },
+    /// Remove an access key created through the admin API.
+    DeleteKey(String),
     Flush,
     /// Answered by the writer without touching the database (health checks).
     Ping,
@@ -602,6 +611,7 @@ impl Store {
             txn.open_table(STATE)?;
             txn.open_table(PART_BYTES)?;
             txn.open_table(REPL)?;
+            txn.open_table(KEYS)?;
             txn.commit()?;
         }
         // After a crash or a run of an older release, the counters may not match the data.
@@ -779,6 +789,17 @@ impl Store {
                 seq,
                 since_ms,
             });
+        }
+        Ok(out)
+    }
+
+    /// Access keys created through the admin API: (access key, record).
+    pub fn access_keys(&self) -> S3Result<Vec<(String, Vec<u8>)>> {
+        let txn = self.db.get()?.begin_read()?;
+        let mut out = Vec::new();
+        for e in txn.open_table(KEYS)?.iter()? {
+            let (k, v) = e?;
+            out.push((k.value().to_string(), v.value().to_vec()));
         }
         Ok(out)
     }
@@ -1586,6 +1607,7 @@ fn run_batch(
             usage: txn.open_table(USAGE)?,
             part_bytes: txn.open_table(PART_BYTES)?,
             repl: txn.open_table(REPL)?,
+            keys: txn.open_table(KEYS)?,
         };
         // Replication rule prefixes per bucket, looked up once per batch.
         let mut repl_rules: HashMap<String, Vec<String>> = HashMap::new();
@@ -1652,6 +1674,7 @@ struct Tables<'t> {
     usage: redb::Table<'t, &'static str, (u64, u64)>,
     part_bytes: redb::Table<'t, &'static str, u64>,
     repl: redb::Table<'t, &'static [u8], (u64, u64)>,
+    keys: redb::Table<'t, &'static str, &'static [u8]>,
 }
 
 fn usage_add(tx: &mut Tables, bucket: &str, objects: i64, bytes: i64) -> S3Result<()> {
@@ -2183,6 +2206,17 @@ fn repl_enqueue(tx: &mut Tables, bucket: &str, keys: &[String]) -> S3Result<bool
 fn apply(tx: &mut Tables, op: Op, garbage: &mut Vec<u128>, last_seq: &mut u64) -> S3Result<OpOut> {
     match op {
         Op::Flush | Op::Ping => Ok(OpOut::Done),
+        Op::CreateKey { access_key, record } => {
+            if tx.keys.get(access_key.as_str())?.is_some() {
+                return Err(S3Error::new("KeyAlreadyExists", hyper::StatusCode::CONFLICT, "The access key already exists."));
+            }
+            tx.keys.insert(access_key.as_str(), record.as_slice())?;
+            Ok(OpOut::Done)
+        }
+        Op::DeleteKey(access_key) => match tx.keys.remove(access_key.as_str())? {
+            Some(_) => Ok(OpOut::Done),
+            None => Err(S3Error::new("NoSuchAccessKey", hyper::StatusCode::NOT_FOUND, "The access key does not exist.")),
+        },
         Op::ReplDone { bucket, key, seq } => {
             let k = obj_key(&bucket, &key);
             if tx.repl.get(k.as_slice())?.map(|v| v.value().0) == Some(seq) {

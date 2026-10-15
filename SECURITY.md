@@ -40,8 +40,10 @@ malicious. It does not defend against someone who controls the host.
 - **Replication** writes to other servers with credentials the operator puts in the targets
   file. Only keys that are not limited to some buckets or by a policy can configure it, and the
   target credentials should be limited to the replica buckets.
-- **Operator endpoints:** `/_metrics` can require a token, and `/_admin/backup` is off unless
-  `--admin-token` is set. Empty tokens and the `change-me` placeholders are refused at startup.
+- **Operator endpoints:** `/_metrics` can require a token, and the admin API (`/_admin/backup`,
+  `/_admin/keys`) is off unless `--admin-token` is set. The admin token can read every object (via
+  backups) and create keys, so treat it like the root key. Keys created through the API are stored
+  in the metadata database, so backups contain their secrets. Empty tokens and the `change-me` placeholders are refused at startup.
 - **Secrets in logs:** access logs redact signatures, credentials and tokens in query strings.
 
 **Out of scope:**

@@ -293,7 +293,7 @@ fn text(e: &Entry) -> String {
     s
 }
 
-fn json_str(out: &mut String, v: &str) {
+pub(crate) fn json_str(out: &mut String, v: &str) {
     out.push('"');
     for c in v.chars() {
         match c {

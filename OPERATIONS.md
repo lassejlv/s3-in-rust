@@ -16,7 +16,7 @@ Every option it mentions is documented in the [README](README.md).
   without it, encrypted objects can't be recovered.
 - [ ] **`--metrics-token`:** set it if `/_metrics` is reachable from outside. Per-bucket series are
   only served with a token.
-- [ ] **`--admin-token`:** set it to take online backups. Without it the admin API is off.
+- [ ] **`--admin-token`:** set it to take online backups and manage keys at runtime. Without it the admin API is off.
 - [ ] **A dedicated data disk.** The free-space reserve (`--min-free-space`) keeps the server working
   when it fills up. Other software sharing the disk can still fill it.
 - [ ] **Backups** are scheduled and a restore has been tried ([below](#backups)).

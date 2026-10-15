@@ -8,7 +8,7 @@
 //! serve and `s3rs fsck` accepts.
 
 use super::meta::{ObjectMeta, PartMeta, Storage};
-use super::{BUCKETS, CONFIG, INLINE, OBJECTS, PART_BYTES, PARTS, REPL, STATE, UPLOADS, USAGE, VERSIONS, data_path};
+use super::{BUCKETS, CONFIG, INLINE, KEYS, OBJECTS, PART_BYTES, PARTS, REPL, STATE, UPLOADS, USAGE, VERSIONS, data_path};
 use crate::error::{S3Error, S3Result};
 use crate::util;
 use redb::{Database, ReadableDatabase, ReadableTable};
@@ -51,7 +51,7 @@ pub fn snapshot(db: &Database, root: &Path, dest: &Path) -> S3Result<Plan> {
             }
         })*};
     }
-    copy!(BUCKETS, OBJECTS, INLINE, UPLOADS, PARTS, CONFIG, VERSIONS, USAGE, STATE, PART_BYTES, REPL);
+    copy!(BUCKETS, OBJECTS, INLINE, UPLOADS, PARTS, CONFIG, VERSIONS, USAGE, STATE, PART_BYTES, REPL, KEYS);
     wtx.commit()?;
     drop(out);
 

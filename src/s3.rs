@@ -90,6 +90,8 @@ pub struct Server {
     pub events: Arc<events::Bus>,
     pub replication: Arc<crate::replication::Replicator>,
     key_limit: Option<crate::ratelimit::Limiter>,
+    /// Keys from the command line and credentials file; merged with the stored ones.
+    file_creds: RwLock<Vec<auth::Credential>>,
     anon_limit: Option<crate::ratelimit::Limiter>,
     /// Weak self-reference, for background tasks that must re-check permissions.
     me: std::sync::OnceLock<std::sync::Weak<Server>>,
@@ -390,6 +392,7 @@ impl Server {
             events: opts.events,
             replication: opts.replication,
             key_limit: opts.rate_limit.map(crate::ratelimit::Limiter::new),
+            file_creds: RwLock::new(Vec::new()),
             anon_limit: opts.rate_limit_anonymous.map(crate::ratelimit::Limiter::new),
             me: std::sync::OnceLock::new(),
             req_counter: AtomicU64::new(1),
@@ -920,7 +923,8 @@ impl Server {
     }
 
     /// `GET /_admin/backup`: a tar of a consistent snapshot of the data directory.
-    async fn admin_backup(&self, parts: &Parts) -> S3Result<Resp> {
+    /// The admin API requires `Authorization: Bearer <--admin-token>`.
+    fn check_admin(&self, parts: &Parts) -> S3Result<()> {
         let Some(token) = &self.admin_token else {
             return Err(err::AccessDenied().with_message("The admin API is disabled; start the server with --admin-token"));
         };
@@ -928,6 +932,93 @@ impl Server {
         if !given.is_some_and(|g| !token.is_empty() && util::ct_eq(g.as_bytes(), token.as_bytes())) {
             return Err(err::AccessDenied());
         }
+        Ok(())
+    }
+
+    /// Set the keys from the command line and credentials file (at startup and on SIGHUP), and
+    /// put them in effect together with the stored keys. Returns how many keys are in effect.
+    pub fn set_file_credentials(&self, creds: Vec<auth::Credential>) -> S3Result<usize> {
+        *self.file_creds.write().unwrap() = creds;
+        self.reload_keys()
+    }
+
+    fn reload_keys(&self) -> S3Result<usize> {
+        let Some(a) = &self.auth else { return Ok(0) };
+        let stored = self.store.access_keys()?;
+        let all = crate::keys::merge(&self.file_creds.read().unwrap(), &stored);
+        let n = all.len();
+        a.replace(all);
+        Ok(n)
+    }
+
+    /// `GET /_admin/keys` lists keys; `POST /_admin/keys` creates one (JSON body, see
+    /// crate::keys::parse_request) and returns its secret, once; `DELETE /_admin/keys/<key>`
+    /// revokes one created this way.
+    async fn admin_keys(&self, parts: &Parts, body: Incoming) -> S3Result<Resp> {
+        self.check_admin(parts)?;
+        if self.auth.is_none() {
+            return Err(err::InvalidRequest().with_message("Authentication is disabled (--anonymous)"));
+        }
+        let json = |j: crate::access::Json| {
+            let mut r = Resp::ok();
+            r.set("content-type", "application/json");
+            r.body = Body::full(j.to_text());
+            r
+        };
+        let target = parts.uri.path().strip_prefix("/_admin/keys").unwrap_or("");
+        match (&parts.method, target) {
+            (&Method::GET, "" | "/") => {
+                let file = self.file_creds.read().unwrap().clone();
+                let mut list: Vec<crate::access::Json> =
+                    file.iter().map(|c| crate::keys::describe(&c.access_key, "file", None, Some(c))).collect();
+                for (ak, raw) in self.store.access_keys()? {
+                    if let Some(r) = crate::keys::Record::decode(&raw) {
+                        list.push(crate::keys::describe(&ak, "api", Some(&r), None));
+                    }
+                }
+                Ok(json(crate::access::Json::Obj(vec![("keys".into(), crate::access::Json::Arr(list))])))
+            }
+            (&Method::POST, "" | "/") => {
+                let body = http_body_util::BodyExt::collect(http_body_util::Limited::new(body, 64 * 1024))
+                    .await
+                    .map_err(|_| err::InvalidArgument().with_message("The request body is too large"))?
+                    .to_bytes();
+                let text = std::str::from_utf8(&body).map_err(|_| err::InvalidArgument())?;
+                let (access_key, record) = crate::keys::parse_request(text, util::now_ms())?;
+                if self.file_creds.read().unwrap().iter().any(|c| c.access_key == access_key) {
+                    return Err(S3Error::new("KeyAlreadyExists", StatusCode::CONFLICT, "The access key already exists."));
+                }
+                let secret = record.secret.clone();
+                let info = crate::keys::describe(&access_key, "api", Some(&record), None);
+                self.store.submit(Op::CreateKey { access_key: access_key.clone(), record: record.encode() }).await?;
+                self.reload_keys()?;
+                elog!("admin: created access key {access_key}");
+                let crate::access::Json::Obj(mut fields) = info else { unreachable!() };
+                fields.insert(1, ("secret_key".into(), crate::access::Json::Str(secret)));
+                let mut r = json(crate::access::Json::Obj(fields));
+                r.status = StatusCode::CREATED;
+                Ok(r)
+            }
+            (&Method::DELETE, t) if t.len() > 1 => {
+                let access_key = uri_decode(&t[1..], false).ok_or_else(err::InvalidArgument)?;
+                if self.file_creds.read().unwrap().iter().any(|c| c.access_key == access_key) {
+                    return Err(S3Error::new(
+                        "KeyInCredentialsFile",
+                        StatusCode::CONFLICT,
+                        "This key comes from the command line or the credentials file; remove it there.",
+                    ));
+                }
+                self.store.submit(Op::DeleteKey(access_key.clone())).await?;
+                self.reload_keys()?;
+                elog!("admin: revoked access key {access_key}");
+                Ok(Resp::new(StatusCode::NO_CONTENT))
+            }
+            _ => Err(err::MethodNotAllowed()),
+        }
+    }
+
+    async fn admin_backup(&self, parts: &Parts) -> S3Result<Resp> {
+        self.check_admin(parts)?;
         if parts.method != Method::GET {
             return Err(err::MethodNotAllowed());
         }
@@ -1031,6 +1122,9 @@ impl Server {
         }
         if !vhost && parts.uri.path() == "/_admin/backup" {
             return self.admin_backup(&parts).await;
+        }
+        if !vhost && (parts.uri.path() == "/_admin/keys" || parts.uri.path().starts_with("/_admin/keys/")) {
+            return self.admin_keys(&parts, body).await;
         }
         if !vhost && self.console && (parts.uri.path() == "/_console" || parts.uri.path().starts_with("/_console/")) {
             return self.console_asset(&parts);

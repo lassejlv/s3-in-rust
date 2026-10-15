@@ -27,6 +27,16 @@ impl Limiter {
         self.check_at(key, Instant::now())
     }
 
+    /// How long until `key` has a token again, without taking one (`None`: it has one now).
+    pub fn wait(&self, key: &str) -> Option<Duration> {
+        let now = Instant::now();
+        let shard = key.bytes().fold(0usize, |h, b| h.wrapping_mul(31).wrapping_add(b as usize)) % SHARDS;
+        let map = self.shards[shard].lock().unwrap();
+        let (tokens, last) = map.get(key)?;
+        let tokens = (*tokens + now.saturating_duration_since(*last).as_secs_f64() * self.rate).min(self.burst);
+        (tokens < 1.0).then(|| Duration::from_secs_f64((1.0 - tokens) / self.rate))
+    }
+
     fn check_at(&self, key: &str, now: Instant) -> Result<(), Duration> {
         let shard = key.bytes().fold(0usize, |h, b| h.wrapping_mul(31).wrapping_add(b as usize)) % SHARDS;
         let mut map = self.shards[shard].lock().unwrap();

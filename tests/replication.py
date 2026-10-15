@@ -191,12 +191,12 @@ a.put_object(Bucket="src", Key="big", Body=rng.randbytes(300_000), CacheControl=
              ContentDisposition="attachment", Tagging="env=prod&team=a%20b")
 a.put_object(Bucket="src", Key="dir/ünï cødé+%.txt", Body=b"odd key")
 a.put_object(Bucket="src", Key="secret", Body=rng.randbytes(80_000), ServerSideEncryption="AES256")
-mp = a.create_multipart_upload(Bucket="src", Key="multi", Metadata={"kind": "mp"})
+mp = a.create_multipart_upload(Bucket="src", Key="multi", Metadata={"kind": "mp"}, ChecksumAlgorithm="SHA256")
 parts = [rng.randbytes(5 * 1024 * 1024), rng.randbytes(5 * 1024 * 1024), rng.randbytes(1234)]
-etags = [a.upload_part(Bucket="src", Key="multi", UploadId=mp["UploadId"], PartNumber=i + 1, Body=d)["ETag"]
-         for i, d in enumerate(parts)]
-a.complete_multipart_upload(Bucket="src", Key="multi", UploadId=mp["UploadId"],
-                            MultipartUpload={"Parts": [{"ETag": e, "PartNumber": i + 1} for i, e in enumerate(etags)]})
+ups = [a.upload_part(Bucket="src", Key="multi", UploadId=mp["UploadId"], PartNumber=i + 1, Body=d, ChecksumAlgorithm="SHA256")
+       for i, d in enumerate(parts)]
+a.complete_multipart_upload(Bucket="src", Key="multi", UploadId=mp["UploadId"], MultipartUpload={"Parts": [
+    {"ETag": u["ETag"], "ChecksumSHA256": u["ChecksumSHA256"], "PartNumber": i + 1} for i, u in enumerate(ups)]})
 ssec = {"SSECustomerAlgorithm": "AES256", "SSECustomerKey": os.urandom(32)}
 a.put_object(Bucket="src", Key="customer-key", Body=b"only the client has the key", **ssec)
 keys = ["small", "big", "dir/ünï cødé+%.txt", "secret", "multi"]
@@ -205,6 +205,9 @@ for k in keys:
     same(a, b, "src", "dst", k)
 assert b.head_object(Bucket="dst", Key="secret").get("ServerSideEncryption") == "AES256"
 assert b.head_object(Bucket="dst", Key="big")["CacheControl"] == "max-age=60"
+# Multipart checksums are replicated too.
+src_ck = a.head_object(Bucket="src", Key="multi", ChecksumMode="ENABLED")["ChecksumSHA256"]
+assert src_ck.endswith("-3") and b.head_object(Bucket="dst", Key="multi", ChecksumMode="ENABLED").get("ChecksumSHA256") == src_ck
 wait_for(lambda: metric(PORT_A, "s3rs_replication_pending") == 0, "queue drained")
 assert absent(b, "dst", "customer-key"), "an SSE-C object was replicated"
 assert metric(PORT_A, 's3rs_replication_total{result="skipped"}') >= 1

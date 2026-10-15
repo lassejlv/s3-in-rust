@@ -836,8 +836,21 @@ impl Replicator {
         wrap: Option<WrapKey>,
     ) -> Result<(), String> {
         let what = |m: &str| format!("{}: {m} {bucket}/{key}", t.id);
+        // The object's checksums go along when every part's is known: the target verifies
+        // them and keeps the same checksum.
+        let part_sums: Vec<&str> = meta
+            .headers
+            .iter()
+            .find(|(k, _)| k == crate::store::PART_CHECKSUMS)
+            .map(|(_, list)| list.split(',').collect())
+            .unwrap_or_default();
+        let checksum = meta.checksum.as_ref().filter(|_| part_sums.len() == parts.len());
         let mut req = Request::new(hyper::Method::POST, bucket, Some(key)).query(&[("uploads", "")]);
         req.headers = headers;
+        if let Some((algo, v)) = checksum {
+            req.headers.push(("x-amz-checksum-algorithm".into(), algo.name().into()));
+            req.headers.push(("x-amz-checksum-type".into(), crate::checksum::Kind::of(v).name().into()));
+        }
         let r = self.send(t, req, None).await?;
         let upload_id = (r.status == 200)
             .then(|| xml::parse(&String::from_utf8_lossy(&r.body)))
@@ -850,9 +863,12 @@ impl Replicator {
             for (i, len) in parts.iter().enumerate() {
                 let n = (i + 1).to_string();
                 let body = self.read(meta, None, start, *len, wrap.clone()).await?;
-                let req = Request::new(hyper::Method::PUT, bucket, Some(key))
+                let mut req = Request::new(hyper::Method::PUT, bucket, Some(key))
                     .query(&[("partNumber", &n), ("uploadId", &upload_id)])
                     .stream(body, *len);
+                if let Some((algo, _)) = checksum {
+                    req.headers.push((algo.header().into(), part_sums[i].into()));
+                }
                 let r = self.send(t, req, Some(*len)).await?;
                 let etag = r.header("etag").filter(|_| r.status == 200).map(String::from);
                 etags.push(etag.ok_or_else(|| format!("{} part {n}: {}", what("UploadPart"), r.describe()))?);
@@ -860,7 +876,11 @@ impl Replicator {
             }
             let mut x = crate::xml::Xml::new("CompleteMultipartUpload");
             for (i, etag) in etags.iter().enumerate() {
-                x.open("Part").elem("PartNumber", (i + 1).to_string()).elem("ETag", etag).close("Part");
+                x.open("Part").elem("PartNumber", (i + 1).to_string()).elem("ETag", etag);
+                if let Some((algo, _)) = checksum {
+                    x.elem(algo.xml_name(), part_sums[i]);
+                }
+                x.close("Part");
             }
             let doc = x.finish("CompleteMultipartUpload");
             let req = Request::new(hyper::Method::POST, bucket, Some(key)).query(&[("uploadId", &upload_id)]).bytes(doc);

@@ -647,17 +647,32 @@ impl SegReader {
 /// MD5 of a stored data file's plaintext (decrypted with `key`, which also authenticates
 /// every chunk), read in bounded steps.
 pub fn segment_md5(path: &std::path::Path, seg_len: u64, key: Option<&WrapKey>) -> io::Result<[u8; 16]> {
+    segment_md5_paced(path, seg_len, key, &mut |_| true)
+}
+
+/// `segment_md5`, calling `pace` with the number of bytes after each chunk read; it may sleep
+/// to limit the read rate, and returns false to stop (an `Interrupted` error).
+pub fn segment_md5_paced(
+    path: &std::path::Path,
+    seg_len: u64,
+    key: Option<&WrapKey>,
+    pace: &mut dyn FnMut(u64) -> bool,
+) -> io::Result<[u8; 16]> {
     use md5::Digest;
+    const CHUNK: u64 = 1 << 20;
     let mut r = SegReader::open_path(path, seg_len, key)?;
     let mut h = md5::Md5::new();
-    let mut buf = Vec::with_capacity(4 << 20);
+    let mut buf = Vec::with_capacity(CHUNK as usize);
     let mut off = 0;
     while off < seg_len {
-        let n = (seg_len - off).min(4 << 20);
+        let n = (seg_len - off).min(CHUNK);
         buf.clear();
         r.read(off, n, &mut buf)?;
         h.update(&buf);
         off += n;
+        if !pace(n) {
+            return Err(io::Error::new(io::ErrorKind::Interrupted, "stopped"));
+        }
     }
     Ok(h.finalize().into())
 }

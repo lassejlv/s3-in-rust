@@ -162,6 +162,10 @@ try:
     # Guessing the admin token is slowed down.
     codes = [admin("GET", token=f"guess{i}")[0] for i in range(4)]
     assert codes[0] == 403 and 503 in codes, codes
+    # While throttled, even the right token is refused (else guessing would go on unhindered).
+    assert admin("GET")[0] == 503
+    time.sleep(2.5)
+    assert admin("GET")[0] == 200
 
     log = open(f"{work}/log").read()
     assert k["secret_key"] not in log and "readersecret0123" not in log

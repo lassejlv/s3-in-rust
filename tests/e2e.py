@@ -268,6 +268,18 @@ def t_multipart_checksums():
         again = s3.complete_multipart_upload(Bucket=B, Key=key, UploadId=up["UploadId"], MultipartUpload={"Parts": parts})
         assert again["ETag"] == r["ETag"]
         s3.delete_object(Bucket=B, Key=key)
+    # Without a declared algorithm, a whole-object checksum sent at completion is checked too
+    # (a full-object CRC is fine), and a 1-part upload's part checksum is the part's.
+    up = s3.create_multipart_upload(Bucket=B, Key="mp-ck-undeclared")
+    r = s3.upload_part(Bucket=B, Key="mp-ck-undeclared", UploadId=up["UploadId"], PartNumber=1, Body=b"abc", ChecksumAlgorithm="CRC32")
+    part = [{"PartNumber": 1, "ETag": r["ETag"], "ChecksumCRC32": r["ChecksumCRC32"]}]
+    expect_error("BadDigest", lambda: s3.complete_multipart_upload(Bucket=B, Key="mp-ck-undeclared", UploadId=up["UploadId"],
+                                                                   ChecksumCRC32="AAAAAA==", MultipartUpload={"Parts": part}))
+    s3.complete_multipart_upload(Bucket=B, Key="mp-ck-undeclared", UploadId=up["UploadId"], ChecksumCRC32=crc(b"abc"),
+                                 MultipartUpload={"Parts": part})
+    assert s3.head_object(Bucket=B, Key="mp-ck-undeclared", ChecksumMode="ENABLED")["ChecksumCRC32"] == crc(b"abc")
+    assert s3.head_object(Bucket=B, Key="mp-ck-undeclared", PartNumber=1)["ChecksumCRC32"] == crc(b"abc")
+    s3.delete_object(Bucket=B, Key="mp-ck-undeclared")
     # A wrong part checksum at completion is refused.
     up = s3.create_multipart_upload(Bucket=B, Key="mp-ck-bad", ChecksumAlgorithm="CRC32")
     r = s3.upload_part(Bucket=B, Key="mp-ck-bad", UploadId=up["UploadId"], PartNumber=1, Body=b"abc", ChecksumAlgorithm="CRC32")
@@ -307,6 +319,9 @@ def t_conditional_deletes():
     etag = s3.put_object(Bucket=B, Key="cdel", Body=b"1")["ETag"]
     expect_error("PreconditionFailed", lambda: s3.put_object(Bucket=B, Key="cdel", Body=b"2", IfNoneMatch=etag))
     s3.put_object(Bucket=B, Key="cdel", Body=b"2", IfNoneMatch='"other"')
+    etag = s3.head_object(Bucket=B, Key="cdel")["ETag"]
+    expect_error("PreconditionFailed", lambda: s3.put_object(Bucket=B, Key="cdel", Body=b"3", IfNoneMatch=f'"x", {etag}'))
+    expect_error("PreconditionFailed", lambda: s3.put_object(Bucket=B, Key="cdel", Body=b"3", IfMatch=etag, IfNoneMatch=etag))
     s3.delete_object(Bucket=B, Key="cdel")
 
 

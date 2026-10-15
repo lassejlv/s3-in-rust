@@ -286,12 +286,14 @@ pub(crate) fn parse_range(spec: &str, size: u64) -> Option<S3Result<(u64, u64)>>
 }
 
 fn write_cond(h: &HeaderMap) -> Option<WriteCond> {
-    match header(h, "if-none-match").map(str::trim) {
-        Some("*") => return Some(WriteCond::NotExists),
-        Some(e) if header(h, "if-match").is_none() => return Some(WriteCond::NotMatches(e.to_string())),
-        _ => {}
+    let none_match = header(h, "if-none-match")
+        .map(str::trim)
+        .map(|v| if v.split(',').any(|e| e.trim() == "*") { WriteCond::NotExists } else { WriteCond::NotMatches(v.to_string()) });
+    let matches = header(h, "if-match").map(|v| WriteCond::Matches(v.to_string()));
+    match (matches, none_match) {
+        (Some(a), Some(b)) => Some(WriteCond::All(vec![a, b])),
+        (a, b) => a.or(b),
     }
-    header(h, "if-match").map(|v| WriteCond::Matches(v.to_string()))
 }
 
 const WEBSITE_REDIRECT: &str = "x-amz-website-redirect-location";
@@ -991,14 +993,21 @@ impl Server {
         let Some(token) = &self.admin_token else {
             return Err(err::AccessDenied().with_message("The admin API is disabled; start the server with --admin-token"));
         };
+        // About one wrong token per second per client address: an address that used up its
+        // allowance is refused before its token is even looked at.
+        let ip = self.client(&parts.headers, peer).ip.to_string();
+        let slow_down = |wait: std::time::Duration| {
+            self.metrics.throttled.fetch_add(1, Ordering::Relaxed);
+            Err(S3Error::new("SlowDown", StatusCode::SERVICE_UNAVAILABLE, "Please reduce your request rate.")
+                .with_header("retry-after", wait.as_secs().max(1).to_string()))
+        };
+        if let Some(wait) = self.admin_failures.wait(&ip) {
+            return slow_down(wait);
+        }
         let given = header(&parts.headers, "authorization").and_then(|h| h.strip_prefix("Bearer ")).map(str::trim);
         if !given.is_some_and(|g| !token.is_empty() && util::ct_eq(g.as_bytes(), token.as_bytes())) {
-            // About one wrong token per second per client address.
-            let ip = self.client(&parts.headers, peer).ip;
-            if let Err(wait) = self.admin_failures.check(&ip.to_string()) {
-                self.metrics.throttled.fetch_add(1, Ordering::Relaxed);
-                return Err(S3Error::new("SlowDown", StatusCode::SERVICE_UNAVAILABLE, "Please reduce your request rate.")
-                    .with_header("retry-after", wait.as_secs().max(1).to_string()));
+            if let Err(wait) = self.admin_failures.check(&ip) {
+                return slow_down(wait);
             }
             return Err(err::AccessDenied());
         }
@@ -1031,16 +1040,14 @@ impl Server {
         if self.auth.is_none() || now < self.next_key_expiry.load(Ordering::SeqCst) {
             return;
         }
-        let expired: Vec<String> = match self.store.access_keys() {
-            Ok(keys) => keys
-                .into_iter()
-                .filter(|(_, raw)| crate::keys::Record::decode(raw).is_some_and(|r| r.expired(now)))
-                .map(|(k, _)| k)
-                .collect(),
+        let expired: Vec<(String, Vec<u8>)> = match self.store.access_keys() {
+            Ok(keys) => {
+                keys.into_iter().filter(|(_, raw)| crate::keys::Record::decode(raw).is_some_and(|r| r.expired(now))).collect()
+            }
             Err(_) => return,
         };
-        for k in &expired {
-            if self.store.submit(Op::DeleteKey(k.clone())).await.is_ok() {
+        for (k, record) in expired {
+            if let Ok(OpOut::More(true)) = self.store.submit(Op::DeleteKeyIf { access_key: k.clone(), record }).await {
                 elog!("admin: temporary access key {k} expired and was removed");
             }
         }
@@ -1897,25 +1904,26 @@ impl Server {
                 Ok(Resp::new(StatusCode::NO_CONTENT))
             }
             ObjectOp::Delete => {
-                let OpOut::Deleted(mut res) = self
-                    .store
-                    .submit(Op::DeleteObjects {
-                        bucket: bucket.into(),
-                        items: vec![(key.into(), version.clone())],
-                        conds: vec![delete_cond(
-                            r.header("if-match"),
-                            r.header("x-amz-if-match-size"),
-                            r.header("x-amz-if-match-last-modified-time"),
-                        )?],
-                        bypass: self.bypass_governance(r, bucket, key),
-                        replica: r.replica,
-                    })
-                    .await?
-                else {
+                let items = vec![(key.to_string(), version.clone())];
+                let op = Op::DeleteObjects {
+                    bucket: bucket.into(),
+                    items: items.clone(),
+                    conds: vec![delete_cond(
+                        r.header("if-match"),
+                        r.header("x-amz-if-match-size"),
+                        r.header("x-amz-if-match-last-modified-time"),
+                    )?],
+                    bypass: self.bypass_governance(r, bucket, key),
+                    replica: r.replica,
+                };
+                let (op, notify) = self.removed_events(r, bucket, &items, op);
+                let OpOut::Deleted(mut res) = self.store.submit(op).await? else {
                     return Err(S3Error::internal("unexpected writer reply"));
                 };
+                if let Some(n) = notify {
+                    n.done();
+                }
                 let outcome = res.pop().ok_or_else(|| S3Error::internal("missing delete result"))??;
-                self.notify_removed(r, bucket, key, version.as_deref(), &outcome).await;
                 let mut resp = Resp::new(StatusCode::NO_CONTENT);
                 if let Some(v) = &outcome.version_id {
                     resp.set("x-amz-version-id", v);
@@ -2347,42 +2355,35 @@ impl Server {
         }
     }
 
-    /// Publish an event for a new object. Returns once it is queued durably for webhooks, so
-    /// an acknowledged write always has its event.
-    async fn notify_created(&self, r: &Req, name: &'static str, bucket: &str, key: &str, m: &ObjectMeta) {
-        let mut ev = self.event(&r.principal, r.client.ip, &r.rid, name, bucket, key);
-        ev.size = m.size;
-        ev.etag = m.etag.clone();
-        ev.version = m.version.clone();
-        ev.sequencer = m.seq;
-        self.events.emit(ev).await;
+    /// `op`, wrapped so that the "created" event of the object it writes (`template` filled in
+    /// from the result) is queued in the same transaction.
+    fn created_events(&self, template: events::Event, bucket: &str, op: Op) -> (Op, Option<events::Notify>) {
+        self.events.wrap(bucket, op, move |out| match out {
+            OpOut::Object(m) => vec![events::Event {
+                size: m.size,
+                etag: m.etag.clone(),
+                version: m.version.clone(),
+                sequencer: m.seq,
+                time_ms: now_ms(),
+                ..template.clone()
+            }],
+            _ => Vec::new(),
+        })
     }
 
-    async fn notify_removed(&self, r: &Req, bucket: &str, key: &str, requested: Option<&str>, o: &store::DeleteOutcome) {
-        if let Some(ev) = self.removed_event(r, bucket, key, requested, o) {
-            self.events.emit(ev).await;
-        }
-    }
-
-    /// `requested` is the version id the client asked to delete, if any.
-    fn removed_event(
-        &self,
-        r: &Req,
-        bucket: &str,
-        key: &str,
-        requested: Option<&str>,
-        o: &store::DeleteOutcome,
-    ) -> Option<events::Event> {
-        // Deleting a missing key or version succeeds but changes nothing: no event.
-        if !o.removed {
-            return None;
-        }
-        let marker_created = requested.is_none() && o.delete_marker;
-        let name = if marker_created { "ObjectRemoved:DeleteMarkerCreated" } else { "ObjectRemoved:Delete" };
-        let mut ev = self.event(&r.principal, r.client.ip, &r.rid, name, bucket, key);
-        ev.version = if marker_created { o.version_id.clone().filter(|v| v != "null") } else { requested.map(str::to_string) };
-        ev.sequencer = o.seq;
-        Some(ev)
+    /// `op` (a DeleteObjects of `items`), wrapped so that the "removed" events of what it
+    /// deletes are queued in the same transaction.
+    fn removed_events(&self, r: &Req, bucket: &str, items: &[(String, Option<String>)], op: Op) -> (Op, Option<events::Notify>) {
+        let template = self.event(&r.principal, r.client.ip, &r.rid, "ObjectRemoved:Delete", bucket, "");
+        let items = items.to_vec();
+        self.events.wrap(bucket, op, move |out| match out {
+            OpOut::Deleted(results) => items
+                .iter()
+                .zip(results)
+                .filter_map(|((key, requested), res)| removed_event(&template, key, requested.as_deref(), res.as_ref().ok()?))
+                .collect(),
+            _ => Vec::new(),
+        })
     }
 
     /// MinIO-compatible ListenBucketNotification: a never-ending JSON-lines stream of events
@@ -2708,15 +2709,19 @@ impl Server {
             delete_marker: false,
         };
         let cond = write_cond(&r.parts.headers);
-        let out =
-            self.store.submit_owning(Op::PutObject { bucket: bucket.into(), key: key.into(), meta, inline, cond }, files).await?;
+        let template = self.event(&r.principal, r.client.ip, &r.rid, "ObjectCreated:Put", bucket, key);
+        let op = Op::PutObject { bucket: bucket.into(), key: key.into(), meta, inline, cond };
+        let (op, notify) = self.created_events(template, bucket, op);
+        let out = self.store.submit_owning(op, files).await?;
+        if let Some(n) = notify {
+            n.done();
+        }
         let mut resp = Resp::ok();
         resp.set("etag", &etag);
         set_sse_headers(&mut resp, &headers);
         if let OpOut::Object(m) = &out {
             set_version_header(&mut resp, m);
             self.set_expiration(&mut resp, bucket, key, m);
-            self.notify_created(r, "ObjectCreated:Put", bucket, key, m).await;
         }
         if let Some((a, v)) = &ing.checksum {
             resp.set(a.header(), v);
@@ -2782,7 +2787,10 @@ impl Server {
             if !meta.tags.is_empty() {
                 resp.set("x-amz-tagging-count", &meta.tags.len().to_string());
             }
-            self.set_expiration(&mut resp, bucket, key_name, &meta);
+            // Expiration rules apply to current versions only.
+            if r.q("versionId").is_none() {
+                self.set_expiration(&mut resp, bucket, key_name, &meta);
+            }
             for (q, hname) in [
                 ("response-content-type", "content-type"),
                 ("response-content-language", "content-language"),
@@ -2815,7 +2823,8 @@ impl Server {
                 resp.set("x-amz-mp-parts-count", &segs.len().to_string());
                 // The part's own checksum (a single-part object's is the object's).
                 if let Some((a, v)) = &meta.checksum {
-                    let part = if segs.len() == 1 { Some(v.as_str()) } else { part_checksums(&meta).get(pn - 1).copied() };
+                    let part =
+                        if meta.etag.contains('-') { part_checksums(&meta).get(pn - 1).copied() } else { Some(v.as_str()) };
                     if let Some(p) = part {
                         resp.set("x-amz-checksum-type", crate::checksum::Kind::of(v).name());
                         resp.set(a.header(), p);
@@ -2952,7 +2961,9 @@ impl Server {
                     .map_err(S3Error::internal)?;
                     match res {
                         Ok((id, md5, sum)) => {
-                            if sum.is_some() {
+                            // The copy is one part now: a composite (per-part) checksum no
+                            // longer describes it.
+                            if sum.is_some() || checksum.as_ref().is_some_and(|(_, v)| v.contains('-')) {
                                 checksum = sum;
                             }
                             (Storage::Segments(vec![(id, size)]), vec![id], Some(md5))
@@ -3004,10 +3015,13 @@ impl Server {
             };
             let mtime = meta.mtime_ms;
             let cond = write_cond(&r.parts.headers);
-            let out = self
-                .store
-                .submit_owning(Op::PutObject { bucket: bucket.into(), key: key.into(), meta, inline, cond }, files)
-                .await?;
+            let template = self.event(&r.principal, r.client.ip, &r.rid, "ObjectCreated:Copy", bucket, key);
+            let op = Op::PutObject { bucket: bucket.into(), key: key.into(), meta, inline, cond };
+            let (op, notify) = self.created_events(template, bucket, op);
+            let out = self.store.submit_owning(op, files).await?;
+            if let Some(n) = notify {
+                n.done();
+            }
             let mut x = Xml::new("CopyObjectResult");
             let new_etag = match &out {
                 OpOut::Object(m) => m.etag.clone(),
@@ -3025,7 +3039,6 @@ impl Server {
             }
             if let OpOut::Object(m) = &out {
                 set_version_header(&mut resp, m);
-                self.notify_created(r, "ObjectCreated:Copy", bucket, key, m).await;
             }
             return Ok(resp);
         }
@@ -3317,17 +3330,15 @@ impl Server {
             seq: 0,
             delete_marker: false,
         };
-        let out = self
-            .store
-            .submit_owning(Op::PutObject { bucket: bucket.into(), key: key.clone(), meta, inline, cond: None }, files)
-            .await?;
+        let template = self.event(&who, client.ip, rid, "ObjectCreated:Post", bucket, &key);
+        let op = Op::PutObject { bucket: bucket.into(), key: key.clone(), meta, inline, cond: None };
+        let (op, notify) = self.created_events(template, bucket, op);
+        let out = self.store.submit_owning(op, files).await?;
+        if let Some(n) = notify {
+            n.done();
+        }
         let version = match &out {
-            OpOut::Object(m) => {
-                let mut ev = self.event(&who, client.ip, rid, "ObjectCreated:Post", bucket, &key);
-                (ev.size, ev.etag, ev.version, ev.sequencer) = (m.size, m.etag.clone(), m.version.clone(), m.seq);
-                self.events.emit(ev).await;
-                m.version.clone()
-            }
+            OpOut::Object(m) => m.version.clone(),
             _ => None,
         };
 
@@ -3421,10 +3432,14 @@ impl Server {
         }
         let cond = write_cond(&r.parts.headers);
         let op = Op::Complete { bucket: bucket.into(), key: key.into(), upload, parts, checksum, cond };
+        let template = self.event(&r.principal, r.client.ip, &r.rid, "ObjectCreated:CompleteMultipartUpload", bucket, key);
+        let (op, notify) = self.created_events(template, bucket, op);
         let meta = match self.store.submit(op).await {
             Ok(OpOut::Object(meta)) => {
-                self.notify_created(r, "ObjectCreated:CompleteMultipartUpload", bucket, key, &meta).await;
                 self.completed.lock().unwrap().remember(upload, bucket, key, &meta);
+                if let Some(n) = notify {
+                    n.done();
+                }
                 meta
             }
             Ok(_) => return Err(S3Error::internal("unexpected writer reply")),
@@ -3477,20 +3492,15 @@ impl Server {
             && valid
                 .iter()
                 .all(|(k, _)| self.authorize(&r.principal, "s3:BypassGovernanceRetention", Some(bucket), Some(k), &ctx).is_ok());
-        let OpOut::Deleted(results) = self
-            .store
-            .submit(Op::DeleteObjects { bucket: bucket.into(), items: valid.clone(), conds, bypass, replica: false })
-            .await?
-        else {
+        let op = Op::DeleteObjects { bucket: bucket.into(), items: valid.clone(), conds, bypass, replica: false };
+        let (op, notify) = self.removed_events(r, bucket, &valid, op);
+        let OpOut::Deleted(results) = self.store.submit(op).await? else {
             return Err(S3Error::internal("unexpected writer reply"));
         };
+        if let Some(n) = notify {
+            n.done();
+        }
         let mut x = Xml::new("DeleteResult");
-        let evs = valid
-            .iter()
-            .zip(&results)
-            .filter_map(|((k, requested), res)| self.removed_event(r, bucket, k, requested.as_deref(), res.as_ref().ok()?))
-            .collect();
-        self.events.emit_all(evs).await;
         for ((k, requested), res) in valid.iter().zip(results) {
             match res {
                 Ok(_) if quiet => {}
@@ -3528,6 +3538,28 @@ impl Server {
 /// owner's, which BucketOwnerEnforced allows).
 fn xml_acl_name(acl: CannedAcl) -> &'static str {
     if acl == CannedAcl::Private { "bucket-owner-full-control" } else { acl.as_str() }
+}
+
+/// The event for one deleted key (`requested`: the version the client asked to delete), or
+/// none if nothing was there to delete.
+fn removed_event(
+    template: &events::Event,
+    key: &str,
+    requested: Option<&str>,
+    o: &store::DeleteOutcome,
+) -> Option<events::Event> {
+    if !o.removed {
+        return None;
+    }
+    let marker_created = requested.is_none() && o.delete_marker;
+    Some(events::Event {
+        name: if marker_created { "ObjectRemoved:DeleteMarkerCreated" } else { "ObjectRemoved:Delete" },
+        key: key.to_string(),
+        version: if marker_created { o.version_id.clone().filter(|v| v != "null") } else { requested.map(str::to_string) },
+        sequencer: o.seq,
+        time_ms: now_ms(),
+        ..template.clone()
+    })
 }
 
 /// Conditions on a delete, from headers or a DeleteObjects entry.

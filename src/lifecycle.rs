@@ -209,24 +209,46 @@ pub struct Stats {
 }
 
 /// Run one sweep over all buckets. Returns (objects expired, uploads aborted).
-pub async fn sweep(store: &Arc<Store>, day_secs: u64, events: Option<&crate::events::Bus>) -> S3Result<(u64, u64)> {
-    let notify = |bucket: &str, removed: &[crate::store::Removed]| {
-        let bus = events?;
-        let evs = removed.iter().map(|r| crate::events::Event {
-            name: if r.marker_created { "LifecycleExpiration:DeleteMarkerCreated" } else { "LifecycleExpiration:Delete" },
-            bucket: bucket.to_string(),
-            key: r.key.clone(),
-            size: r.size,
-            etag: r.etag.clone(),
-            version: r.version.clone(),
-            principal: "s3.amazonaws.com".to_string(),
-            source_ip: String::new(),
-            request_id: String::new(),
-            time_ms: util::now_ms(),
-            sequencer: r.seq,
-        });
-        Some(bus.emit_all(evs.collect()))
+/// Submit a removal, with its LifecycleExpiration events queued in the same transaction.
+async fn submit_removal(store: &Store, events: Option<&Arc<crate::events::Bus>>, bucket: &str, op: Op) -> S3Result<OpOut> {
+    let (op, notify) = match events {
+        Some(bus) => {
+            let b = bucket.to_string();
+            bus.wrap(bucket, op, move |out| match out {
+                OpOut::Removed(removed) => removed
+                    .iter()
+                    .map(|r| crate::events::Event {
+                        name: if r.marker_created {
+                            "LifecycleExpiration:DeleteMarkerCreated"
+                        } else {
+                            "LifecycleExpiration:Delete"
+                        },
+                        bucket: b.clone(),
+                        key: r.key.clone(),
+                        size: r.size,
+                        etag: r.etag.clone(),
+                        version: r.version.clone(),
+                        principal: "s3.amazonaws.com".to_string(),
+                        source_ip: String::new(),
+                        request_id: String::new(),
+                        time_ms: util::now_ms(),
+                        sequencer: r.seq,
+                    })
+                    .collect(),
+                _ => Vec::new(),
+            })
+        }
+        None => (op, None),
     };
+    let out = store.submit(op).await?;
+    if let Some(n) = notify {
+        n.done();
+    }
+    Ok(out)
+}
+
+/// Run one sweep over all buckets. Returns (objects expired, uploads aborted).
+pub async fn sweep(store: &Arc<Store>, day_secs: u64, events: Option<&Arc<crate::events::Bus>>) -> S3Result<(u64, u64)> {
     let (mut expired, mut aborted) = (0u64, 0u64);
     let st = store.clone();
     let buckets = tokio::task::spawn_blocking(move || st.list_buckets()).await.map_err(crate::error::S3Error::internal)??;
@@ -250,12 +272,10 @@ pub async fn sweep(store: &Arc<Store>, day_secs: u64, events: Option<&crate::eve
                         .map(|(k, m)| (k.clone(), m.mtime_ms))
                         .collect();
                     if !due.is_empty()
-                        && let Ok(OpOut::Removed(removed)) = store.submit(Op::Expire { bucket: bucket.clone(), items: due }).await
+                        && let Ok(OpOut::Removed(removed)) =
+                            submit_removal(store, events, &bucket, Op::Expire { bucket: bucket.clone(), items: due }).await
                     {
                         expired += removed.len() as u64;
-                        if let Some(queued) = notify(&bucket, &removed) {
-                            queued.await;
-                        }
                     }
                     if page.len() < 1000 {
                         break;
@@ -296,12 +316,9 @@ pub async fn sweep(store: &Arc<Store>, day_secs: u64, events: Option<&crate::eve
                         .collect();
                     if !due.is_empty()
                         && let Ok(OpOut::Removed(removed)) =
-                            store.submit(Op::PurgeVersions { bucket: bucket.clone(), items: due }).await
+                            submit_removal(store, events, &bucket, Op::PurgeVersions { bucket: bucket.clone(), items: due }).await
                     {
                         expired += removed.len() as u64;
-                        if let Some(queued) = notify(&bucket, &removed) {
-                            queued.await;
-                        }
                     }
                     match page.last {
                         Some(l) if n >= 1000 => after = Some(l),

@@ -15,7 +15,7 @@ use http_body_util::Full;
 use hyper_util::rt::TokioIo;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 use tokio::sync::{broadcast, watch};
 
@@ -416,68 +416,103 @@ impl Bus {
         self.closing.send_replace(true);
     }
 
-    /// Publish an event to live listeners and to the webhook targets of matching rules.
-    /// Returns once the webhook events are queued durably (or dropped, which is counted).
-    pub async fn emit(&self, ev: Event) {
-        self.emit_all(vec![ev]).await
-    }
-
-    pub async fn emit_all(&self, evs: Vec<Event>) {
+    /// Prepare the events of a write: `make` turns the operation's result into its events.
+    /// Returns the operation to submit instead, wrapped so that its webhook events are queued
+    /// in the same transaction as the change (so a crash can't separate them, and queue order
+    /// is commit order), and a `Notify` to call `done` on once it succeeded.
+    pub fn wrap(
+        self: &Arc<Self>,
+        bucket: &str,
+        op: crate::store::Op,
+        make: impl Fn(&crate::store::OpOut) -> Vec<Event> + Send + Sync + 'static,
+    ) -> (crate::store::Op, Option<Notify>) {
         let listeners = self.live.receiver_count() > 0;
-        if (!listeners && self.targets.is_empty()) || evs.is_empty() {
-            return;
+        let rules = if self.targets.is_empty() { None } else { self.rules_for(bucket) };
+        if !listeners && rules.is_none() {
+            return (op, None);
         }
-        let mut queued: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
-        let mut counted: Vec<(Arc<Queue>, u64)> = Vec::new();
-        for mut ev in evs {
-            let rules = if self.targets.is_empty() { None } else { self.rules_for(&ev.bucket) };
-            if !listeners && rules.is_none() {
-                continue;
-            }
-            // Events carry the writer's commit order; the counter only covers events without one.
-            if ev.sequencer == 0 {
-                ev.sequencer = self.seq.fetch_add(1, Ordering::Relaxed);
-            }
-            let ev = Arc::new(ev);
-            if listeners {
-                let _ = self.live.send(ev.clone());
-            }
-            for rule in rules.iter().flat_map(|r| r.iter()).filter(|r| r.matches(&ev)) {
-                let Some(queue) = self.targets.get(&rule.target) else { continue };
-                let body = ev.to_json(&self.region, &rule.id).into_bytes();
-                if queue.len.load(Ordering::Relaxed) >= MAX_QUEUED
-                    || queue.bytes.load(Ordering::Relaxed) + body.len() as u64 > MAX_QUEUED_BYTES
-                {
-                    // The target has been down for a long time. Count it rather than fill the disk.
-                    self.stats.dropped.fetch_add(1, Ordering::Relaxed);
-                    continue;
+        let shared: Arc<Mutex<Outcome>> = Arc::default();
+        let (bus, out) = (self.clone(), shared.clone());
+        let rows = Arc::new(move |result: &crate::store::OpOut| {
+            let mut o = Outcome::default();
+            let mut rows = Vec::new();
+            for mut ev in make(result) {
+                // Events carry the writer's commit order; the counter only covers events without one.
+                if ev.sequencer == 0 {
+                    ev.sequencer = bus.seq.fetch_add(1, Ordering::Relaxed);
                 }
-                queue.add(&self.stats, 1, body.len() as u64);
-                counted.push((queue.clone(), body.len() as u64));
-                let mut key = rule.target.as_bytes().to_vec();
-                key.push(0);
-                key.extend_from_slice(&self.seq.fetch_add(1, Ordering::Relaxed).to_be_bytes());
-                queued.push((key, body));
+                for rule in rules.iter().flat_map(|r| r.iter()).filter(|r| r.matches(&ev)) {
+                    let Some(queue) = bus.targets.get(&rule.target) else { continue };
+                    let body = ev.to_json(&bus.region, &rule.id).into_bytes();
+                    if queue.len.load(Ordering::Relaxed) >= MAX_QUEUED
+                        || queue.bytes.load(Ordering::Relaxed) + body.len() as u64 > MAX_QUEUED_BYTES
+                    {
+                        // The target has been down for a long time. Count it rather than fill the disk.
+                        o.dropped += 1;
+                        continue;
+                    }
+                    o.queued.push((queue.clone(), body.len() as u64));
+                    let mut key = rule.target.as_bytes().to_vec();
+                    key.push(0);
+                    key.extend_from_slice(&bus.seq.fetch_add(1, Ordering::Relaxed).to_be_bytes());
+                    rows.push((key, body));
+                }
+                o.events.push(Arc::new(ev));
             }
-        }
-        if queued.is_empty() {
-            return;
-        }
-        // Queued events never take the space kept free for deletes: on a nearly full disk
-        // they are dropped (and counted) instead.
-        let bytes: u64 = counted.iter().map(|(_, b)| b).sum();
-        let res = match self.store.space.check(bytes) {
-            Ok(()) => self.store.submit(crate::store::Op::QueueEvents(queued)).await.map(|_| ()),
-            Err(e) => Err(e),
-        };
-        if let Err(e) = res {
-            for (q, b) in &counted {
-                q.remove(&self.stats, 1, *b);
+            // Queued events never take the space kept free for deletes: on a nearly full disk
+            // they are dropped (and counted) instead.
+            let bytes: u64 = o.queued.iter().map(|(_, b)| b).sum();
+            if !rows.is_empty()
+                && let Err(e) = bus.store.space.check(bytes)
+            {
+                o.dropped += rows.len() as u64;
+                o.queued.clear();
+                o.error = Some(e.message);
+                rows.clear();
             }
-            self.stats.dropped.fetch_add(counted.len() as u64, Ordering::Relaxed);
+            // A batch retried after a failed commit runs this again: keep the last outcome.
+            *out.lock().unwrap() = o;
+            rows
+        });
+        (crate::store::Op::WithEvents(Box::new(op), rows), Some(Notify { bus: self.clone(), outcome: shared }))
+    }
+}
+
+/// What `Bus::wrap`'s events came to, for `Notify::done`.
+#[derive(Default)]
+struct Outcome {
+    events: Vec<Arc<Event>>,
+    queued: Vec<(Arc<Queue>, u64)>,
+    dropped: u64,
+    error: Option<String>,
+}
+
+/// Finishes a wrapped write's events once it is committed.
+pub struct Notify {
+    bus: Arc<Bus>,
+    outcome: Arc<Mutex<Outcome>>,
+}
+
+impl Notify {
+    /// The write succeeded: count its queued events and tell live listeners.
+    pub fn done(self) {
+        let o = std::mem::take(&mut *self.outcome.lock().unwrap());
+        let bus = &self.bus;
+        for (q, bytes) in &o.queued {
+            q.add(&bus.stats, 1, *bytes);
+        }
+        if o.dropped > 0 {
+            bus.stats.dropped.fetch_add(o.dropped, Ordering::Relaxed);
             let now = now_ms() / 60_000;
-            if self.drop_warned.swap(now, Ordering::Relaxed) != now {
-                elog!("webhooks: dropped {} event(s): {}", counted.len(), e.message);
+            if let Some(e) = &o.error
+                && bus.drop_warned.swap(now, Ordering::Relaxed) != now
+            {
+                elog!("webhooks: dropped {} event(s): {e}", o.dropped);
+            }
+        }
+        if bus.live.receiver_count() > 0 {
+            for ev in o.events {
+                let _ = bus.live.send(ev);
             }
         }
     }
@@ -656,6 +691,12 @@ async fn deliver(t: Target, store: Arc<Store>, queue: Arc<Queue>, stats: Arc<Sta
             _ => Vec::new(),
         };
         if batch.is_empty() {
+            // The queue is empty: correct any drift in its counters (e.g. a write whose
+            // request went away between its commit and counting its events).
+            let (n, b) = (queue.len.load(Ordering::Relaxed), queue.bytes.load(Ordering::Relaxed));
+            if n > 0 || b > 0 {
+                queue.remove(&stats, n, b);
+            }
             // New events are visible once the writer commits them.
             tokio::select! {
                 _ = committed.changed() => {}

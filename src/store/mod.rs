@@ -403,12 +403,21 @@ pub enum WriteCond {
     NotExists,
     /// `If-Match: "etag"` — only overwrite this version.
     Matches(String),
-    /// `If-None-Match: "etag"` — don't overwrite this version.
+    /// `If-None-Match: "etag"[, "etag"...]` — don't overwrite these versions.
     NotMatches(String),
+    /// Several conditions (`If-Match` and `If-None-Match` together), all of which must hold.
+    All(Vec<WriteCond>),
 }
+
+/// Builds the event queue rows (key, body) for an operation's result. It runs inside the
+/// operation's own transaction, so the events are committed together with the change they
+/// describe, and their queue keys follow commit order.
+pub type EventRows = Arc<dyn Fn(&OpOut) -> Vec<(Vec<u8>, Vec<u8>)> + Send + Sync>;
 
 #[derive(Clone)]
 pub enum Op {
+    /// `op`, plus the event notifications for its result.
+    WithEvents(Box<Op>, EventRows),
     CreateBucket(String),
     DeleteBucket(String),
     PutObject {
@@ -518,8 +527,6 @@ pub enum Op {
         bucket: String,
         limit: usize,
     },
-    /// Queue event notifications: (queue key, body); see `Store::events`.
-    QueueEvents(Vec<(Vec<u8>, Vec<u8>)>),
     /// Remove delivered (or abandoned) event notifications.
     DeleteEvents(Vec<Vec<u8>>),
     /// Store an access key created through the admin API (refused if it exists).
@@ -529,6 +536,12 @@ pub enum Op {
     },
     /// Remove an access key created through the admin API.
     DeleteKey(String),
+    /// Remove an access key if its record is still exactly this one (expiry clean-up, which
+    /// must not remove a key re-created under the same name meanwhile).
+    DeleteKeyIf {
+        access_key: String,
+        record: Vec<u8>,
+    },
     Flush,
     /// Answered by the writer without touching the database (health checks).
     Ping,
@@ -1654,7 +1667,7 @@ fn writer_loop(
             continue;
         }
         let force_durable = batch.iter().any(|j| matches!(j.op, Op::Flush));
-        let events = batch.iter().any(|j| matches!(j.op, Op::QueueEvents(_)));
+        let events = batch.iter().any(|j| matches!(j.op, Op::WithEvents(..)));
         let immediate = durable || force_durable || last_durable.elapsed() >= DURABLE_EVERY;
 
         // While the ballast can still be given up, keep the batch so a commit that fails on a
@@ -1764,9 +1777,18 @@ fn run_batch(
         for job in batch.iter_mut() {
             let mut garbage = Vec::new();
             let op = std::mem::replace(&mut job.op, Op::Flush);
+            let (op, event_rows) = match op {
+                Op::WithEvents(inner, rows) => (*inner, Some(rows)),
+                op => (op, None),
+            };
             let touched = repl_touched(&mut tx, &mut repl_rules, &op)?;
             let backfill = matches!(op, Op::ReplBackfill { .. });
             let r = apply(&mut tx, op, &mut garbage, last_seq);
+            if let (Ok(out), Some(rows)) = (&r, &event_rows) {
+                for (k, v) in rows(out) {
+                    tx.events.insert(k.as_slice(), v.as_slice())?;
+                }
+            }
             if r.is_ok()
                 && let Some((bucket, keys)) = touched
                 && !matches!(&r, Ok(OpOut::Object(m)) if is_replica(&m.headers))
@@ -1991,13 +2013,16 @@ fn check_cond(existing: Option<&ObjectMeta>, cond: &Option<WriteCond>) -> S3Resu
     let existing = existing.filter(|m| !m.delete_marker);
     match (cond, existing) {
         (None, _) => Ok(()),
-        (Some(WriteCond::NotMatches(e)), Some(m)) if norm_etag(e) == norm_etag(&m.etag) => Err(err::PreconditionFailed()),
+        (Some(WriteCond::All(conds)), _) => conds.iter().try_for_each(|c| check_cond(existing, &Some(c.clone()))),
+        (Some(WriteCond::NotMatches(list)), Some(m)) if list.split(',').any(|e| norm_etag(e) == norm_etag(&m.etag)) => {
+            Err(err::PreconditionFailed())
+        }
         (Some(WriteCond::NotMatches(_)), _) => Ok(()),
         (Some(WriteCond::NotExists), None) => Ok(()),
         (Some(WriteCond::NotExists), Some(_)) => Err(err::PreconditionFailed()),
         (Some(WriteCond::Matches(_)), None) => Err(err::NoSuchKey()),
         (Some(WriteCond::Matches(e)), Some(m)) => {
-            if e.trim() == "*" || norm_etag(e) == norm_etag(&m.etag) {
+            if e.split(',').any(|e| e.trim() == "*" || norm_etag(e) == norm_etag(&m.etag)) {
                 Ok(())
             } else {
                 Err(err::PreconditionFailed())
@@ -2383,13 +2408,8 @@ fn repl_enqueue(tx: &mut Tables, bucket: &str, keys: &[String]) -> S3Result<bool
 
 fn apply(tx: &mut Tables, op: Op, garbage: &mut Vec<u128>, last_seq: &mut u64) -> S3Result<OpOut> {
     match op {
+        Op::WithEvents(op, _) => apply(tx, *op, garbage, last_seq),
         Op::Flush | Op::Ping => Ok(OpOut::Done),
-        Op::QueueEvents(items) => {
-            for (k, v) in items {
-                tx.events.insert(k.as_slice(), v.as_slice())?;
-            }
-            Ok(OpOut::Done)
-        }
         Op::DeleteEvents(keys) => {
             for k in keys {
                 tx.events.remove(k.as_slice())?;
@@ -2402,6 +2422,13 @@ fn apply(tx: &mut Tables, op: Op, garbage: &mut Vec<u128>, last_seq: &mut u64) -
             }
             tx.keys.insert(access_key.as_str(), record.as_slice())?;
             Ok(OpOut::Done)
+        }
+        Op::DeleteKeyIf { access_key, record } => {
+            let same = tx.keys.get(access_key.as_str())?.is_some_and(|v| v.value() == record.as_slice());
+            if same {
+                tx.keys.remove(access_key.as_str())?;
+            }
+            Ok(OpOut::More(same))
         }
         Op::DeleteKey(access_key) => match tx.keys.remove(access_key.as_str())? {
             Some(_) => Ok(OpOut::Done),
@@ -2781,6 +2808,13 @@ fn apply(tx: &mut Tables, op: Op, garbage: &mut Vec<u128>, last_seq: &mut u64) -
             });
             let mut object_checksum = None;
             let mut part_list = None;
+            // The client's checksum of the whole object, if it sent one, must match.
+            let claimed = checksum.as_ref().map(|(a, v)| (*a, v.trim().to_string()));
+            let unverifiable = || {
+                err::InvalidRequest()
+                    .with_message("The object checksum can't be verified: the parts have no checksums of that algorithm")
+            };
+            let mismatch = || err::BadDigest().with_message("The checksum you specified did not match the calculated checksum.");
             if let Some(algo) = algo {
                 let kind = header(UPLOAD_CHECKSUM_TYPE)
                     .and_then(|t| crate::checksum::Kind::parse(&t))
@@ -2791,13 +2825,22 @@ fn apply(tx: &mut Tables, op: Op, garbage: &mut Vec<u128>, last_seq: &mut u64) -
                     .map(|(c, n)| c.as_ref().filter(|(a, _)| *a == algo).map(|(_, v)| (v.as_str(), *n)))
                     .collect();
                 match sums.and_then(|s: Vec<(&str, u64)>| crate::checksum::combine(algo, kind, &s).map(|total| (s, total))) {
-                    Some((s, total)) => {
-                        if declared.is_some()
-                            && let Some((a, claimed)) = &checksum
-                            && (*a != algo || claimed.trim() != total)
-                        {
-                            return Err(err::BadDigest()
-                                .with_message("The checksum you specified did not match the calculated checksum."));
+                    Some((s, mut total)) => {
+                        if let Some((a, c)) = &claimed {
+                            if *a != algo {
+                                return Err(unverifiable());
+                            }
+                            if *c != total {
+                                // Without a declared type, a CRC of the whole object (instead of
+                                // the composite default) is fine too, and is then what is stored.
+                                let full = (declared.is_none() && !c.contains('-'))
+                                    .then(|| crate::checksum::combine(algo, crate::checksum::Kind::FullObject, &s))
+                                    .flatten();
+                                if full.as_ref() != Some(c) {
+                                    return Err(mismatch());
+                                }
+                                total = c.clone();
+                            }
                         }
                         part_list = Some(s.iter().map(|(v, _)| *v).collect::<Vec<_>>().join(","));
                         object_checksum = Some((algo, total));
@@ -2805,8 +2848,11 @@ fn apply(tx: &mut Tables, op: Op, garbage: &mut Vec<u128>, last_seq: &mut u64) -
                     None if declared.is_some() => {
                         return Err(err::InvalidPart().with_message("A part has no checksum of the upload's algorithm"));
                     }
+                    None if claimed.is_some() => return Err(unverifiable()),
                     None => {}
                 }
+            } else if claimed.is_some() {
+                return Err(unverifiable());
             }
             let mut headers: Vec<(String, String)> =
                 u.headers.into_iter().filter(|(k, _)| !k.starts_with(INTERNAL_PREFIX)).collect();

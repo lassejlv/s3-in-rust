@@ -40,9 +40,35 @@ pub struct Config {
     pub rate: u64,
 }
 
+/// Keeps a pass's reads under the configured rate (sleeping on the blocking thread that
+/// reads), and stops them when the server shuts down.
+struct Pacer {
+    started: Instant,
+    rate: u64,
+    read: AtomicU64,
+    stopping: watch::Receiver<bool>,
+}
+
+impl Pacer {
+    /// Count `n` bytes read and wait until that is within the rate. False once stopping.
+    fn pace(&self, n: u64) -> bool {
+        let read = self.read.fetch_add(n, Relaxed) + n;
+        let due = Duration::from_secs_f64(read as f64 / self.rate.max(1) as f64);
+        loop {
+            if *self.stopping.borrow() {
+                return false;
+            }
+            let Some(wait) = due.checked_sub(self.started.elapsed()) else { return true };
+            std::thread::sleep(wait.min(Duration::from_millis(200)));
+        }
+    }
+}
+
 enum Outcome {
     Verified,
     Skipped,
+    /// The server is shutting down.
+    Stopped,
     /// A data file is gone (maybe the object was replaced meanwhile: checked by the caller).
     Missing(String),
     Corrupt(String),
@@ -54,7 +80,7 @@ fn md5(data: &[u8]) -> [u8; 16] {
 }
 
 /// Check one version's data against its ETag.
-fn verify(store: &Store, meta: &ObjectMeta, inline: Option<&Bytes>, master: Option<&WrapKey>) -> Outcome {
+fn verify(store: &Store, meta: &ObjectMeta, inline: Option<&Bytes>, master: Option<&WrapKey>, pacer: &Pacer) -> Outcome {
     let header = |n: &str| meta.headers.iter().any(|(k, _)| k == n);
     let key = if header("x-amz-server-side-encryption-customer-algorithm") {
         return Outcome::Skipped;
@@ -77,12 +103,16 @@ fn verify(store: &Store, meta: &ObjectMeta, inline: Option<&Bytes>, master: Opti
                 },
                 None => digests.push(md5(data)),
             }
+            if !pacer.pace(data.len() as u64) {
+                return Outcome::Stopped;
+            }
         }
         Storage::Segments(segs) => {
             for (id, len) in segs {
                 let path = store.data_path(*id);
-                match crate::io::segment_md5(&path, *len, key) {
+                match crate::io::segment_md5_paced(&path, *len, key, &mut |n| pacer.pace(n)) {
                     Ok(d) => digests.push(d),
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => return Outcome::Stopped,
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                         return Outcome::Missing(format!("data file {} is missing", path.display()));
                     }
@@ -143,8 +173,8 @@ async fn pass(
     stats: &Stats,
     stopping: &watch::Receiver<bool>,
 ) -> Option<(u64, u64)> {
-    let started = Instant::now();
-    let (mut read, mut checked, mut damaged) = (0u64, 0u64, 0u64);
+    let pacer = Arc::new(Pacer { started: Instant::now(), rate: cfg.rate, read: AtomicU64::new(0), stopping: stopping.clone() });
+    let (mut checked, mut damaged) = (0u64, 0u64);
     let st = store.clone();
     let buckets = tokio::task::spawn_blocking(move || st.list_buckets()).await.ok()?.unwrap_or_default();
     for (bucket, _) in buckets {
@@ -170,11 +200,11 @@ async fn pass(
                     return None;
                 }
                 let vid = e.meta.version.clone().unwrap_or_else(|| "null".into());
-                let (st, b, k, key) = (store.clone(), bucket.clone(), e.key.clone(), master.cloned());
+                let (st, b, k, key, pacer) = (store.clone(), bucket.clone(), e.key.clone(), master.cloned(), pacer.clone());
                 let outcome = tokio::task::spawn_blocking(move || {
                     // Read the version again: it may have changed since it was listed.
                     let Ok((meta, inline)) = st.get_object_version(&b, &k, &vid) else { return None };
-                    let first = verify(&st, &meta, inline.as_ref(), key.as_ref());
+                    let first = verify(&st, &meta, inline.as_ref(), key.as_ref(), &pacer);
                     // Damage is reported only if the version still exists unchanged (a
                     // concurrent overwrite or delete removes data files under the check).
                     let outcome = match first {
@@ -198,8 +228,8 @@ async fn pass(
                         checked += 1;
                         stats.verified.fetch_add(1, Relaxed);
                         stats.bytes.fetch_add(size, Relaxed);
-                        read += size;
                     }
+                    Outcome::Stopped => return None,
                     Outcome::Skipped => {
                         stats.skipped.fetch_add(1, Relaxed);
                     }
@@ -207,17 +237,7 @@ async fn pass(
                         checked += 1;
                         damaged += 1;
                         stats.corrupt.fetch_add(1, Relaxed);
-                        read += size;
                         elog!("scrub: DAMAGED {label}: {why}");
-                    }
-                }
-                // Stay under the configured read rate.
-                let due = Duration::from_secs_f64(read as f64 / cfg.rate.max(1) as f64);
-                if let Some(wait) = due.checked_sub(started.elapsed()) {
-                    let mut stop = stopping.clone();
-                    tokio::select! {
-                        _ = tokio::time::sleep(wait) => {}
-                        _ = stop.changed() => return None,
                     }
                 }
             }

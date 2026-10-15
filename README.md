@@ -749,8 +749,9 @@ How delivery works:
   header lets receivers verify it.
 - **Delivery is durable and at least once:**
   - Events are queued on disk, per target.
-  - A write is acknowledged only once its events are queued, so a crash can't lose the event of
-    an acknowledged write.
+  - A write's events are queued in the same transaction as the write itself, so there is never
+    a change without its event (or an event without its change), and each target's queue is in
+    commit order.
   - An event is removed from the queue only after the target answered `2xx`.
   - Until then it is retried with backoff (up to a minute), and the events behind it wait. Each
     target therefore gets its events in order, also across outages and restarts.

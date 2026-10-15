@@ -97,7 +97,28 @@ assert "scrub: DAMAGED plain/big: content does not match its ETag" in log, log[-
 assert "DAMAGED plain/multi" not in log and "DAMAGED versioned" not in log
 print("a flipped byte was found and reported")
 
+# The read rate holds within large objects too: about 9 MiB at 2 MiB/s takes over 3 s.
 p.terminate()
 p.wait()
+p = subprocess.Popen([BIN, "-d", f"{work}/data", "-l", f"127.0.0.1:{PORT}", "--access-key", "k", "--secret-key", "scrubsecret",
+                      "--encryption-key-file", f"{work}/key", "--scrub-interval", "1h", "--scrub-rate", "2"],
+                     stdout=open(f"{work}/log", "a"), stderr=subprocess.STDOUT)
+procs.append(p)
+started = time.time()
+for _ in range(100):
+    try:
+        urllib.request.urlopen(f"{EP}/_health")
+        break
+    except Exception:
+        time.sleep(0.1)
+wait_passes(1)
+took = time.time() - started
+assert took > 3, took
+# Stopping doesn't wait for a pass (or a large object) to finish.
+p = procs[-1]
+t = time.time()
+p.terminate()
+p.wait()
+print(f"a pass at 2 MiB/s took {took:.1f}s; shutdown took {time.time() - t:.1f}s")
 shutil.rmtree(work)
 print("SCRUB TEST OK")

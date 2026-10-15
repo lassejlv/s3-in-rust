@@ -1398,9 +1398,10 @@ impl Server {
         let vref = version.as_deref();
         match op {
             ObjectOp::ListParts => self.list_parts(r, bucket, key),
+            // Objects have no ACLs of their own: what applies to them is their bucket's ACL.
             ObjectOp::GetAcl => {
                 self.lookup(bucket, key, vref)?;
-                Ok(Resp::xml(acl_doc(CannedAcl::Private)))
+                Ok(Resp::xml(acl_doc(self.bucket_access(bucket)?.acl)))
             }
             ObjectOp::GetTagging => {
                 let (meta, _) = self.lookup(bucket, key, vref)?;
@@ -1441,6 +1442,19 @@ impl Server {
             ObjectOp::UploadPart | ObjectOp::UploadPartCopy => self.upload_part(r, bucket, key).await,
             ObjectOp::PutAcl => {
                 self.lookup(bucket, key, vref)?;
+                let acl = match r.header("x-amz-acl") {
+                    Some(a) => CannedAcl::parse(a)?,
+                    None => acl_from_xml(&self.read_xml(r).await?)?,
+                };
+                // Accepting a different ACL and ignoring it would let a caller believe an object
+                // in a public bucket was now private.
+                let current = self.bucket_access(bucket)?.acl;
+                if acl != current {
+                    return Err(err::NotImplemented().with_message(format!(
+                        "Object ACLs are not supported: objects have their bucket's ACL ({}). Use the bucket ACL or a bucket policy.",
+                        current.as_str()
+                    )));
+                }
                 Ok(Resp::ok())
             }
             ObjectOp::PutTagging => {

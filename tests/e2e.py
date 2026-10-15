@@ -284,6 +284,15 @@ def t_sigv2_header():
     c.put_object(Bucket=B, Key="v2 key+x", Body=b"sigv2", Metadata={"a": "b"})
     assert c.get_object(Bucket=B, Key="v2 key+x")["Body"].read() == b"sigv2"
     assert any(o["Key"] == "v2 key+x" for o in c.list_objects(Bucket=B, Prefix="v2")["Contents"])
+    # A signature covers the operation: a presigned PUT can't be replayed on a subresource.
+    url = c.generate_presigned_url("put_object", Params={"Bucket": B, "Key": "v2 key+x"}, ExpiresIn=60)
+    for sub in ["tagging", "retention", "legal-hold", "%72etention", "acl"]:
+        req = urllib.request.Request(url + "&" + sub, data=b"<x/>", method="PUT")
+        try:
+            urllib.request.urlopen(req)
+            raise AssertionError(f"presigned PUT accepted for ?{sub}")
+        except urllib.error.HTTPError as e:
+            assert e.code == 403, (sub, e.code)
 
 
 def _presigned(s3):
@@ -378,8 +387,16 @@ def t_public_read_acl():
     assert http("PUT", f"/{pb}/new.txt", data=b"nope")[0] == 403
     assert http("DELETE", f"/{pb}/file.txt")[0] == 403
     assert http("GET", f"/{pb}?acl")[0] == 403
+    # Objects have their bucket's ACL: GetObjectAcl reports it, and PutObjectAcl refuses to
+    # change it rather than pretending to.
+    grants = s3.get_object_acl(Bucket=pb, Key="file.txt")["Grants"]
+    assert any(g["Grantee"].get("URI", "").endswith("AllUsers") for g in grants), grants
+    s3.put_object_acl(Bucket=pb, Key="file.txt", ACL="public-read")
+    expect_error("NotImplemented", lambda: s3.put_object_acl(Bucket=pb, Key="file.txt", ACL="private"))
+    assert http("GET", f"/{pb}/file.txt")[0] == 200
     s3.put_bucket_acl(Bucket=pb, ACL="private")
     assert http("GET", f"/{pb}/file.txt")[0] == 403
+    s3.put_object_acl(Bucket=pb, Key="file.txt", ACL="private")
     # Canned ACL at creation time.
     pb2 = B + "-pub2"
     s3.create_bucket(Bucket=pb2, ACL="public-read")

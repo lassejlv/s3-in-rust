@@ -326,7 +326,9 @@ Behind a reverse proxy (Railway, Fly, nginx), pass `--behind-proxy` so `aws:Sour
 headers are ignored.
 
 The `public-read` ACL lets anonymous callers GET objects and list the bucket. `public-read-write`
-also lets them upload and delete. Per-object ACLs are accepted but ignored.
+also lets them upload and delete. Objects have no ACLs of their own: they have their bucket's
+ACL. GetObjectAcl reports it, `x-amz-acl` on uploads is ignored, and PutObjectAcl refuses
+(`NotImplemented`) to set anything else.
 
 **CORS.** `PutBucketCors`, `GetBucketCors` and `DeleteBucketCors` are supported. `OPTIONS` preflight
 requests are answered without authentication. Matching responses get `Access-Control-*` headers, and

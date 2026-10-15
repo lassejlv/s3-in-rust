@@ -369,6 +369,10 @@ impl Auth {
             "versions",
             "website",
         ];
+        // Every parameter that selects an operation is signed, not only the ones in the classic
+        // SigV2 list: otherwise a signature for one operation (say, a presigned PUT) would also be
+        // valid for another on the same path (PUT ?retention). Names are compared decoded, as
+        // the request router sees them.
         let mut subs: Vec<(String, Option<String>)> = raw_query
             .split('&')
             .filter_map(|p| {
@@ -376,7 +380,8 @@ impl Auth {
                     Some((k, v)) => (k, Some(uri_decode(v, false).unwrap_or_else(|| v.to_string()))),
                     None => (p, None),
                 };
-                SUBRESOURCES.contains(&k).then(|| (k.to_string(), v))
+                let k = uri_decode(k, true).unwrap_or_else(|| k.to_string());
+                (SUBRESOURCES.contains(&k.as_str()) || crate::ops::is_subresource(&k)).then_some((k, v))
             })
             .collect();
         subs.sort();
@@ -657,6 +662,36 @@ mod tests {
         };
         assert!(c.can_access("team-a-logs") && c.can_access("shared"));
         assert!(!c.can_access("team-b") && !c.can_access("shared2"));
+    }
+
+    /// A SigV2 signature covers the operation: one made for a plain PUT is not valid for PUT
+    /// ?retention (or any other subresource) on the same object, however the name is encoded.
+    #[test]
+    fn sigv2_signs_every_subresource() {
+        let auth = doc_auth();
+        let date = httpdate::fmt_http_date(std::time::SystemTime::now());
+        let sign = |resource: &str| {
+            let sts = format!("PUT\n\n\n{date}\n{resource}");
+            let mut m = <hmac::Hmac<sha1::Sha1> as KeyInit>::new_from_slice(b"wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY").unwrap();
+            m.update(sts.as_bytes());
+            util::base64(&m.finalize().into_bytes())
+        };
+        let check = |query: &str, sig: &str| {
+            let uri = if query.is_empty() { "/b/k".to_string() } else { format!("/b/k?{query}") };
+            let req = hyper::Request::builder().method("PUT").uri(uri).header("date", &date).body(()).unwrap();
+            let (parts, _) = req.into_parts();
+            auth.verify_v2(&parts, query, None, "AKIAIOSFODNN7EXAMPLE", sig, None).is_ok()
+        };
+        let plain = sign("/b/k");
+        assert!(check("", &plain));
+        for q in ["retention", "legal-hold", "%72etention", "attributes", "tagging", "acl", "%61cl", "uploads"] {
+            assert!(!check(q, &plain), "a plain PUT signature was accepted for ?{q}");
+        }
+        assert!(check("retention", &sign("/b/k?retention")));
+        assert!(check("%72etention", &sign("/b/k?retention")));
+        assert!(check("tagging&x-id=PutObjectTagging", &sign("/b/k?tagging")));
+        // Parameters that are not subresources stay outside the signature, as in S3.
+        assert!(check("x-id=PutObject", &plain));
     }
 
     /// Example from the AWS SigV4 documentation ("GET Object" with a Range header).

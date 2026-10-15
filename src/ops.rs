@@ -110,6 +110,12 @@ pub enum BucketOp {
     Listen,
 }
 
+/// Whether the query parameter `name` selects a subresource, i.e. another operation on the same
+/// bucket or object.
+pub fn is_subresource(name: &str) -> bool {
+    BUCKET_SUBS.iter().any(|s| s.name == name) || OBJECT_SUBS.contains(&name) || name == "partNumber"
+}
+
 fn has(query: &[(String, String)], name: &str) -> bool {
     query.iter().any(|(k, _)| k == name)
 }

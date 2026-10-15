@@ -3320,10 +3320,14 @@ impl Server {
         {
             headers.push(("content-type".into(), ct.clone()));
         }
-        if f.keys().any(|k| k.starts_with(SSE_C_ALG.trim_end_matches("algorithm"))) {
-            return Err(err::NotImplemented().with_message("SSE-C is not supported for POST uploads"));
+        // SSE-C: the customer key comes in form fields, like the other request headers.
+        let mut sse_c = HeaderMap::new();
+        for (name, value) in f.iter().filter(|(k, _)| k.starts_with("x-amz-server-side-encryption-customer-")) {
+            let name = hyper::header::HeaderName::from_bytes(name.as_bytes()).map_err(|_| err::InvalidArgument())?;
+            let value = HeaderValue::from_str(value).map_err(|_| err::InvalidArgument())?;
+            sse_c.insert(name, value);
         }
-        let enc = self.write_encryption(&HeaderMap::new(), bucket, f.get(SSE).map(String::as_str))?;
+        let enc = self.write_encryption(&sse_c, bucket, f.get(SSE).map(String::as_str))?;
         headers.retain(|(k, _)| !k.starts_with(SSE));
         headers.extend(enc.as_ref().map(|(_, h)| h.clone()).unwrap_or_default());
         headers.extend(self.new_lock_headers(&HeaderMap::new(), bucket)?);

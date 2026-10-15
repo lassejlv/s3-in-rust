@@ -754,6 +754,18 @@ def t_presigned_post():
         assert st == 403 and b"Extra input fields" in body, body
         wrong = dict(post["fields"], key="elsewhere/${filename}")
         assert _form_post(post["url"], wrong, b"data")[0] == 403
+    # SSE-C: the customer key in form fields encrypts the upload; reading it needs the key.
+    import base64
+    key = os.urandom(32)
+    ssec = {"x-amz-server-side-encryption-customer-algorithm": "AES256",
+            "x-amz-server-side-encryption-customer-key": base64.b64encode(key).decode(),
+            "x-amz-server-side-encryption-customer-key-md5": base64.b64encode(hashlib.md5(key).digest()).decode()}
+    post = s3.generate_presigned_post(B, "forms/ssec.txt", Fields=ssec, Conditions=[{k: v} for k, v in ssec.items()], ExpiresIn=60)
+    st, _, body = _form_post(post["url"], post["fields"], b"secret form data")
+    assert st == 204, (st, body)
+    expect_error("InvalidRequest", lambda: s3.get_object(Bucket=B, Key="forms/ssec.txt"))
+    assert s3.get_object(Bucket=B, Key="forms/ssec.txt", SSECustomerAlgorithm="AES256", SSECustomerKey=key)["Body"].read() == b"secret form data"
+    s3.delete_object(Bucket=B, Key="forms/ssec.txt")
     # Default response (204) and redirect.
     post = s3.generate_presigned_post(B, "forms/plain.txt", ExpiresIn=60)
     st, _, _ = _form_post(post["url"], post["fields"], b"plain")

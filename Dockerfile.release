@@ -2,6 +2,10 @@
 # (dist/<arch>/s3rs and dist/<arch>/s3rs-tls in the build context). For building from source,
 # use the Dockerfile next to this one.
 FROM debian:trixie-slim
+LABEL org.opencontainers.image.title="s3rs" \
+      org.opencontainers.image.description="Fast, lightweight S3-compatible object storage" \
+      org.opencontainers.image.licenses="MIT OR Apache-2.0" \
+      org.opencontainers.image.source="https://github.com/lassejlv/s3-in-rust"
 ARG TARGETARCH
 ARG BINARY=s3rs
 COPY dist/${TARGETARCH}/${BINARY} /usr/local/bin/s3rs

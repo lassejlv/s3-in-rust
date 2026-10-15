@@ -68,7 +68,7 @@ jobs:
             name=$bin-$v-${{ matrix.target }}
             mkdir -p pkg/$name
             cp dist/${{ matrix.arch }}/$bin pkg/$name/s3rs
-            cp README.md pkg/$name/
+            cp README.md LICENSE-MIT LICENSE-APACHE pkg/$name/
             tar -C pkg -czf $name.tar.gz $name
           done
       - uses: actions/upload-artifact@v4

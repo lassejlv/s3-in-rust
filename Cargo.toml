@@ -2,6 +2,8 @@
 name = "s3rs"
 version = "0.1.0"
 description = "Fast, lightweight S3-compatible object storage in pure Rust"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/lassejlv/s3-in-rust"
 edition = "2024"
 
 [dependencies]

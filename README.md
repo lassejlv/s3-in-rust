@@ -761,3 +761,12 @@ HTTPS, with an `https://` webhook, using a throwaway CA from `tests/tls/gen-cert
   original numbers). Clients and SDKs that upload consecutive parts see no difference.
 - GetObjectAttributes needs `s3:GetObject` (or `s3:GetObjectVersion`) as well as
   `s3:GetObjectAttributes`, as in S3.
+
+## License
+
+Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or [MIT license](LICENSE-MIT)
+at your option.
+
+Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in
+s3rs by you, as defined in the Apache-2.0 license, shall be dual licensed as above, without any
+additional terms or conditions.

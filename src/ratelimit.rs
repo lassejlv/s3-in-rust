@@ -22,6 +22,11 @@ impl Limiter {
         Limiter { rate, burst: rate * 2.0, shards: (0..SHARDS).map(|_| Mutex::new(HashMap::new())).collect() }
     }
 
+    /// `rate` per second, with bursts of up to `burst`.
+    pub fn with_burst(rate: u32, burst: u32) -> Self {
+        Limiter { burst: burst.max(1) as f64, ..Limiter::new(rate) }
+    }
+
     /// Take a token for `key`, or say how long until one is available.
     pub fn check(&self, key: &str) -> Result<(), Duration> {
         self.check_at(key, Instant::now())
@@ -90,5 +95,16 @@ mod tests {
         }
         let total: usize = l.shards.iter().map(|s| s.lock().unwrap().len()).sum();
         assert!(total <= MAX_ENTRIES * SHARDS, "{total}");
+    }
+
+    #[test]
+    fn custom_burst() {
+        let l = Limiter::with_burst(1, 10);
+        let t0 = Instant::now();
+        for _ in 0..10 {
+            l.check_at("a", t0).unwrap();
+        }
+        assert!(l.check_at("a", t0).is_err());
+        assert!(l.check_at("a", t0 + Duration::from_millis(1100)).is_ok());
     }
 }

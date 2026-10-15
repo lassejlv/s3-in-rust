@@ -160,11 +160,11 @@ try:
     assert admin("POST", body={"expires_in": 0})[0] == 400
 
     # Guessing the admin token is slowed down.
-    codes = [admin("GET", token=f"guess{i}")[0] for i in range(4)]
+    codes = [admin("GET", token=f"guess{i}")[0] for i in range(14)]
     assert codes[0] == 403 and 503 in codes, codes
     # While throttled, even the right token is refused (else guessing would go on unhindered).
     assert admin("GET")[0] == 503
-    time.sleep(2.5)
+    time.sleep(1.5)
     assert admin("GET")[0] == 200
 
     log = open(f"{work}/log").read()

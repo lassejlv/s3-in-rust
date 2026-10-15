@@ -44,7 +44,8 @@ malicious. It does not defend against someone who controls the host.
   `/_admin/keys`) is off unless `--admin-token` is set. The admin token can read every object (via
   backups) and create keys, so treat it like the root key. Keys created through the API are stored
   in the metadata database, so backups contain their secrets. Empty tokens and the `change-me` placeholders are refused at startup.
-  Wrong admin tokens are limited to about one per second per client address (then `503 SlowDown`).
+  Wrong admin tokens are limited to about one per second per client address after a burst of ten
+  (then `503 SlowDown`, also for the right token).
 - **Secrets in logs:** access logs redact signatures, credentials and tokens in query strings.
 
 **Out of scope:**

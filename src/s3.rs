@@ -421,7 +421,7 @@ impl Server {
             replication: opts.replication,
             bucket_log,
             key_limit: opts.rate_limit.map(crate::ratelimit::Limiter::new),
-            admin_failures: crate::ratelimit::Limiter::new(1),
+            admin_failures: crate::ratelimit::Limiter::with_burst(1, 10),
             file_creds: RwLock::new(Vec::new()),
             keys_reload: Mutex::new(()),
             next_key_expiry: AtomicU64::new(u64::MAX),
@@ -993,8 +993,8 @@ impl Server {
         let Some(token) = &self.admin_token else {
             return Err(err::AccessDenied().with_message("The admin API is disabled; start the server with --admin-token"));
         };
-        // About one wrong token per second per client address: an address that used up its
-        // allowance is refused before its token is even looked at.
+        // About one wrong token per second per client address (after a burst of ten): an
+        // address that used up its allowance is refused before its token is even looked at.
         let ip = self.client(&parts.headers, peer).ip.to_string();
         let slow_down = |wait: std::time::Duration| {
             self.metrics.throttled.fetch_add(1, Ordering::Relaxed);

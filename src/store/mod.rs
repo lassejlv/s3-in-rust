@@ -256,6 +256,9 @@ pub struct Store {
     pub space: Arc<space::Space>,
     /// While non-zero (a backup is streaming), data files are not deleted.
     gc_paused: Arc<std::sync::atomic::AtomicUsize>,
+    /// Data files being read (id -> readers): their deletion waits until the readers are done,
+    /// so a download is never cut off by a concurrent overwrite or delete.
+    reading: Arc<std::sync::Mutex<HashMap<u128, u32>>>,
     /// Signalled when a commit added keys to the replication queue.
     pub repl_wake: Arc<tokio::sync::Notify>,
     /// Counts commits that queued event notifications (delivery tasks watch it).
@@ -368,6 +371,26 @@ fn poisoned(db: &Database) -> bool {
 pub enum Incoming<'a> {
     Object(&'a str),
     Part { upload: u128, part: u32 },
+}
+
+/// Data files a reader is using; dropping it lets their deletion go ahead.
+pub struct ReadLease {
+    reading: Arc<std::sync::Mutex<HashMap<u128, u32>>>,
+    ids: Vec<u128>,
+}
+
+impl Drop for ReadLease {
+    fn drop(&mut self) {
+        let mut map = self.reading.lock().unwrap();
+        for id in &self.ids {
+            if let Some(n) = map.get_mut(id) {
+                *n -= 1;
+                if *n == 0 {
+                    map.remove(id);
+                }
+            }
+        }
+    }
 }
 
 /// Work for the file deletion thread.
@@ -718,29 +741,55 @@ impl Store {
         let gc_space = space.clone();
         let gc_paused = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let paused = gc_paused.clone();
+        let reading: Arc<std::sync::Mutex<HashMap<u128, u32>>> = Arc::default();
+        let gc_reading = reading.clone();
         std::thread::Builder::new().name("s3rs-gc".into()).spawn(move || {
-            for msg in del_rx {
-                let ids = match msg {
-                    Gc::Remove(ids) => ids,
-                    Gc::Sync(done) => {
-                        let _ = done.send(());
-                        continue;
-                    }
+            // Files still being read, and syncs waiting for them.
+            let mut deferred: Vec<u128> = Vec::new();
+            let mut syncs: Vec<mpsc::Sender<()>> = Vec::new();
+            loop {
+                let msg = match del_rx.recv_timeout(Duration::from_millis(200)) {
+                    Ok(m) => Some(m),
+                    Err(mpsc::RecvTimeoutError::Timeout) => None,
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
                 };
-                // A backup in progress may still need these files; they wait in the queue.
-                while paused.load(std::sync::atomic::Ordering::SeqCst) > 0 {
-                    std::thread::sleep(Duration::from_millis(50));
-                }
-                for id in ids {
-                    if let Err(e) = std::fs::remove_file(data_path(&del_root, id))
-                        && e.kind() != std::io::ErrorKind::NotFound
-                    {
-                        elog!("gc: failed to remove {}: {e}", util::id_hex(id));
+                let ids = match msg {
+                    Some(Gc::Remove(ids)) => ids,
+                    Some(Gc::Sync(done)) => {
+                        syncs.push(done);
+                        Vec::new()
+                    }
+                    None => Vec::new(),
+                };
+                let ids: Vec<u128> = ids.into_iter().chain(std::mem::take(&mut deferred)).collect();
+                if !ids.is_empty() {
+                    // A backup in progress may still need these files; they wait in the queue.
+                    while paused.load(std::sync::atomic::Ordering::SeqCst) > 0 {
+                        std::thread::sleep(Duration::from_millis(50));
+                    }
+                    for id in ids {
+                        // Checked and removed under the lock, so a reader can't lease the file
+                        // in between (a reader that leases it afterwards finds it gone).
+                        let readers = gc_reading.lock().unwrap();
+                        if readers.contains_key(&id) {
+                            deferred.push(id);
+                            continue;
+                        }
+                        if let Err(e) = std::fs::remove_file(data_path(&del_root, id))
+                            && e.kind() != std::io::ErrorKind::NotFound
+                        {
+                            elog!("gc: failed to remove {}: {e}", util::id_hex(id));
+                        }
+                    }
+                    // Deletes free space: put the ballast back once there is room.
+                    if !gc_space.ballast.present() && matches!(gc_space.restore_ballast(), Ok(true)) {
+                        elog!("disk space recovered: recreated the ballast file");
                     }
                 }
-                // Deletes free space: put the ballast back once there is room.
-                if !gc_space.ballast.present() && matches!(gc_space.restore_ballast(), Ok(true)) {
-                    elog!("disk space recovered: recreated the ballast file");
+                if deferred.is_empty() {
+                    for done in syncs.drain(..) {
+                        let _ = done.send(());
+                    }
                 }
             }
         })?;
@@ -765,6 +814,7 @@ impl Store {
             db,
             writer: tx,
             deleter: del_tx,
+            reading,
             space,
             gc_paused,
             repl_wake,
@@ -790,6 +840,17 @@ impl Store {
 
     pub fn data_path(&self, id: u128) -> PathBuf {
         data_path(&self.root, id)
+    }
+
+    /// Keep these data files from being deleted while the lease lives. A file that was already
+    /// deleted stays deleted: callers check the files exist after taking the lease.
+    pub fn lease(&self, ids: impl IntoIterator<Item = u128>) -> ReadLease {
+        let ids: Vec<u128> = ids.into_iter().collect();
+        let mut map = self.reading.lock().unwrap();
+        for id in &ids {
+            *map.entry(*id).or_default() += 1;
+        }
+        ReadLease { reading: self.reading.clone(), ids }
     }
 
     pub fn tmp_path(&self, id: u128) -> PathBuf {

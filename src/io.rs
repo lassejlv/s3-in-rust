@@ -737,9 +737,21 @@ pub async fn read_body(
     let pieces = plan(segs, start, len);
     let st = store.clone();
     let not_found = |e: io::Error| if e.kind() == io::ErrorKind::NotFound { None } else { Some(S3Error::from(e)) };
+    // Hold the files until the read is done (a concurrent overwrite or delete would otherwise
+    // remove them under it), then make sure none was removed before the lease was taken: if one
+    // was, the object changed and the caller looks it up again.
+    let lease = store.lease(pieces.iter().map(|p| p.0));
+    if pieces.len() > 1 {
+        let (st, ids): (_, Vec<u128>) = (store.clone(), pieces.iter().map(|p| p.0).collect());
+        tokio::task::spawn_blocking(move || ids.iter().try_for_each(|id| std::fs::metadata(st.data_path(*id)).map(|_| ())))
+            .await
+            .map_err(|e| Some(S3Error::internal(e)))?
+            .map_err(not_found)?;
+    }
 
     if len <= SMALL_READ {
         let data = tokio::task::spawn_blocking(move || -> io::Result<Vec<u8>> {
+            let _lease = lease;
             let mut out = Vec::with_capacity(len as usize);
             for (id, off, n, slen) in pieces {
                 SegReader::open(&st, id, slen, key.as_ref())?.read(off, n, &mut out)?;
@@ -765,6 +777,7 @@ pub async fn read_body(
         .map_err(not_found)?;
     let (tx, rx) = mpsc::channel::<io::Result<Bytes>>(4);
     tokio::spawn(async move {
+        let _lease = lease;
         let mut current = Some((first, off0, n0));
         loop {
             let (mut r, mut off, mut n) = match current.take() {

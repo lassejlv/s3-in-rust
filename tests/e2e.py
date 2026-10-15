@@ -521,16 +521,18 @@ def t_public_read_acl():
     assert http("PUT", f"/{pb}/new.txt", data=b"nope")[0] == 403
     assert http("DELETE", f"/{pb}/file.txt")[0] == 403
     assert http("GET", f"/{pb}?acl")[0] == 403
-    # Objects have their bucket's ACL: GetObjectAcl reports it, and PutObjectAcl refuses to
-    # change it rather than pretending to.
+    # Objects without an ACL of their own have their bucket's: GetObjectAcl reports it, and
+    # PutObjectAcl refuses to make one private in a public bucket rather than pretending to.
     grants = s3.get_object_acl(Bucket=pb, Key="file.txt")["Grants"]
     assert any(g["Grantee"].get("URI", "").endswith("AllUsers") for g in grants), grants
     s3.put_object_acl(Bucket=pb, Key="file.txt", ACL="public-read")
     expect_error("NotImplemented", lambda: s3.put_object_acl(Bucket=pb, Key="file.txt", ACL="private"))
     assert http("GET", f"/{pb}/file.txt")[0] == 200
+    # The object's own public-read ACL outlives the bucket's.
     s3.put_bucket_acl(Bucket=pb, ACL="private")
-    assert http("GET", f"/{pb}/file.txt")[0] == 403
+    assert http("GET", f"/{pb}/file.txt")[0] == 200
     s3.put_object_acl(Bucket=pb, Key="file.txt", ACL="private")
+    assert http("GET", f"/{pb}/file.txt")[0] == 403
     # Canned ACL at creation time.
     pb2 = B + "-pub2"
     s3.create_bucket(Bucket=pb2, ACL="public-read")

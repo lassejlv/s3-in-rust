@@ -47,6 +47,8 @@ First release.
 - Authentication: SigV4 (headers, presigned URLs, streaming and trailers) and SigV2.
 
 **Access control**
+- Per-object `public-read` ACLs (on uploads, copies, multipart and POST uploads, or with
+  PutObjectAcl): single objects can be public in a private bucket.
 - Public access blocks (BlockPublicAcls, IgnorePublicAcls, BlockPublicPolicy,
   RestrictPublicBuckets) and bucket ownership controls, as set by tools such as Terraform;
   `--block-public-access` applies the block to every bucket.

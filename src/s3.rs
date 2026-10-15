@@ -692,7 +692,22 @@ impl Server {
                 }
                 // Unknown buckets look the same as forbidden ones to anonymous callers.
                 let access = self.bucket_access(b).map_err(|_| err::AccessDenied())?;
-                if access.allows_anonymous(action, &resource(), ctx) { Ok(()) } else { Err(err::AccessDenied()) }
+                if access.allows_anonymous(action, &resource(), ctx) {
+                    return Ok(());
+                }
+                // An object's own public-read ACL (unless public ACLs are ignored, or the bucket
+                // policy explicitly denies the read).
+                if let Some(k) = key
+                    && matches!(action, "s3:GetObject" | "s3:GetObjectVersion")
+                    && !access.public_block.ignore_acls
+                    && access.policy_decision(action, &resource(), ctx) != iam::Decision::Deny
+                {
+                    let version = ctx.query.iter().find(|(n, v)| n == "versionId" && !v.is_empty()).map(|(_, v)| v.as_str());
+                    if self.lookup(b, k, version).is_ok_and(|(m, _)| is_public_object(&m)) {
+                        return Ok(());
+                    }
+                }
+                Err(err::AccessDenied())
             }
             Principal::User(c) => {
                 if c.read_only && !(action.starts_with("s3:Get") || action.starts_with("s3:List")) {
@@ -930,7 +945,7 @@ impl Server {
         }
         let index = cfg.index.as_deref().unwrap_or("index.html");
         let target = if key.is_empty() || key.ends_with('/') { format!("{key}{index}") } else { key.clone() };
-        let e = match self.website_object(parts, bucket, &target, head, &access, &ctx).await {
+        let e = match self.website_object(parts, bucket, &target, head, &ctx).await {
             Ok(r) => return r,
             Err(e) => e,
         };
@@ -938,7 +953,7 @@ impl Server {
         if e.status == StatusCode::NOT_FOUND
             && !key.is_empty()
             && !key.ends_with('/')
-            && access.allows_anonymous("s3:GetObject", &format!("arn:aws:s3:::{bucket}/{key}/{index}"), &ctx)
+            && self.authorize(&Principal::Anonymous, "s3:GetObject", Some(bucket), Some(&format!("{key}/{index}")), &ctx).is_ok()
             && self.store.get_object(bucket, &format!("{key}/{index}")).is_ok()
         {
             // Absolute, so a key starting with "/" cannot become a protocol-relative URL.
@@ -953,7 +968,7 @@ impl Server {
             // Served without the request's conditional / range headers, with the original status.
             let mut plain = Request::new(()).into_parts().0;
             plain.method = parts.method.clone();
-            if let Ok(mut r) = self.website_object(&plain, bucket, doc, head, &access, &ctx).await
+            if let Ok(mut r) = self.website_object(&plain, bucket, doc, head, &ctx).await
                 && r.status == StatusCode::OK
             {
                 r.status = e.status;
@@ -964,18 +979,12 @@ impl Server {
     }
 
     /// Serve one object to an anonymous website visitor (it must be publicly readable).
-    async fn website_object(
-        &self,
-        parts: &Parts,
-        bucket: &str,
-        key: &str,
-        head: bool,
-        access: &BucketAccess,
-        ctx: &iam::Ctx<'_>,
-    ) -> S3Result<Resp> {
-        if check_key(key).is_err() || !access.allows_anonymous("s3:GetObject", &format!("arn:aws:s3:::{bucket}/{key}"), ctx) {
+    async fn website_object(&self, parts: &Parts, bucket: &str, key: &str, head: bool, ctx: &iam::Ctx<'_>) -> S3Result<Resp> {
+        if check_key(key).is_err() {
             return Err(err::AccessDenied());
         }
+        // Public through the bucket (ACL or policy), or through the object's own ACL.
+        self.authorize(&Principal::Anonymous, "s3:GetObject", Some(bucket), Some(key), ctx)?;
         let (meta, _) = self.store.get_object(bucket, key)?;
         if let Some((_, loc)) = meta.headers.iter().find(|(k, v)| k == WEBSITE_REDIRECT && valid_redirect_location(v)) {
             let mut r = Resp::new(StatusCode::MOVED_PERMANENTLY);
@@ -1904,8 +1913,9 @@ impl Server {
             ObjectOp::ListParts => self.list_parts(r, bucket, key),
             // Objects have no ACLs of their own: what applies to them is their bucket's ACL.
             ObjectOp::GetAcl => {
-                self.lookup(bucket, key, vref)?;
-                Ok(Resp::xml(acl_doc(self.bucket_access(bucket)?.acl)))
+                let (meta, _) = self.lookup(bucket, key, vref)?;
+                let acl = if is_public_object(&meta) { CannedAcl::PublicRead } else { self.bucket_access(bucket)?.acl };
+                Ok(Resp::xml(acl_doc(acl)))
             }
             ObjectOp::GetTagging => {
                 let (meta, _) = self.lookup(bucket, key, vref)?;
@@ -1951,16 +1961,25 @@ impl Server {
                     None => acl_from_xml(&self.read_xml(r).await?)?,
                 };
                 self.check_acl(bucket, r.header("x-amz-acl").unwrap_or(xml_acl_name(acl)))?;
-                // Accepting a different ACL and ignoring it would let a caller believe an object
-                // in a public bucket was now private.
-                let current = self.bucket_access(bucket)?.acl;
-                if acl != current {
+                // An object can be made public in a private bucket, but not private in a public
+                // one: accepting that and ignoring it would let a caller believe it worked.
+                let bucket_acl = self.bucket_access(bucket)?.acl;
+                if acl == CannedAcl::Private && bucket_acl != CannedAcl::Private {
                     return Err(err::NotImplemented().with_message(format!(
-                        "Object ACLs are not supported: objects have their bucket's ACL ({}). Use the bucket ACL or a bucket policy.",
-                        current.as_str()
+                        "Objects in a {} bucket can't be made private; use a bucket policy instead.",
+                        bucket_acl.as_str()
                     )));
                 }
-                Ok(Resp::ok())
+                let stored = object_acl(Some(acl.as_str()))?.map(|(_, v)| v);
+                let out = self
+                    .store
+                    .submit(Op::SetObjectAcl { bucket: bucket.into(), key: key.into(), version: version.clone(), acl: stored })
+                    .await?;
+                let mut resp = Resp::ok();
+                if let OpOut::Object(m) = &out {
+                    set_version_header(&mut resp, m);
+                }
+                Ok(resp)
             }
             ObjectOp::PutTagging => {
                 let doc = self.read_xml(r).await?;
@@ -2891,6 +2910,7 @@ impl Server {
         let mut headers = stored_headers(&r.parts.headers)?;
         headers.extend(enc.map(|(_, h)| h).unwrap_or_default());
         headers.extend(lock_headers);
+        headers.extend(object_acl(r.header("x-amz-acl"))?);
         self.metrics.add_bytes_in(ing.size);
         let (storage, inline, files) = ing.storage();
         let meta = ObjectMeta {
@@ -3252,6 +3272,7 @@ impl Server {
             let mut headers = if replace { stored_headers(&r.parts.headers)? } else { inheritable(&src.headers) };
             headers.extend(dst_enc.as_ref().map(|(_, h)| h.clone()).unwrap_or_default());
             headers.extend(lock_headers.iter().cloned());
+            headers.extend(object_acl(r.header("x-amz-acl"))?);
             // Shared segments keep the source's parts, and with them the parts' checksums.
             if new_md5.is_none() {
                 headers.extend(src.headers.iter().filter(|(k, _)| k == store::PART_CHECKSUMS).cloned());
@@ -3317,6 +3338,7 @@ impl Server {
         let mut headers = stored_headers(&r.parts.headers)?;
         headers.extend(enc.map(|(_, h)| h).unwrap_or_default());
         headers.extend(self.new_lock_headers(&r.parts.headers, bucket)?);
+        headers.extend(object_acl(r.header("x-amz-acl"))?);
         // A checksum algorithm (and type) for the parts and the whole object.
         let algo = match r.header("x-amz-checksum-algorithm") {
             Some(a) => Some(ChecksumAlgo::from_name(a.trim()).ok_or_else(|| {
@@ -3563,6 +3585,7 @@ impl Server {
         headers.retain(|(k, _)| !k.starts_with(SSE));
         headers.extend(enc.as_ref().map(|(_, h)| h.clone()).unwrap_or_default());
         headers.extend(self.new_lock_headers(&HeaderMap::new(), bucket)?);
+        headers.extend(object_acl(f.get("acl").map(String::as_str))?);
         headers.sort();
 
         let (min, max) = range.unwrap_or((0, MAX_OBJECT_SIZE));
@@ -3900,6 +3923,19 @@ fn part_checksums(meta: &ObjectMeta) -> Vec<&str> {
 }
 
 /// Stored headers a copy takes over from its source (not encryption or Object Lock state).
+/// The stored form of a canned ACL given for a new object: objects remember only that they are
+/// public (readable by anyone); otherwise their bucket's ACL applies.
+fn object_acl(acl: Option<&str>) -> S3Result<Option<(String, String)>> {
+    Ok(match acl.map(CannedAcl::parse).transpose()? {
+        Some(CannedAcl::PublicRead | CannedAcl::PublicReadWrite) => Some((store::OBJECT_ACL.into(), "public-read".into())),
+        _ => None,
+    })
+}
+
+fn is_public_object(meta: &ObjectMeta) -> bool {
+    !meta.delete_marker && meta.headers.iter().any(|(k, v)| k == store::OBJECT_ACL && v == "public-read")
+}
+
 fn inheritable(h: &[(String, String)]) -> Vec<(String, String)> {
     h.iter()
         .filter(|(k, _)| {

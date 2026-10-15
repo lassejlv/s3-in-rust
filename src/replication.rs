@@ -797,6 +797,9 @@ impl Replicator {
         if sse {
             headers.push(("x-amz-server-side-encryption".into(), "AES256".into()));
         }
+        if meta.headers.iter().any(|(k, v)| k == crate::store::OBJECT_ACL && v == "public-read") {
+            headers.push(("x-amz-acl".into(), "public-read".into()));
+        }
         headers.push(replica_header());
         let parts: Vec<u64> = match &meta.storage {
             Storage::Segments(s) if meta.etag.contains('-') => s.iter().map(|(_, l)| *l).collect(),

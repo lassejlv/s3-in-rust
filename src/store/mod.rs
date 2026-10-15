@@ -535,6 +535,13 @@ pub enum Op {
         legal_hold: Option<bool>,
         bypass: bool,
     },
+    /// Set (or with `None` remove) a version's own canned ACL.
+    SetObjectAcl {
+        bucket: String,
+        key: String,
+        version: Option<String>,
+        acl: Option<String>,
+    },
     /// Lifecycle: permanently remove noncurrent entries (key, seq, rule). Each item is
     /// re-checked against the current state, so concurrent writes never cause early deletion.
     PurgeVersions {
@@ -2452,6 +2459,8 @@ fn bucket_has_versions(tx: &Tables, bucket: &str) -> S3Result<bool> {
 
 /// Stored headers with this prefix are internal: never sent to clients or copied.
 pub const INTERNAL_PREFIX: &str = "x-s3rs-";
+/// An object version's own canned ACL (absent: the bucket's ACL applies).
+pub const OBJECT_ACL: &str = "x-s3rs-acl";
 /// An upload's checksum algorithm and type (CreateMultipartUpload).
 pub const UPLOAD_CHECKSUM_ALGO: &str = "x-s3rs-checksum-algorithm";
 pub const UPLOAD_CHECKSUM_TYPE: &str = "x-s3rs-checksum-type";
@@ -2858,6 +2867,17 @@ fn apply(tx: &mut Tables, op: Op, garbage: &mut Vec<u128>, last_seq: &mut u64) -
             })?;
             Ok(OpOut::Object(meta))
         }
+        Op::SetObjectAcl { bucket, key, version, acl } => {
+            let meta = update_version(tx, &bucket, &key, version.as_deref(), |meta| {
+                meta.headers.retain(|(k, _)| k != OBJECT_ACL);
+                if let Some(a) = &acl {
+                    meta.headers.push((OBJECT_ACL.to_string(), a.clone()));
+                    meta.headers.sort();
+                }
+                Ok(())
+            })?;
+            Ok(OpOut::Object(meta))
+        }
         Op::PurgeVersions { bucket, items } => {
             let mut out = Vec::new();
             for (key, seq, rule) in items {
@@ -3006,7 +3026,7 @@ fn apply(tx: &mut Tables, op: Op, garbage: &mut Vec<u128>, last_seq: &mut u64) -
                 return Err(unverifiable());
             }
             let mut headers: Vec<(String, String)> =
-                u.headers.into_iter().filter(|(k, _)| !k.starts_with(INTERNAL_PREFIX)).collect();
+                u.headers.into_iter().filter(|(k, _)| !k.starts_with(INTERNAL_PREFIX) || k == OBJECT_ACL).collect();
             if let Some(list) = part_list {
                 headers.push((PART_CHECKSUMS.to_string(), list));
             }

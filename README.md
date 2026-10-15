@@ -423,9 +423,16 @@ Behind a reverse proxy (Railway, Fly, nginx), pass `--behind-proxy` so `aws:Sour
 headers are ignored.
 
 The `public-read` ACL lets anonymous callers GET objects and list the bucket. `public-read-write`
-also lets them upload and delete. Objects have no ACLs of their own: they have their bucket's
-ACL. GetObjectAcl reports it, `x-amz-acl` on uploads is otherwise ignored, and PutObjectAcl
-refuses (`NotImplemented`) to set anything else.
+also lets them upload and delete.
+
+**Object ACLs:** an object uploaded with `x-amz-acl: public-read` (PUT, copy, multipart upload,
+or the `acl` field of a browser POST), or given that ACL later with PutObjectAcl, can be read by
+anyone, also in a private bucket and from the website endpoint, while the bucket's listing and
+its other objects stay private. This is what applications that publish individual uploads
+(avatars, attachments) expect. Each object version has its own ACL, and copies don't inherit it.
+An explicit `Deny` in the bucket policy and `IgnorePublicAcls` still win. Objects without their
+own public ACL have their bucket's: a private object ACL can't make an object private in a
+public bucket (PutObjectAcl refuses that with `NotImplemented`; use a bucket policy).
 
 **Public access blocks** work as on S3: `BlockPublicAcls` refuses public ACLs (on the bucket and
 in `x-amz-acl` on uploads), `IgnorePublicAcls` makes a public ACL behave as private,

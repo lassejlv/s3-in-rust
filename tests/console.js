@@ -239,6 +239,34 @@ const shot = (page, name) => (out ? page.screenshot({ path: `${out}/${name}.png`
   await page.waitForSelector('#details button:has-text("Make public")');
   if ((await fetch(publicUrl)).status !== 403) throw new Error('private object still readable');
 
+  if (process.env.S3RS_ADMIN_TOKEN) {
+    step('access keys: create and revoke');
+    await page.click('#keys');
+    await page.fill('#f-admin', 'wrong-token');
+    await page.click('#modal-ok');
+    await page.waitForSelector('.toast:has-text("admin token was refused")');
+    await page.click('#keys');
+    await page.fill('#f-admin', process.env.S3RS_ADMIN_TOKEN);
+    await page.click('#modal-ok');
+    await page.waitForSelector('.keys-table');
+    await page.click('#modal-body button:has-text("New key")');
+    await page.fill('#f-kdesc', 'made in the console');
+    await page.check('#f-kro');
+    await page.click('#modal-ok');
+    await page.waitForSelector('#modal-title:has-text("Key created")');
+    const newKey = await page.inputValue('#modal-body label:has-text("Access key") input');
+    const newSecret = await page.inputValue('#modal-body label:has-text("Secret key") input');
+    if (!newKey || newSecret.length < 20) throw new Error('no key/secret shown');
+    await page.click('#modal-ok');
+    await page.waitForSelector(`.keys-table tr:has-text("${newKey}")`);
+    if (!(await page.textContent(`.keys-table tr:has-text("${newKey}")`)).includes('read-only')) throw new Error('key not read-only');
+    await page.click(`.keys-table tr:has-text("${newKey}") button:has-text("Revoke")`);
+    await page.click('#modal-ok');
+    await page.waitForSelector('.keys-table');
+    if (await page.locator(`.keys-table tr:has-text("${newKey}")`).count()) throw new Error('key not revoked');
+    await page.click('#modal-ok');
+  }
+
   step('dark mode + mobile screenshot');
   await page.emulateMedia({ colorScheme: 'dark' });
   await page.setViewportSize({ width: 390, height: 760 });

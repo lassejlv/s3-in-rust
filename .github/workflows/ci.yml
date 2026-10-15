@@ -57,6 +57,7 @@ jobs:
             --lifecycle-interval 1 --encryption-key-file /tmp/s3rs.key \
             --website-listen 127.0.0.1:9001 --website-domain web.localhost \
             --webhook test=http://127.0.0.1:9399/hook --webhook-secret hooksecret \
+            --admin-token console-admin-token \
             --access-log json > /tmp/access.log 2> /tmp/s3rs.log &
           echo $! > /tmp/s3rs.pid
           for i in $(seq 50); do curl -sf http://127.0.0.1:9000/_health && break; sleep 0.1; done
@@ -123,6 +124,7 @@ jobs:
       - name: web console (Playwright)
         env:
           S3RS_CONSOLE_URL: http://localhost:9000
+          S3RS_ADMIN_TOKEN: console-admin-token
           LANG: C.UTF-8  # non-ASCII download names need a UTF-8 locale in Chromium
           S3RS_ACCESS_KEY: testkey
           S3RS_SECRET_KEY: testsecret

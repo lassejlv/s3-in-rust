@@ -78,6 +78,8 @@ key. From the console you can:
 - Delete objects and whole folders, and change a bucket's versioning, public access, website,
   quota and lifecycle settings (delete objects or old versions after some days, clean up
   unfinished uploads; rules set by other tools are kept), and edit its bucket policy as JSON.
+- With the server's admin token, list, create (read-only, bucket-limited or expiring) and revoke
+  access keys under **Access keys**. The token is kept only while the page is open.
 
 The console is three static files compiled into the binary. Every request is signed with SigV4
 inside the browser tab, so the server keeps no sessions and the console can do nothing an S3

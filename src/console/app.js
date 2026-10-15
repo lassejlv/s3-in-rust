@@ -916,6 +916,91 @@ async function deleteBucket(b) {
   } catch (e) { toast(e.message, true); }
 }
 
+// ------------------------------------------------------------------ access keys (admin API)
+
+// The admin token stays in this page's memory only.
+let adminToken = "";
+
+async function admin(method, path = "", body = null) {
+  const resp = await fetch(`/_admin/keys${path}`, {
+    method, cache: "no-store", headers: { authorization: `Bearer ${adminToken}`, "content-type": "application/json" },
+    body: body ? JSON.stringify(body) : null,
+  });
+  const text = await resp.text();
+  if (!resp.ok) {
+    let msg = `HTTP ${resp.status}`;
+    if (text.startsWith("<")) msg = xmlText(new DOMParser().parseFromString(text, "application/xml"), "Message") || msg;
+    throw new S3Error(resp.status, null, msg);
+  }
+  return text ? JSON.parse(text) : null;
+}
+
+async function manageKeys() {
+  if (!adminToken) {
+    const t = await prompt("Admin token", [
+      el("p", { class: "muted" }, "Managing access keys needs the server's admin token (--admin-token). It is kept only while this page is open."),
+      el("label", {}, "Admin token", el("input", { id: "f-admin", type: "password", required: true, autocomplete: "off" })),
+    ], "Continue", () => $("f-admin").value.trim());
+    if (!t) return;
+    adminToken = t;
+  }
+  let keys;
+  try {
+    keys = (await admin("GET")).keys;
+  } catch (e) {
+    if (e.status === 403) adminToken = "";
+    toast(e.status === 403 ? "The admin token was refused (or the admin API is off)." : e.message, true);
+    return;
+  }
+  let action = null;
+  const rows = keys.map((k) => el("tr", {},
+    el("td", { class: "mono" }, k.access_key),
+    el("td", {}, k.description || (k.source === "file" ? "(credentials file)" : "")),
+    el("td", {}, [k.read_only ? "read-only" : "read-write", k.buckets ? `buckets: ${k.buckets.join(", ")}` : null, k.policy ? "policy" : null,
+      k.expires ? `expires ${formatDate(k.expires)}` : null].filter(Boolean).join(" · ")),
+    el("td", {}, k.source === "api"
+      ? el("button", { type: "button", class: "small danger", onclick: () => { action = { revoke: k.access_key }; $("modal").close("cancel"); } }, "Revoke")
+      : null)));
+  await prompt("Access keys", [
+    el("table", { class: "keys-table" }, ...rows),
+    el("button", { type: "button", class: "primary", onclick: () => { action = { create: true }; $("modal").close("cancel"); } }, "New key…"),
+  ], "Done", () => true);
+  if (action?.revoke) return revokeKey(action.revoke);
+  if (action?.create) return createKey();
+}
+
+async function revokeKey(ak) {
+  const ok = await confirmDialog("Revoke key", `Revoke ${ak}? Clients using it stop working at once.`, "Revoke");
+  if (!ok) return;
+  try { await admin("DELETE", `/${encodeURIComponent(ak)}`); toast(`Revoked ${ak}`); } catch (e) { toast(e.message, true); }
+  manageKeys();
+}
+
+async function createKey() {
+  const spec = await prompt("New access key", [
+    el("label", {}, "Description", el("input", { id: "f-kdesc", autocomplete: "off" })),
+    el("label", { class: "radio" }, el("input", { type: "checkbox", id: "f-kro" }), "Read-only"),
+    el("label", {}, "Limit to buckets (comma-separated, * wildcards; empty = all)", el("input", { id: "f-kbuckets", autocomplete: "off" })),
+    el("label", {}, "Expires after (hours; empty = never)", el("input", { id: "f-kexp", type: "number", min: "1", step: "1" })),
+  ], "Create", () => {
+    const body = { description: $("f-kdesc").value.trim(), read_only: $("f-kro").checked };
+    const buckets = $("f-kbuckets").value.split(",").map((b) => b.trim()).filter(Boolean);
+    if (buckets.length) body.buckets = buckets;
+    if ($("f-kexp").value) body.expires_in = Math.round(Number($("f-kexp").value) * 3600);
+    return body;
+  });
+  if (!spec) return manageKeys();
+  let k;
+  try { k = await admin("POST", "", spec); } catch (e) { toast(e.message, true); return; }
+  const copy = (v) => el("input", { class: "share-url", value: v, readonly: true, onfocus: (e) => e.target.select() });
+  await prompt("Key created", [
+    el("p", {}, "Copy the secret key now: it is not shown again."),
+    el("label", {}, "Access key", copy(k.access_key)),
+    el("label", {}, "Secret key", copy(k.secret_key)),
+  ], "Done", () => true);
+  manageKeys();
+}
+
 // ------------------------------------------------------------------ dialogs
 
 function prompt(title, fields, okLabel, collect) {
@@ -963,6 +1048,7 @@ document.addEventListener("DOMContentLoaded", () => {
     }
   });
   $("logout").addEventListener("click", logout);
+  $("keys").addEventListener("click", manageKeys);
   $("new-bucket").addEventListener("click", createBucket);
   $("bucket-filter").addEventListener("input", renderBuckets);
   $("refresh").addEventListener("click", () => loadList(false));

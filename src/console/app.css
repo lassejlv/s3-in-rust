@@ -155,3 +155,6 @@ table.objects { width: 100%; border-collapse: collapse; }
 .access .badge { margin-left: 0; }
 .access .share-url { flex: 1 1 200px; min-width: 0; }
 textarea.policy { width: 100%; font-family: ui-monospace, monospace; font-size: 12px; box-sizing: border-box; }
+.keys-table { width: 100%; border-collapse: collapse; font-size: 13px; margin-bottom: 12px; }
+.keys-table td { padding: 4px 6px; border-bottom: 1px solid var(--border); vertical-align: middle; }
+.mono { font-family: ui-monospace, monospace; }

@@ -813,7 +813,7 @@ direct uploads from web apps.
 | Forms | POST Object (browser uploads with POST policies) |
 | Reads | Single `Range` requests, `partNumber` reads, `If-Match` / `If-None-Match` / `If-Modified-Since` / `If-Unmodified-Since`, `response-*` header overrides |
 | Writes | Conditional writes (`If-None-Match: *` or an ETag, `If-Match`), `Content-MD5`, `x-amz-content-sha256` verification, user metadata (`x-amz-meta-*`) and standard headers |
-| Checksums | CRC32, CRC32C, CRC64NVME, SHA1 and SHA256, sent as headers or as aws-chunked trailers. They are verified on upload and returned with `x-amz-checksum-mode: ENABLED`. Multipart uploads get COMPOSITE or FULL_OBJECT checksums, and their parts keep their own. |
+| Checksums | CRC32, CRC32C, CRC64NVME, SHA1 and SHA256, sent as headers or as aws-chunked trailers. They are verified on upload and returned with `x-amz-checksum-mode: ENABLED`. Multipart uploads get COMPOSITE or FULL_OBJECT checksums, and their parts keep their own. CopyObject with `x-amz-checksum-algorithm` computes a new one (also in place). |
 | Auth | SigV4 headers, SigV4 presigned URLs, SigV4 streaming (`STREAMING-AWS4-HMAC-SHA256-PAYLOAD[-TRAILER]`, `STREAMING-UNSIGNED-PAYLOAD-TRAILER`), SigV2 headers and presigned URLs |
 | Transport | HTTP/1.1 keep-alive, HTTP/2 (h2c), path-style and virtual-hosted-style addressing |
 

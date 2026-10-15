@@ -2810,6 +2810,14 @@ impl Server {
         let requested_enc = self.write_encryption(&r.parts.headers, bucket, None)?;
         let explicit_enc = r.header(SSE).is_some() || r.header(SSE_C_ALG).is_some();
         let lock_headers = self.new_lock_headers(&r.parts.headers, bucket)?;
+        // A checksum algorithm for the copy: computed from the data unless the source already
+        // has that (full-object) checksum.
+        let want_checksum = match r.header("x-amz-checksum-algorithm") {
+            Some(a) => Some(ChecksumAlgo::from_name(a.trim()).ok_or_else(|| {
+                err::InvalidRequest().with_message("x-amz-checksum-algorithm must be CRC32, CRC32C, CRC64NVME, SHA1 or SHA256")
+            })?),
+            None => None,
+        };
         let _ = r.body.read_all(MAX_XML_BODY).await?;
         for attempt in 0..3 {
             let (src, inline) = self.lookup(&sb, &sk, sv.as_deref())?;
@@ -2830,26 +2838,37 @@ impl Server {
                 (Some(a), Some(b)) => a.same(b),
                 _ => false,
             };
-            if sb == bucket && sk == key && !replace && sv.is_none() && !explicit_enc {
+            if sb == bucket && sk == key && !replace && sv.is_none() && !explicit_enc && want_checksum.is_none() {
                 return Err(err::InvalidRequest().with_message(
                     "This copy request is illegal because it is trying to copy an object to itself without changing the object's metadata, storage class, website redirect location or encryption attributes.",
                 ));
             }
+            let recompute = want_checksum.filter(|a| {
+                src.checksum
+                    .as_ref()
+                    .is_none_or(|(have, v)| have != a || crate::checksum::Kind::of(v) != crate::checksum::Kind::FullObject)
+            });
+            let mut checksum = src.checksum.clone();
             let (storage, files, new_md5) = match &src.storage {
-                // Re-encrypting, or versioned buckets (which keep small objects in files): write
-                // a new data file from the plaintext.
+                // Re-encrypting, computing a new checksum, or versioned buckets (which keep small
+                // objects in files): write a new data file from the plaintext.
                 Storage::Inline(_) | Storage::Segments(_)
-                    if !same_key || (dest_versioned && matches!(src.storage, Storage::Inline(_))) =>
+                    if !same_key || recompute.is_some() || (dest_versioned && matches!(src.storage, Storage::Inline(_))) =>
                 {
                     let (st, src2, data, size) = (self.store.clone(), src.clone(), inline.clone(), src.size);
                     let (sk2, dk2) = (src_key.clone(), dst_key.clone());
                     let res = tokio::task::spawn_blocking(move || {
-                        io::copy_range_blocking(&st, &src2, data.as_ref(), 0, size, sk2.as_ref(), dk2.as_ref(), None)
+                        io::copy_range_blocking(&st, &src2, data.as_ref(), 0, size, sk2.as_ref(), dk2.as_ref(), recompute)
                     })
                     .await
                     .map_err(S3Error::internal)?;
                     match res {
-                        Ok((id, md5, _)) => (Storage::Segments(vec![(id, size)]), vec![id], Some(md5)),
+                        Ok((id, md5, sum)) => {
+                            if sum.is_some() {
+                                checksum = sum;
+                            }
+                            (Storage::Segments(vec![(id, size)]), vec![id], Some(md5))
+                        }
                         Err(e) if e.kind() == std::io::ErrorKind::NotFound && attempt < 2 => continue,
                         Err(e) => return Err(e.into()),
                     }
@@ -2888,7 +2907,7 @@ impl Server {
                     None => src.etag.clone(),
                 },
                 headers,
-                checksum: src.checksum.clone(),
+                checksum: checksum.clone(),
                 storage,
                 tags,
                 version: None,
@@ -2907,7 +2926,7 @@ impl Server {
                 _ => src.etag.clone(),
             };
             x.elem("LastModified", iso8601(mtime)).elem("ETag", &new_etag);
-            if let Some((a, v)) = &src.checksum {
+            if let Some((a, v)) = &checksum {
                 x.elem(a.xml_name(), v);
                 x.elem("ChecksumType", crate::checksum::Kind::of(v).name());
             }

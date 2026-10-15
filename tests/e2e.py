@@ -276,6 +276,24 @@ def t_multipart_checksums():
     s3.abort_multipart_upload(Bucket=B, Key="mp-ck-bad", UploadId=up["UploadId"])
 
 
+def t_copy_checksum():
+    import base64
+    import zlib
+    data = os.urandom(300_000)
+    s3.put_object(Bucket=B, Key="ck-copy-src", Body=data)
+    r = s3.copy_object(Bucket=B, Key="ck-copy-dst", CopySource={"Bucket": B, "Key": "ck-copy-src"}, ChecksumAlgorithm="CRC32")
+    want = base64.b64encode(zlib.crc32(data).to_bytes(4, "big")).decode()
+    assert r["CopyObjectResult"]["ChecksumCRC32"] == want, r
+    h = s3.head_object(Bucket=B, Key="ck-copy-dst", ChecksumMode="ENABLED")
+    assert h["ChecksumCRC32"] == want
+    # Adding a checksum to an object in place.
+    s3.copy_object(Bucket=B, Key="ck-copy-src", CopySource={"Bucket": B, "Key": "ck-copy-src"}, ChecksumAlgorithm="CRC32")
+    assert s3.head_object(Bucket=B, Key="ck-copy-src", ChecksumMode="ENABLED")["ChecksumCRC32"] == want
+    assert s3.get_object(Bucket=B, Key="ck-copy-src")["Body"].read() == data
+    for k in ("ck-copy-src", "ck-copy-dst"):
+        s3.delete_object(Bucket=B, Key=k)
+
+
 def t_conditional_deletes():
     etag = s3.put_object(Bucket=B, Key="cdel", Body=b"12345")["ETag"]
     expect_error("PreconditionFailed", lambda: s3.delete_object(Bucket=B, Key="cdel", IfMatch='"nope"'))

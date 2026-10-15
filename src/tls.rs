@@ -31,11 +31,24 @@ mod imp {
         Arc::new(rustls::crypto::ring::default_provider())
     }
 
+    /// A readable PEM error (some variants otherwise print their marker as a byte array).
+    fn pem_error(path: &Path, e: rustls_pki_types::pem::Error) -> String {
+        use rustls_pki_types::pem::Error;
+        let what = match e {
+            Error::MissingSectionEnd { end_marker } => {
+                format!("missing `-----END {}-----` (truncated file?)", String::from_utf8_lossy(&end_marker))
+            }
+            Error::NoItemsFound => "no PEM items found (encrypted keys are not supported)".to_string(),
+            e => e.to_string(),
+        };
+        format!("{}: {what}", path.display())
+    }
+
     fn read_certs(path: &Path) -> Result<Vec<CertificateDer<'static>>, String> {
         let certs = CertificateDer::pem_file_iter(path)
-            .map_err(|e| format!("{}: {e}", path.display()))?
+            .map_err(|e| pem_error(path, e))?
             .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| format!("{}: {e}", path.display()))?;
+            .map_err(|e| pem_error(path, e))?;
         if certs.is_empty() {
             return Err(format!("{}: no PEM certificates found", path.display()));
         }
@@ -79,14 +92,15 @@ mod imp {
 
     fn build_server(cert: &Path, key: &Path) -> Result<ServerConfig, String> {
         let certs = read_certs(cert)?;
-        let key = PrivateKeyDer::from_pem_file(key).map_err(|e| format!("{}: {e}", key.display()))?;
+        let key_path = key;
+        let key = PrivateKeyDer::from_pem_file(key).map_err(|e| pem_error(key, e))?;
         // with_single_cert also checks that the key belongs to the certificate.
         let mut cfg = ServerConfig::builder_with_provider(provider())
             .with_safe_default_protocol_versions()
             .map_err(|e| e.to_string())?
             .with_no_client_auth()
             .with_single_cert(certs, key)
-            .map_err(|e| format!("{}: {e}", cert.display()))?;
+            .map_err(|e| format!("{} with key {}: {e}", cert.display(), key_path.display()))?;
         cfg.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
         Ok(cfg)
     }
@@ -108,6 +122,11 @@ mod imp {
             .with_no_client_auth();
         cfg.alpn_protocols = vec![b"http/1.1".to_vec()];
         Ok(Arc::new(cfg))
+    }
+
+    /// Check that `host` (a DNS name or IP address, without brackets) can be verified by TLS.
+    pub fn check_server_name(host: &str) -> Result<(), String> {
+        ServerName::try_from(host).map(|_| ()).map_err(|e| format!("{host}: {e}"))
     }
 
     /// Start TLS on a connected stream to `host` (a DNS name or IP address).
@@ -156,6 +175,10 @@ mod stub {
         pub async fn accept(self, _stream: TcpStream) -> std::io::Result<TcpStream> {
             Err(std::io::Error::other(UNSUPPORTED))
         }
+    }
+
+    pub fn check_server_name(_host: &str) -> Result<(), String> {
+        Ok(())
     }
 
     pub fn client_config(_extra_ca: Option<&Path>) -> Result<Arc<ClientConfig>, String> {

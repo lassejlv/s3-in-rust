@@ -2,7 +2,8 @@
 
 A fast, lightweight, S3-compatible object storage server written in pure Rust.
 
-- **Single static binary** (~4.5 MB), no runtime dependencies, no C code in the dependency tree.
+- **Single self-contained binary** (~4.5 MB, linked only against the system C library), no C code
+  in the dependency tree.
   Native HTTPS is an optional build feature (see [HTTPS](#https-tls)).
 - **Works with standard S3 clients**: AWS CLI, boto3, and other SDKs (SigV4 and SigV2 auth, presigned
   URLs, streaming/chunked uploads, multipart uploads, checksums).
@@ -108,6 +109,11 @@ and status, a latency histogram, bytes in and out, lifecycle activity, and the b
 endpoints are public unless you set `--metrics-token`, which applies to `/_metrics` only. Per-bucket
 series (which name every bucket) are included only when `/_metrics` is protected by a token.
 
+Connections that stay silent are closed: a new connection must send its first request within 30
+seconds, and every request's headers (including the next request on a kept-alive connection) must
+arrive within 30 seconds. HTTP/2 connections are pinged every 30 seconds and closed if the peer
+doesn't answer.
+
 On `SIGTERM` or Ctrl-C the server stops accepting connections and waits up to 30 seconds for
 in-flight requests to finish. It then flushes metadata and records a clean shutdown. If a run
 crashes, the next start scans the store before serving and removes orphaned data files.
@@ -125,15 +131,17 @@ cargo build --release --features tls
 # s3rs listening on https://0.0.0.0:9000 ...
 ```
 
-- The certificate file holds the PEM chain (leaf first). The key is PKCS#8, PKCS#1 or SEC1 PEM. The
-  server refuses to start if the key doesn't match the certificate.
+- The certificate file holds the PEM chain (leaf first). The key is an unencrypted PEM key (PKCS#8,
+  PKCS#1 or SEC1) for RSA, ECDSA P-256/P-384 or Ed25519. The server refuses to start if the key
+  doesn't match the certificate.
 - The same certificate serves the S3 API, the console and the `--website-listen` endpoint. Use one
   with names (or a wildcard) for each of them.
 - TLS 1.2 and 1.3 are supported. ALPN offers HTTP/2 and HTTP/1.1.
 - `SIGHUP` re-reads the certificate and key (for example after a Let's Encrypt renewal), together
   with the access keys. Open connections keep the old certificate. New ones get the new certificate.
   If the new files can't be loaded, the old certificate stays in use and the log says so.
-- Clients get 10 seconds to complete the handshake.
+- Clients get 10 seconds to complete the handshake. Handshakes still in progress at shutdown are
+  dropped.
 - Policies see `aws:SecureTransport` as `true`, and website redirects use `https://`.
 
 A default build refuses to start when given `--tls-cert`. Behind a TLS-terminating proxy (or on
@@ -357,7 +365,7 @@ Supported: index documents (`/` and `/dir/`, and `/dir` redirects to `/dir/`), e
 `Protocol` and `HttpRedirectCode` redirects), `RedirectAllRequestsTo`, per-object
 `x-amz-website-redirect-location`, ranges and conditional GETs. Errors are HTML pages. The endpoint
 accepts only anonymous GET and HEAD, and never lists buckets. Redirects use `https://` when s3rs
-serves TLS, and behind a TLS-terminating proxy they use the scheme from `X-Forwarded-Proto`.
+serves TLS, and with `--behind-proxy` they use the scheme from `X-Forwarded-Proto`.
 
 ## Usage and quotas
 

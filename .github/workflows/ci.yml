@@ -24,7 +24,11 @@ jobs:
       - run: cargo test
       - run: cargo test --features tls
       - name: the default build has no C code
-        run: "! cargo tree -e normal,build | grep -E ' (cc|ring|aws-lc-sys|cmake) v'"
+        shell: bash
+        run: |
+          cargo tree -e normal,build --target all > /tmp/tree.txt
+          grep -q '^s3rs v' /tmp/tree.txt
+          ! grep -E ' (cc|ring|aws-lc-sys|cmake) v' /tmp/tree.txt
 
   e2e:
     name: end-to-end (boto3, aws-cli, minio-go)

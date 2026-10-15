@@ -427,6 +427,10 @@ impl Url {
         if port == 0 {
             return Err(bad("port"));
         }
+        if tls {
+            crate::tls::check_server_name(host.trim_start_matches('[').trim_end_matches(']'))
+                .map_err(|e| format!("{s}: invalid TLS server name ({e})"))?;
+        }
         if path.contains('#') || path.parse::<hyper::http::uri::PathAndQuery>().is_err() {
             return Err(bad("path"));
         }
@@ -561,6 +565,11 @@ mod tests {
         let u = Url::parse("https://hooks.example.com/s3").unwrap();
         assert!(u.tls && u.port == 443 && u.host_header() == "hooks.example.com");
         assert_eq!(Url::parse("https://h:8443/").unwrap().host_header(), "h:8443");
+        #[cfg(feature = "tls")]
+        for bad in ["https://127.1/", "https://a..b/", "https://-x-/"] {
+            assert!(Url::parse(bad).is_err(), "{bad:?}");
+        }
+        assert!(Url::parse("https://[::1]:8443/").is_ok() && Url::parse("https://10.0.0.1/").is_ok());
         assert_eq!(Url::parse("http://h").unwrap().path, "/");
         assert_eq!(Url::parse("http://[::1]:9/").unwrap().host, "[::1]");
         assert!(Url::parse("ftp://h/").is_err());

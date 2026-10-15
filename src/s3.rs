@@ -534,6 +534,13 @@ impl Server {
         Client { ip, secure }
     }
 
+    /// `scheme://host` of a request, for URLs that point back at this server. HTTP/2 requests
+    /// carry the host in the URI instead of a Host header.
+    fn base_url(&self, parts: &Parts, client: Client) -> String {
+        let host = header(&parts.headers, "host").or_else(|| parts.uri.authority().map(|a| a.as_str())).unwrap_or("localhost");
+        format!("{}://{host}", if client.secure { "https" } else { "http" })
+    }
+
     /// Policy context for a request.
     fn ctx<'a>(
         &self,
@@ -732,12 +739,8 @@ impl Server {
             Err(e) => return page(e),
         };
         let Some(cfg) = access.website.clone() else { return page(err::NoSuchWebsiteConfiguration()) };
-        // Behind a TLS-terminating proxy the original scheme arrives in X-Forwarded-Proto.
-        let proto = header(&parts.headers, "x-forwarded-proto")
-            .and_then(|p| p.split(',').next())
-            .map(str::trim)
-            .filter(|p| *p == "https" || *p == "http")
-            .unwrap_or(if self.tls { "https" } else { "http" });
+        // HTTPS when s3rs serves TLS, or (with --behind-proxy) when the proxy says so.
+        let proto = if ctx.secure { "https" } else { "http" };
         let redirect = |code: u16, location: &str| {
             let mut r = Resp::new(StatusCode::from_u16(code).unwrap_or(StatusCode::MOVED_PERMANENTLY));
             r.set("location", location);
@@ -2503,8 +2506,7 @@ impl Server {
             _ => None,
         };
 
-        let host = header(&parts.headers, "host").unwrap_or("localhost");
-        let location = format!("http://{host}/{bucket}/{}", uri_encode(&key, true));
+        let location = format!("{}/{bucket}/{}", self.base_url(parts, client), uri_encode(&key, true));
         let redirect = f.get("success_action_redirect").or_else(|| f.get("redirect")).filter(|u| !u.is_empty());
         if let Some(url) = redirect {
             let sep = if url.contains('?') { '&' } else { '?' };
@@ -2577,9 +2579,8 @@ impl Server {
         let out = self.store.submit(Op::Complete { bucket: bucket.into(), key: key.into(), upload, parts, cond }).await?;
         let OpOut::Object(meta) = out else { return Err(S3Error::internal("unexpected writer reply")) };
         self.notify_created(r, "ObjectCreated:CompleteMultipartUpload", bucket, key, &meta);
-        let host = r.header("host").unwrap_or("localhost");
         let mut x = Xml::new("CompleteMultipartUploadResult");
-        x.elem("Location", format!("http://{host}/{bucket}/{}", uri_encode(key, true)))
+        x.elem("Location", format!("{}/{bucket}/{}", self.base_url(&r.parts, r.client), uri_encode(key, true)))
             .elem("Bucket", bucket)
             .elem("Key", key)
             .elem("ETag", &meta.etag);

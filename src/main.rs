@@ -4,6 +4,7 @@ mod access;
 mod auth;
 mod body;
 mod chunked;
+mod conn;
 mod console;
 mod crypt;
 mod error;
@@ -23,7 +24,7 @@ mod website;
 mod xml;
 
 use hyper::service::service_fn;
-use hyper_util::rt::{TokioExecutor, TokioIo};
+use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use hyper_util::server::conn::auto;
 use std::convert::Infallible;
 use std::net::SocketAddr;
@@ -482,7 +483,8 @@ fn main() {
         match tls::client_config(cfg.webhook_ca.as_deref()) {
             Ok(c) => Some(c),
             Err(e) => {
-                eprintln!("error: https:// webhooks: {e}");
+                let what = if cfg.webhooks.iter().any(|(_, u)| u.tls) { "https:// webhooks" } else { "--webhook-ca" };
+                eprintln!("error: {what}: {e}");
                 std::process::exit(2);
             }
         }
@@ -595,9 +597,19 @@ async fn serve(
     }
 
     let mut builder = auto::Builder::new(TokioExecutor::new());
-    builder.http1().keep_alive(true).max_buf_size(1024 * 1024);
+    // The timer makes hyper enforce its timeouts: a request's headers (and the next request on a
+    // kept-alive connection) must arrive within 30s, and HTTP/2 peers must answer pings.
+    builder
+        .http1()
+        .timer(TokioTimer::new())
+        .header_read_timeout(Duration::from_secs(30))
+        .keep_alive(true)
+        .max_buf_size(1024 * 1024);
     builder
         .http2()
+        .timer(TokioTimer::new())
+        .keep_alive_interval(Duration::from_secs(30))
+        .keep_alive_timeout(Duration::from_secs(20))
         .max_concurrent_streams(256)
         .initial_stream_window_size(4 * 1024 * 1024)
         .initial_connection_window_size(16 * 1024 * 1024);
@@ -641,6 +653,8 @@ async fn serve(
         });
     }
 
+    // Tells connections still in their TLS handshake to give up, so they don't delay the drain.
+    let (stopping_tx, stopping) = tokio::sync::watch::channel(false);
     let shutdown = shutdown_signal();
     tokio::pin!(shutdown);
     loop {
@@ -663,6 +677,7 @@ async fn serve(
         let builder = builder.clone();
         let watcher = graceful.watcher();
         let acceptor = tls.as_ref().map(|t| t.acceptor());
+        let mut stopping = stopping.clone();
         tokio::spawn(async move {
             let svc = service_fn(move |req| {
                 let server = server.clone();
@@ -676,21 +691,29 @@ async fn serve(
             });
             match acceptor {
                 None => {
-                    let conn = builder.serve_connection(TokioIo::new(stream), svc).into_owned();
+                    let io = conn::FirstByteDeadline::new(stream, conn::FIRST_BYTE_TIMEOUT);
+                    let conn = builder.serve_connection(TokioIo::new(io), svc).into_owned();
                     let _ = watcher.watch(conn).await;
                 }
                 Some(acceptor) => {
                     // Failed handshakes (scanners, plain HTTP, expired client trust) are routine
                     // on a public port, so they are not logged.
-                    let Ok(Ok(stream)) = tokio::time::timeout(tls::HANDSHAKE_TIMEOUT, acceptor.accept(stream)).await else {
-                        return;
+                    let handshake = tokio::time::timeout(tls::HANDSHAKE_TIMEOUT, acceptor.accept(stream));
+                    let stream = tokio::select! {
+                        r = handshake => match r {
+                            Ok(Ok(s)) => s,
+                            _ => return,
+                        },
+                        _ = stopping.wait_for(|s| *s) => return,
                     };
-                    let conn = builder.serve_connection(TokioIo::new(stream), svc).into_owned();
+                    let io = conn::FirstByteDeadline::new(stream, conn::FIRST_BYTE_TIMEOUT);
+                    let conn = builder.serve_connection(TokioIo::new(io), svc).into_owned();
                     let _ = watcher.watch(conn).await;
                 }
             }
         });
     }
+    let _ = stopping_tx.send(true);
     drop(listener);
     drop(website_listener);
     // End open event streams so they don't hold up the drain.

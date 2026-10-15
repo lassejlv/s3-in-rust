@@ -92,11 +92,15 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          # The release notes are the version's section of CHANGELOG.md.
+          version=${GITHUB_REF_NAME#v}
+          awk -v v="$version" '$0 ~ "^## "v"( |$)" {f=1; next} /^## / && f {exit} f' CHANGELOG.md > notes.md
+          if [ ! -s notes.md ]; then echo "CHANGELOG.md has no section for $version" >&2; exit 1; fi
           cd artifacts
           sha256sum *.tar.gz > SHA256SUMS
           cat SHA256SUMS
           gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --title "s3rs $GITHUB_REF_NAME" \
-            --generate-notes *.tar.gz SHA256SUMS
+            --notes-file ../notes.md *.tar.gz SHA256SUMS
 
   image:
     name: container images

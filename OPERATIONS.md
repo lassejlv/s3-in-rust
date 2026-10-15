@@ -47,7 +47,9 @@ Kubernetes. Use `GET /_health` for liveness and readiness.
 ### Sizing
 
 - **Memory:** about 100–200 MB under load, most of it the metadata cache (`--cache-mb`, default
-  256). A larger cache helps when there are millions of objects.
+  256). A larger cache helps when there are millions of objects. In a 7-minute soak test (16
+  clients of mixed PUT/GET/DELETE/LIST/multipart traffic plus a GET flood, `--cache-mb 64`), memory
+  levelled off at about 120 MB, with constant thread and file counts.
 - **Disk:** objects are stored as-is. Encryption adds 16 bytes per 64 KiB plus 73 bytes per
   object. Objects up to
   `--inline-threshold` (64 KiB) live in the metadata database, larger ones in data files. Versioned

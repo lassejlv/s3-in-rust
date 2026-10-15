@@ -1,0 +1,45 @@
+# Changelog
+
+## 0.1.0 (unreleased)
+
+First release.
+
+**Storage**
+- A single binary with no runtime dependencies. Metadata is in redb, with group-committed
+  durable writes, and small objects are stored inline.
+- Objects larger than that are immutable data files. A crash never loses an acknowledged write:
+  the next start removes orphaned files and recomputes usage counters.
+- Versioning (enabled and suspended), lifecycle rules (expiration, noncurrent versions, incomplete
+  uploads) and Object Lock (governance and compliance retention, legal holds).
+- Server-side encryption with SSE-S3 (master key) and SSE-C, using chunked AES-256-GCM.
+- Per-bucket usage accounting and quotas, including bytes in unfinished multipart uploads.
+- `s3rs fsck` checks a data directory, deeply with `--deep`, and `--repair` fixes it.
+- Consistent online backups (`GET /_admin/backup`) and offline backups (`s3rs backup`) as tar
+  archives.
+- Full-disk safety: a free-space reserve (507 StorageFull), a ballast file, and in-place recovery
+  of the metadata database.
+
+**S3 API**
+- Buckets, objects, multipart uploads, copies, listings (v1, v2, versions), tagging, ACLs (canned),
+  bucket policies, CORS, website hosting, notifications, ranges, conditional requests, checksums
+  (CRC32/CRC32C/CRC64NVME/SHA1/SHA256), POST uploads, GetObjectAttributes.
+- Authentication: SigV4 (headers, presigned URLs, streaming and trailers) and SigV2.
+
+**Access control**
+- Several access keys from a credentials file (reloaded on SIGHUP): read-only keys,
+  bucket-limited keys, and IAM-style policies per key or bucket (conditions, variables, explicit
+  Deny).
+
+**Operations**
+- Web console at `/_console/`.
+- Prometheus metrics, JSON access logs, event notifications (webhooks and live streams).
+- Native HTTPS with certificate reload, as the optional `tls` build feature.
+- Idle timeouts, a connection limit, and slow clients that never hold threads.
+- Release binaries for Linux x86_64 and arm64, container images, a hardened systemd unit and
+  Prometheus alert rules.
+
+**Testing**
+- Unit tests, including AWS SigV4 test vectors and parser fuzzing.
+- Compatibility suites: boto3, aws-cli, minio-go and a Playwright console test, all also over HTTPS.
+- A SIGKILL crash-consistency test, a disk-full test, a backup/restore test and HTTP-level
+  fuzzing, all in CI.

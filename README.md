@@ -101,7 +101,8 @@ Each flag can also be set with the environment variable shown (switches take `1`
 | `--cache-mb` | `S3RS_CACHE_MB` | `256` | Metadata cache size |
 | `--min-free-space` | `S3RS_MIN_FREE_SPACE` | 2% of the disk (16M–256M) | Refuses uploads when the data disk's free space would drop below this (e.g. `512M`, `2G`; `0` turns it off). See [Disk space](#disk-space). |
 | `--no-fsync` | `S3RS_NO_FSYNC` | off | Skips fsync. Faster, but a power loss can lose up to ~1s of acknowledged writes. |
-| `-v, --verbose` | `S3RS_VERBOSE` | off | Logs every request |
+| `--access-log` | `S3RS_ACCESS_LOG` | off | Logs every request to stdout as `json` or `text` (see [Access logs](#access-logs)) |
+| `-v, --verbose` | `S3RS_VERBOSE` | off | Same as `--access-log text` |
 
 The server refuses to start without credentials unless you pass `--anonymous`.
 
@@ -114,6 +115,30 @@ Connections that stay silent are closed: a new connection must send its first re
 seconds, and every request's headers (including the next request on a kept-alive connection) must
 arrive within 30 seconds. HTTP/2 connections are pinged every 30 seconds and closed if the peer
 doesn't answer.
+
+### Access logs
+
+`--access-log json` writes one JSON object per request to stdout. Diagnostics go to stderr, so the
+two streams can be collected separately:
+
+```json
+{"time":"2026-10-15T01:57:54.775Z","request_id":"5B15702C99B7AB0A","endpoint":"api","remote_ip":"10.0.4.7",
+ "user":"mykey","method":"GET","path":"/photos/missing","bucket":"photos","key":"missing",
+ "error":"NoSuchKey","user_agent":"aws-cli/2.17","status":404,"duration_ms":0.040}
+```
+
+- `endpoint` is `api` or `website`.
+- `remote_ip` honours `--behind-proxy`.
+- `user` is the access key of a signed request.
+- `error` is the S3 error code. `bytes_in` and `bytes_out` come from the request and response
+  lengths.
+- Signatures and session tokens in presigned URLs are replaced by `REDACTED`.
+- `request_id` is the `x-amz-request-id` the client received.
+
+Lines are written by a separate thread, so logging never slows requests down: small GETs still run
+at about 85k requests/s with JSON logs on. If stdout can't keep up, lines are dropped and counted
+in `s3rs_access_log_dropped_total`. `--access-log text` (or `-v`) prints a compact human-readable
+line instead.
 
 ### Disk space
 

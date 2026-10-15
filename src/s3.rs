@@ -34,7 +34,8 @@ const MAX_XML_BODY: usize = 4 * 1024 * 1024;
 pub struct Options {
     pub region: String,
     pub domain: Option<String>,
-    pub verbose: bool,
+    /// Log every request (to stdout) in this format.
+    pub access_log: Option<crate::accesslog::Format>,
     /// Origins allowed by default for buckets without their own CORS configuration.
     pub cors_origins: Vec<String>,
     /// If set, `/_metrics` requires `Authorization: Bearer <token>`.
@@ -60,7 +61,7 @@ pub struct Server {
     pub auth: Option<Auth>,
     pub region: String,
     pub domain: Option<String>,
-    pub verbose: bool,
+    access_log: Option<crate::accesslog::AccessLog>,
     pub metrics: crate::metrics::Metrics,
     default_cors: Option<Vec<CorsRule>>,
     /// Parsed ACL / policy / CORS per bucket; invalidated whenever they change.
@@ -358,7 +359,7 @@ impl Server {
             auth,
             region: opts.region,
             domain: opts.domain,
-            verbose: opts.verbose,
+            access_log: opts.access_log.map(crate::accesslog::AccessLog::new),
             metrics: crate::metrics::Metrics::new(opts.events.stats.clone()),
             default_cors,
             access_cache: RwLock::new(HashMap::new()),
@@ -630,10 +631,19 @@ impl Server {
         let query = req.uri().query().map(|q| format!("?{q}")).unwrap_or_default();
         let origin = header(req.headers(), "origin").map(str::to_string);
         let cors_bucket = origin.as_ref().and_then(|_| self.resolve(req.uri(), req.headers()).ok()).and_then(|(b, _, _)| b);
+        // Captured before the request is consumed, for the access log.
+        let log_in = self.access_log.as_ref().map(|_| {
+            let h = req.headers();
+            let n = |name| header(h, name).and_then(|v| v.parse::<u64>().ok());
+            (n("x-amz-decoded-content-length").or_else(|| n("content-length")), header(h, "user-agent").map(str::to_string))
+        });
+        let mut rec = crate::accesslog::Record::default();
+        let mut error_code = None;
         let _inflight = self.metrics.start();
-        let mut resp = match self.route(req, peer, &rid).await {
+        let mut resp = match self.route(req, peer, &rid, &mut rec).await {
             Ok(r) => r,
             Err(e) => {
+                error_code = Some(e.code);
                 if e.status == StatusCode::INTERNAL_SERVER_ERROR {
                     eprintln!("error: {method} {path}: {e}");
                 }
@@ -655,8 +665,22 @@ impl Server {
         }
         let elapsed = started.elapsed();
         self.metrics.finish(&method, resp.status.as_u16(), elapsed);
-        if self.verbose {
-            eprintln!("{method} {path}{query} -> {} ({:.2}ms)", resp.status.as_u16(), elapsed.as_secs_f64() * 1000.0);
+        if let (Some(log), Some((bytes_in, user_agent))) = (&self.access_log, &log_in) {
+            log.log(&crate::accesslog::Entry {
+                endpoint: "api",
+                request_id: &rid,
+                remote_ip: peer.ip(),
+                method: method.as_str(),
+                path: &path,
+                query: query.strip_prefix('?').unwrap_or(&query),
+                status: resp.status.as_u16(),
+                error: error_code,
+                bytes_in: *bytes_in,
+                bytes_out: header(&resp.headers, "content-length").and_then(|v| v.parse().ok()),
+                duration: elapsed,
+                user_agent: user_agent.as_deref(),
+                record: &rec,
+            });
         }
         let mut out = Response::new(resp.body);
         *out.status_mut() = resp.status;
@@ -700,8 +724,23 @@ impl Server {
         let resp = self.website(&parts, &rid, peer).await;
         let elapsed = started.elapsed();
         self.metrics.finish(&method, resp.status.as_u16(), elapsed);
-        if self.verbose {
-            eprintln!("website {method} {path} -> {} ({:.2}ms)", resp.status.as_u16(), elapsed.as_secs_f64() * 1000.0);
+        if let Some(log) = &self.access_log {
+            let rec = crate::accesslog::Record { client_ip: Some(self.client(&parts.headers, peer).ip), ..Default::default() };
+            log.log(&crate::accesslog::Entry {
+                endpoint: "website",
+                request_id: &rid,
+                remote_ip: peer.ip(),
+                method: method.as_str(),
+                path: &path,
+                query: parts.uri.query().unwrap_or(""),
+                status: resp.status.as_u16(),
+                error: None,
+                bytes_in: None,
+                bytes_out: header(&resp.headers, "content-length").and_then(|v| v.parse().ok()),
+                duration: elapsed,
+                user_agent: header(&parts.headers, "user-agent"),
+                record: &rec,
+            });
         }
         let mut out = Response::new(resp.body);
         *out.status_mut() = resp.status;
@@ -852,10 +891,26 @@ impl Server {
         })
     }
 
-    async fn route(&self, req: Request<Incoming>, peer: SocketAddr, rid: &str) -> S3Result<Resp> {
+    /// Write out buffered access log lines (at shutdown).
+    pub fn flush_logs(&self) {
+        if let Some(log) = &self.access_log {
+            log.flush();
+        }
+    }
+
+    async fn route(
+        &self,
+        req: Request<Incoming>,
+        peer: SocketAddr,
+        rid: &str,
+        rec: &mut crate::accesslog::Record,
+    ) -> S3Result<Resp> {
         let (parts, body) = req.into_parts();
         let raw_query = parts.uri.query().unwrap_or("");
+        rec.client_ip = Some(self.client(&parts.headers, peer).ip);
         let (bucket, key, vhost) = self.resolve(&parts.uri, &parts.headers)?;
+        rec.bucket.clone_from(&bucket);
+        rec.key.clone_from(&key);
         // Built-in endpoints. `_` cannot start a bucket name, so these never shadow a bucket;
         // with virtual-hosted addressing they are only matched when no bucket was resolved.
         if !vhost && parts.uri.path() == "/_health" {
@@ -872,7 +927,16 @@ impl Server {
             }
             let mut r = Resp::ok();
             r.set("content-type", "text/plain; version=0.0.4");
-            r.body = Body::full(self.metrics.render(&self.store, self.metrics_token.is_some()));
+            let mut text = self.metrics.render(&self.store, self.metrics_token.is_some());
+            if let Some(log) = &self.access_log {
+                use std::fmt::Write;
+                let _ = writeln!(
+                    text,
+                    "# TYPE s3rs_access_log_dropped_total counter\ns3rs_access_log_dropped_total {}",
+                    log.dropped.load(Ordering::Relaxed)
+                );
+            }
+            r.body = Body::full(text);
             return Ok(r);
         }
         if !vhost && self.console && (parts.uri.path() == "/_console" || parts.uri.path().starts_with("/_console/")) {
@@ -909,6 +973,9 @@ impl Server {
             }
             Some(_) => (auth::payload_mode(&parts)?, Principal::Anonymous),
         };
+        if let Principal::User(c) = &principal {
+            rec.user = Some(c.access_key.clone());
+        }
         let query = parse_query(raw_query);
         let body = BodyStream::new(body, &mut payload);
         let auth_type = if r_has_auth_header(&parts) { "REST-HEADER" } else { "REST-QUERY-STRING" };

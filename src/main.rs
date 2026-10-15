@@ -1,6 +1,7 @@
 //! s3rs — a fast, lightweight, S3-compatible object storage server in pure Rust.
 
 mod access;
+mod accesslog;
 mod auth;
 mod body;
 mod chunked;
@@ -97,7 +98,9 @@ OPTIONS (each also settable through the environment variable shown):
         --no-fsync               Do not fsync data or metadata (faster, less durable)
                                                                  [S3RS_NO_FSYNC=1]
         --lifecycle-interval <S> Seconds between lifecycle sweeps [S3RS_LIFECYCLE_INTERVAL, default 3600]
-    -v, --verbose                Log every request               [S3RS_VERBOSE=1]
+        --access-log <FORMAT>    Log every request to stdout: json or text
+                                                                 [S3RS_ACCESS_LOG, default off]
+    -v, --verbose                Same as --access-log text       [S3RS_VERBOSE=1]
     -h, --help                   Show this help
 ";
 
@@ -128,7 +131,7 @@ struct Config {
     cache_mb: usize,
     min_free: Option<u64>,
     fsync: bool,
-    verbose: bool,
+    access_log: Option<accesslog::Format>,
     lifecycle_interval: u64,
     /// Length of a lifecycle "day" in seconds; only meant to be shortened for testing.
     lifecycle_day_secs: u64,
@@ -185,7 +188,11 @@ fn parse_args() -> Result<Config, String> {
             .transpose()
             .map_err(|e| format!("S3RS_MIN_FREE_SPACE: {e}"))?,
         fsync: !env_flag("S3RS_NO_FSYNC")?,
-        verbose: env_flag("S3RS_VERBOSE")?,
+        access_log: match env("S3RS_ACCESS_LOG") {
+            Some(v) => accesslog::Format::parse(&v).map_err(|e| format!("S3RS_ACCESS_LOG: {e}"))?,
+            None if env_flag("S3RS_VERBOSE")? => Some(accesslog::Format::Text),
+            None => None,
+        },
         lifecycle_interval: env("S3RS_LIFECYCLE_INTERVAL")
             .map_or(Ok(3600), |v| v.parse())
             .map_err(|e| format!("S3RS_LIFECYCLE_INTERVAL: {e}"))?,
@@ -240,7 +247,8 @@ fn parse_args() -> Result<Config, String> {
             "--min-free-space" => c.min_free = Some(parse_size(&val()?).map_err(|e| format!("--min-free-space: {e}"))?),
             "--no-fsync" => c.fsync = false,
             "--lifecycle-interval" => c.lifecycle_interval = val()?.parse().map_err(|e| format!("--lifecycle-interval: {e}"))?,
-            "-v" | "--verbose" => c.verbose = true,
+            "-v" | "--verbose" => c.access_log = Some(accesslog::Format::Text),
+            "--access-log" => c.access_log = accesslog::Format::parse(&val()?).map_err(|e| format!("--access-log: {e}"))?,
             "-h" | "--help" => {
                 print!("{USAGE}");
                 std::process::exit(0);
@@ -572,7 +580,7 @@ async fn serve(
     let opts = s3::Options {
         region: cfg.region.clone(),
         domain: cfg.domain.clone(),
-        verbose: cfg.verbose,
+        access_log: cfg.access_log,
         cors_origins: cfg.cors_origins.clone(),
         metrics_token: cfg.metrics_token.clone(),
         master_key: cfg.encryption_key,
@@ -760,6 +768,7 @@ async fn serve(
         }
     };
     let _ = store.submit(store::Op::Flush).await;
+    server.flush_logs();
     // Only a complete drain is a clean shutdown; otherwise cancelled uploads may leave orphaned
     // data files, which the next start's recovery scan removes.
     if drained {

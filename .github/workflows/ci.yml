@@ -56,7 +56,8 @@ jobs:
             --access-key testkey --secret-key testsecret --credentials-file /tmp/creds \
             --lifecycle-interval 1 --encryption-key-file /tmp/s3rs.key \
             --website-listen 127.0.0.1:9001 --website-domain web.localhost \
-            --webhook test=http://127.0.0.1:9399/hook --webhook-secret hooksecret > /tmp/s3rs.log 2>&1 &
+            --webhook test=http://127.0.0.1:9399/hook --webhook-secret hooksecret \
+            --access-log json > /tmp/access.log 2> /tmp/s3rs.log &
           echo $! > /tmp/s3rs.pid
           for i in $(seq 50); do curl -sf http://127.0.0.1:9000/_health && break; sleep 0.1; done
       - name: boto3 suite
@@ -126,6 +127,22 @@ jobs:
           kill -TERM "$(cat /tmp/s3rs.pid)"
           while kill -0 "$(cat /tmp/s3rs.pid)" 2>/dev/null; do sleep 0.2; done
           ./target/release/s3rs fsck -d /tmp/s3rs-data --deep --encryption-key-file /tmp/s3rs.key
+      - name: access log (one JSON object per request, no secrets)
+        run: |
+          python3 - <<'PY'
+          import json
+          lines = open("/tmp/access.log").read().splitlines()
+          assert len(lines) > 500, len(lines)
+          for l in lines:
+              e = json.loads(l)
+              assert {"time", "request_id", "method", "path", "status", "duration_ms"} <= e.keys(), e
+              q = e.get("query", "")
+              for p in q.split("&"):
+                  name, _, value = p.partition("=")
+                  if name.lower() in ("x-amz-signature", "signature", "x-amz-security-token"):
+                      assert value == "REDACTED", e
+          print(len(lines), "access log lines OK;", sum("Signature" in json.loads(l).get("query", "") for l in lines), "presigned")
+          PY
       - name: crash consistency (SIGKILL under concurrent writes)
         run: python3 tests/crash.py ./target/release/s3rs 8
       - name: disk full (100 MB tmpfs)

@@ -337,20 +337,22 @@ pub async fn ingest(store: &Arc<Store>, mut body: impl Source, e: Expect) -> S3R
         }
     }
 
-    // Spill to a data file. Disk work (hashing, encryption, writes) runs on the blocking pool one
-    // chunk at a time, overlapped with receiving the next chunk, so a slow client never holds a
-    // blocking thread while it trickles data.
+    // Spill to a data file. Disk work (hashing, encryption, writes) runs on the blocking pool,
+    // overlapped with receiving the next chunks, so a slow client never holds a blocking thread
+    // while it trickles data.
     let id = util::new_id();
     let tmp = store.tmp_path(id);
     let fsync = store.fsync;
-    let mut pipe = WritePipe::new(WriteState {
-        path: tmp.clone(),
-        f: None,
-        hashers: Hashers::new(&e),
-        encryptor: e.encrypt.as_ref().map(crypt::Encryptor::new),
-        sealed: Vec::new(),
-        n: 0,
-    });
+    let mut pipe = WritePipe::new(
+        WriteState {
+            path: tmp.clone(),
+            f: None,
+            encryptor: e.encrypt.as_ref().map(crypt::Encryptor::new),
+            sealed: Vec::new(),
+            n: 0,
+        },
+        Hashers::new(&e),
+    );
     let feed = async {
         let mut total = buf.len() as u64;
         let mut next_space_check = SPACE_CHECK_EVERY;
@@ -444,7 +446,6 @@ async fn next_chunk(body: &mut impl Source) -> S3Result<Option<Bytes>> {
 struct WriteState {
     path: std::path::PathBuf,
     f: Option<File>,
-    hashers: Hashers,
     encryptor: Option<crypt::Encryptor>,
     sealed: Vec<u8>,
     n: u64,
@@ -458,8 +459,7 @@ impl WriteState {
         Ok(self.f.as_mut().expect("just created"))
     }
 
-    fn write(&mut self, b: &[u8]) -> io::Result<()> {
-        self.hashers.update(b);
+    fn write(&mut self, b: &Bytes) -> io::Result<()> {
         self.n += b.len() as u64;
         match self.encryptor.as_mut() {
             Some(enc) => {
@@ -474,7 +474,7 @@ impl WriteState {
         }
     }
 
-    fn finish(mut self, fsync: bool) -> io::Result<(Hashers, u64)> {
+    fn finish(mut self, fsync: bool) -> io::Result<u64> {
         if let Some(enc) = self.encryptor.take() {
             self.sealed.clear();
             enc.finish(&mut self.sealed);
@@ -485,21 +485,21 @@ impl WriteState {
         if fsync {
             f.sync_data()?;
         }
-        Ok((self.hashers, self.n))
+        Ok(self.n)
     }
 }
 
-/// Feeds an upload's chunks to an async writer task, which writes whatever is queued in one
-/// blocking-pool call and then waits (without a thread) for more. Up to four chunks can be
-/// queued, so receiving and writing overlap.
-struct WritePipe {
+/// Runs `step` over a stream of chunks on the blocking pool: whatever is queued is processed in
+/// one blocking call, and the task then waits (without a thread) for more. Up to four chunks
+/// can be queued, so receiving and processing overlap.
+struct Pipe<S: Send + 'static> {
     tx: Option<mpsc::Sender<Bytes>>,
     /// Taken by the first `wait` (a finished JoinHandle must not be polled again).
-    task: Option<tokio::task::JoinHandle<io::Result<WriteState>>>,
+    task: Option<tokio::task::JoinHandle<io::Result<S>>>,
 }
 
-impl WritePipe {
-    fn new(state: WriteState) -> Self {
+impl<S: Send + 'static> Pipe<S> {
+    fn new(state: S, step: fn(&mut S, &Bytes) -> io::Result<()>) -> Self {
         let (tx, mut rx) = mpsc::channel::<Bytes>(4);
         let task = tokio::spawn(async move {
             let mut st = state;
@@ -510,7 +510,7 @@ impl WritePipe {
                 }
                 st = tokio::task::spawn_blocking(move || {
                     for c in &chunks {
-                        st.write(c)?;
+                        step(&mut st, c)?;
                     }
                     Ok::<_, io::Error>(st)
                 })
@@ -519,35 +519,63 @@ impl WritePipe {
             }
             Ok(st)
         });
-        WritePipe { tx: Some(tx), task: Some(task) }
+        Pipe { tx: Some(tx), task: Some(task) }
     }
 
     /// Queue a chunk (waits while four are already queued).
-    async fn write(&mut self, chunk: Bytes) -> S3Result<()> {
-        let Some(tx) = self.tx.as_ref() else { return Err(S3Error::internal("the upload writer stopped")) };
+    async fn send(&mut self, chunk: Bytes) -> S3Result<()> {
+        let Some(tx) = self.tx.as_ref() else { return Err(S3Error::internal("the upload pipeline stopped")) };
         if tx.send(chunk).await.is_err() {
-            // The writer stopped on an error: report that error.
+            // The task stopped on an error: report that error.
             return self.wait().await.map(|_| ());
         }
         Ok(())
     }
 
-    async fn wait(&mut self) -> S3Result<WriteState> {
+    async fn wait(&mut self) -> S3Result<S> {
         self.tx = None;
         match self.task.take() {
             Some(task) => Ok(task.await.map_err(S3Error::internal)??),
-            None => Err(S3Error::internal("the upload writer already failed")),
+            None => Err(S3Error::internal("the upload pipeline already failed")),
+        }
+    }
+}
+
+/// An upload's data file being written. Hashing (MD5, which can't be split up, plus any
+/// checksums) and writing (with encryption) run in two pipelines side by side, so a single
+/// stream is limited by the slower of the two rather than by their sum.
+struct WritePipe {
+    write: Pipe<WriteState>,
+    hash: Pipe<Hashers>,
+}
+
+impl WritePipe {
+    fn new(state: WriteState, hashers: Hashers) -> Self {
+        WritePipe {
+            write: Pipe::new(state, WriteState::write),
+            hash: Pipe::new(hashers, |h, c| {
+                h.update(c);
+                Ok(())
+            }),
         }
     }
 
-    async fn finish(mut self, fsync: bool) -> S3Result<(Hashers, u64)> {
-        let st = self.wait().await?;
-        Ok(tokio::task::spawn_blocking(move || st.finish(fsync)).await.map_err(S3Error::internal)??)
+    async fn write(&mut self, chunk: Bytes) -> S3Result<()> {
+        self.hash.send(chunk.clone()).await?;
+        self.write.send(chunk).await
     }
 
-    /// Wait for writes in progress (so the caller can remove the file).
+    async fn finish(mut self, fsync: bool) -> S3Result<(Hashers, u64)> {
+        let (st, hashers) = (self.write.wait().await, self.hash.wait().await);
+        let st = st?;
+        let n = tokio::task::spawn_blocking(move || st.finish(fsync)).await.map_err(S3Error::internal)??;
+        Ok((hashers?, n))
+    }
+
+    /// Wait for work in progress (so the caller can remove the file).
     async fn abort(mut self) {
-        let _ = self.wait().await;
+        let _ = self.write.wait().await;
+        let _ = self.hash.wait().await;
     }
 }
 

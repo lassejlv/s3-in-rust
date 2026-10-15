@@ -29,6 +29,7 @@ mod lock;
 mod metrics;
 mod ops;
 mod post;
+mod replication;
 mod s3;
 mod store;
 mod tls;
@@ -87,8 +88,13 @@ OPTIONS (each also settable through the environment variable shown):
         --tls-cert <PATH>        Serve HTTPS: PEM certificate chain (reloaded on SIGHUP)
                                                                  [S3RS_TLS_CERT]
         --tls-key <PATH>         PEM private key for --tls-cert  [S3RS_TLS_KEY]
-        --webhook-ca <PATH>      Extra PEM CA certificates trusted for https:// webhooks
-                                                                 [S3RS_WEBHOOK_CA]
+        --webhook-ca <PATH>      Extra PEM CA certificates trusted for https:// webhooks and
+                                 replication targets             [S3RS_WEBHOOK_CA]
+        --replication-targets <P> Remote servers for bucket replication, one
+                                 `ID URL ACCESS_KEY SECRET_KEY [REGION]` per line (reloaded
+                                 on SIGHUP); buckets refer to them as
+                                 arn:s3rs:replication::<ID>:<BUCKET>
+                                                                 [S3RS_REPLICATION_TARGETS]
         --behind-proxy           Trust X-Forwarded-For / X-Forwarded-Proto from a reverse proxy
                                  (client IP and HTTPS for policy conditions and redirects)
                                                                  [S3RS_BEHIND_PROXY=1]
@@ -141,6 +147,7 @@ struct Config {
     webhooks: Vec<(String, events::Url)>,
     webhook_secret: Option<String>,
     webhook_ca: Option<PathBuf>,
+    replication_targets: Option<PathBuf>,
     tls_cert: Option<PathBuf>,
     tls_key: Option<PathBuf>,
     encryption_key: Option<[u8; 32]>,
@@ -203,6 +210,7 @@ fn parse_args() -> Result<Config, String> {
         webhooks: env("S3RS_WEBHOOKS").map(|v| parse_webhooks(&v)).transpose()?.unwrap_or_default(),
         webhook_secret: env("S3RS_WEBHOOK_SECRET"),
         webhook_ca: env("S3RS_WEBHOOK_CA").map(PathBuf::from),
+        replication_targets: env("S3RS_REPLICATION_TARGETS").map(PathBuf::from),
         tls_cert: env("S3RS_TLS_CERT").map(PathBuf::from),
         tls_key: env("S3RS_TLS_KEY").map(PathBuf::from),
         encryption_key: env_key()?,
@@ -267,6 +275,7 @@ fn parse_args() -> Result<Config, String> {
             }
             "--webhook-secret" => c.webhook_secret = Some(val()?),
             "--webhook-ca" => c.webhook_ca = Some(val()?.into()),
+            "--replication-targets" => c.replication_targets = Some(val()?.into()),
             "--tls-cert" => c.tls_cert = Some(val()?.into()),
             "--tls-key" => c.tls_key = Some(val()?.into()),
             "--encryption-key" => c.encryption_key = Some(parse_key(&val()?).map_err(|e| format!("--encryption-key: {e}"))?),
@@ -840,6 +849,27 @@ async fn serve(
         Some(a) => Some(bind(a).await),
         None => None,
     };
+    let repl_targets = match &cfg.replication_targets {
+        Some(p) => match replication::load_targets(p) {
+            Ok(t) => t,
+            Err(e) => {
+                elog!("error: --replication-targets: {e}");
+                std::process::exit(2);
+            }
+        },
+        None => Vec::new(),
+    };
+    let repl_tls = if replication::Replicator::needs_tls(&repl_targets) || cfg.webhook_ca.is_some() {
+        match tls::client_config(cfg.webhook_ca.as_deref()) {
+            Ok(c) => Some(c),
+            Err(e) => {
+                elog!("error: replication targets: {e}");
+                std::process::exit(2);
+            }
+        }
+    } else {
+        None
+    };
     let anonymous = auth.is_none();
     let opts = s3::Options {
         region: cfg.region.clone(),
@@ -860,6 +890,12 @@ async fn serve(
             cfg.webhooks.clone(),
             cfg.webhook_secret.clone(),
             webhook_tls,
+        ),
+        replication: replication::Replicator::new(
+            store.clone(),
+            repl_targets.clone(),
+            repl_tls,
+            cfg.encryption_key.map(|k| crypt::WrapKey::new(crypt::KeyKind::Master, k)),
         ),
     };
     let server = Arc::new(s3::Server::new(store.clone(), auth, opts));
@@ -899,6 +935,17 @@ async fn serve(
         let s = if url.tls { "https" } else { "http" };
         elog!("webhook target {id}: {s}://{}:{}{} (arn:s3rs:webhook::{id})", url.host, url.port, url.path);
     }
+    for t in &repl_targets {
+        let s = if t.url.tls { "https" } else { "http" };
+        elog!(
+            "replication target {}: {s}://{}:{}{} (arn:s3rs:replication::{}:<bucket>)",
+            t.id,
+            t.url.host,
+            t.url.port,
+            t.url.path,
+            t.id
+        );
+    }
     if let Some(a) = cfg.website_listen {
         elog!("s3rs website endpoint on {scheme}://{a}");
     }
@@ -925,7 +972,7 @@ async fn serve(
     let graceful = hyper_util::server::graceful::GracefulShutdown::new();
 
     #[cfg(unix)]
-    if server.auth.is_some() || tls.is_some() {
+    if server.auth.is_some() || tls.is_some() || cfg.replication_targets.is_some() {
         let server = server.clone();
         let cfg = cfg.clone();
         let tls = tls.clone();
@@ -936,6 +983,15 @@ async fn serve(
                     match t.reload() {
                         Ok(()) => elog!("reloaded the TLS certificate"),
                         Err(e) => elog!("TLS RELOAD FAILED, still using the previous certificate: {e}"),
+                    }
+                }
+                if let Some(p) = &cfg.replication_targets {
+                    match replication::load_targets(p) {
+                        Ok(t) => {
+                            elog!("reloaded {} replication target(s)", t.len());
+                            server.replication.set_targets(t);
+                        }
+                        Err(e) => elog!("REPLICATION TARGETS RELOAD FAILED, still using the previous ones: {e}"),
                     }
                 }
                 if server.auth.is_none() {
@@ -975,6 +1031,7 @@ async fn serve(
 
     // Tells connections still in their TLS handshake to give up, so they don't delay the drain.
     let (stopping_tx, stopping) = tokio::sync::watch::channel(false);
+    tokio::spawn(server.replication.clone().run(stopping.clone()));
     let shutdown = shutdown_signal();
     tokio::pin!(shutdown);
     loop {

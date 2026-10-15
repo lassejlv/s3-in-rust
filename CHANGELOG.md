@@ -16,6 +16,11 @@ First release.
 - `s3rs fsck` checks a data directory, deeply with `--deep`, and `--repair` fixes it.
 - Consistent online backups (`GET /_admin/backup`) and offline backups (`s3rs backup`) as tar
   archives.
+- Bucket replication to other S3-compatible servers (PutBucketReplication):
+  - asynchronous, from a durable queue written with each change;
+  - prefix and tag filters, delete replication, and copying of existing objects;
+  - retries with backoff, and two-way replication that settles instead of looping;
+  - backlog and lag metrics.
 - Full-disk safety: a free-space reserve (507 StorageFull), a ballast file, and in-place recovery
   of the metadata database.
 - The data directory records its format version: a release refuses to open data written in a
@@ -46,4 +51,4 @@ First release.
 - Unit tests, including AWS SigV4 test vectors and parser fuzzing.
 - Compatibility suites: boto3, aws-cli, minio-go and a Playwright console test, all also over HTTPS.
 - A SIGKILL crash-consistency test, a disk-full test, a backup/restore test, an upgrade test
-  (data written by older builds) and HTTP-level fuzzing, all in CI.
+  (data written by older builds), a two-server replication test and HTTP-level fuzzing, all in CI.

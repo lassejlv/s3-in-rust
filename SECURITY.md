@@ -37,6 +37,9 @@ malicious. It does not defend against someone who controls the host.
   - The number of connections is capped.
   - The access log queue is bounded.
   - A full disk refuses writes (507) but keeps serving reads and deletes.
+- **Replication** writes to other servers with credentials the operator puts in the targets
+  file. Only keys that are not limited to some buckets or by a policy can configure it, and the
+  target credentials should be limited to the replica buckets.
 - **Operator endpoints:** `/_metrics` can require a token, and `/_admin/backup` is off unless
   `--admin-token` is set. Empty tokens and the `change-me` placeholders are refused at startup.
 - **Secrets in logs:** access logs redact signatures, credentials and tokens in query strings.
@@ -48,8 +51,10 @@ malicious. It does not defend against someone who controls the host.
   user, or someone with backup storage write access.
 - **Distributed denial of service:** many clients together can exhaust bandwidth or connections.
   Put a load balancer or rate limiter in front if this matters.
-- **Availability beyond one machine:** there is no replication. Use backups (see
-  [OPERATIONS.md](OPERATIONS.md#backups)).
+- **Availability beyond one machine:** a single server is a single point of failure.
+  [Replication](README.md#replication) keeps an asynchronous copy of chosen buckets on another
+  server. A failover is manual, and the copy can miss the last changes before a failure. Use
+  backups too (see [OPERATIONS.md](OPERATIONS.md#backups)).
 
 ## Hardening
 

@@ -570,6 +570,76 @@ modifies or deletes object data. If some metadata records can't be read, it remo
 files those records refer to are unknown. The exit status is 0 when everything is consistent, and 1 when it found problems.
 CI runs `fsck --deep` on the data left by the full test suite after a graceful shutdown.
 
+## Replication
+
+s3rs can copy a bucket's changes to a bucket on another server: a second s3rs (for example in
+another data center), AWS S3, MinIO or any other S3-compatible server. Replication is
+asynchronous: writes return as soon as they are stored locally, and are sent to the destination
+in the background, normally within a second.
+
+**Targets.** The operator lists the remote servers in a file, one per line (`#` starts a
+comment), and passes it with `--replication-targets` (reloaded on `SIGHUP`):
+
+```
+# ID  URL                          ACCESS_KEY  SECRET_KEY  [REGION]
+dr    https://s3-dr.example.com    AKIA...     ...         us-east-1
+```
+
+The credentials are the target's own keys. They decide what replication can write there, so give
+them access to the replica buckets only (s3rs: a key limited to those buckets). Only keys that are
+not limited to some buckets or by a policy can configure replication.
+
+**Configuration.** Buckets opt in with the standard PutBucketReplication call. A destination is
+`arn:s3rs:replication::<TARGET>:<BUCKET>`:
+
+```bash
+aws s3api put-bucket-replication --bucket photos --replication-configuration '{
+  "Role": "",
+  "Rules": [{
+    "ID": "dr", "Status": "Enabled", "Priority": 1,
+    "Filter": {"Prefix": ""},
+    "DeleteMarkerReplication": {"Status": "Enabled"},
+    "ExistingObjectReplication": {"Status": "Enabled"},
+    "Destination": {"Bucket": "arn:s3rs:replication::dr:photos-replica"}
+  }]
+}'
+```
+
+- **What is replicated:**
+  - New and overwritten objects arrive with their content, ETag, content type and other
+    headers, user metadata and tags. Multipart objects are uploaded in the same parts, so they
+    keep their ETag.
+  - Tag changes are replicated too.
+  - SSE-S3 objects are decrypted and stored with `x-amz-server-side-encryption: AES256` at the
+    destination, which therefore needs SSE-S3 too.
+  - SSE-C objects are skipped: the server never has their key.
+- **Deletes** are replicated only with `DeleteMarkerReplication` enabled. That isn't possible in
+  rules with tag filters.
+- **Existing objects** are copied when `ExistingObjectReplication` is enabled. The copy runs in the
+  background and resumes after a restart.
+- **Rules** filter by prefix and/or tags. Each destination gets the state of the highest-priority
+  rule that matches.
+- **Versioned buckets:** the current version of each key is replicated, not its history.
+  Versioning is not required.
+- **Object Lock** settings are not replicated.
+
+**How it works.** Every change to a replicated key is recorded in a queue in the metadata
+database, in the same transaction as the change itself, so no change is lost to a crash or a
+restart. Several changes to the same key before it is sent collapse into one. A background worker
+sends each queued key's current state to its destinations and removes the entry once all of them
+have it.
+- **Unchanged objects:** a destination that already holds an identical object (same ETag,
+  metadata and tags) is not sent it again. This also lets two servers replicate to each other
+  without bouncing changes back and forth.
+- **Retries:** failed keys are retried with exponential backoff (up to 5 minutes). A target that
+  stops answering is probed every few seconds, and when it comes back the whole backlog is sent
+  at once.
+
+**Monitoring.** `s3rs_replication_pending` counts queued keys, and `s3rs_replication_lag_seconds`
+is the age of the oldest change not yet replicated. `s3rs_replication_total{result}` counts keys
+that were replicated, unchanged, skipped (SSE-C) or failed. The log says why keys fail, at most
+every 10 seconds.
+
 ## Event notifications
 
 s3rs can tell other services when objects are created or removed, in S3's event format.
@@ -647,7 +717,7 @@ direct uploads from web apps.
 
 | Area | Operations |
 |---|---|
-| Buckets | ListBuckets, CreateBucket (with canned ACL), DeleteBucket, HeadBucket, GetBucketLocation, Get/PutBucketVersioning, Get/PutBucketAcl, Get/Put/DeleteBucketPolicy, GetBucketPolicyStatus, Get/Put/DeleteBucketCors, Get/Put/DeleteBucketTagging, Get/Put/DeleteBucketEncryption, Get/PutObjectLockConfiguration, Get/Put/DeleteBucketWebsite, Get/PutBucketNotificationConfiguration, ListenBucketNotification (MinIO) |
+| Buckets | ListBuckets, CreateBucket (with canned ACL), DeleteBucket, HeadBucket, GetBucketLocation, Get/PutBucketVersioning, Get/PutBucketAcl, Get/Put/DeleteBucketPolicy, GetBucketPolicyStatus, Get/Put/DeleteBucketCors, Get/Put/DeleteBucketTagging, Get/Put/DeleteBucketEncryption, Get/PutObjectLockConfiguration, Get/Put/DeleteBucketWebsite, Get/PutBucketNotificationConfiguration, Get/Put/DeleteBucketReplication, ListenBucketNotification (MinIO) |
 | Objects | PutObject, GetObject, HeadObject, GetObjectAttributes, DeleteObject, DeleteObjects, CopyObject (COPY/REPLACE for metadata and tags), Get/Put/DeleteObjectTagging, `x-amz-tagging` on upload, GetObjectAcl, Get/PutObjectRetention, Get/PutObjectLegalHold, SSE-S3 and SSE-C on every read/write/copy path |
 | Listing | ListObjects (v1), ListObjectsV2, ListObjectVersions (versions and delete markers); prefix, delimiter, pagination, `start-after`, `encoding-type=url` |
 | Multipart | CreateMultipartUpload, UploadPart, UploadPartCopy (with ranges), CompleteMultipartUpload, AbortMultipartUpload, ListParts, ListMultipartUploads |

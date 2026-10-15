@@ -98,6 +98,7 @@ errors! {
     NoSuchObjectLockConfiguration => NOT_FOUND, "The specified object does not have a ObjectLock configuration";
     ObjectLockConfigurationNotFoundError => NOT_FOUND, "Object Lock configuration does not exist for this bucket";
     NoSuchWebsiteConfiguration => NOT_FOUND, "The specified bucket does not have a website configuration";
+    ReplicationConfigurationNotFoundError => NOT_FOUND, "The replication configuration was not found";
     ConditionalRequestConflict => CONFLICT, "A conflicting conditional operation is currently in progress against this resource.";
 }
 

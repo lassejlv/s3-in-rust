@@ -397,7 +397,7 @@ impl Url {
         let (tls, rest) = match (s.strip_prefix("https://"), s.strip_prefix("http://")) {
             (Some(rest), _) => (true, rest),
             (None, Some(rest)) => (false, rest),
-            _ => return Err(format!("{s}: webhook URLs must start with http:// or https://")),
+            _ => return Err(format!("{s}: URLs must start with http:// or https://")),
         };
         let default_port = if tls { 443 } else { 80 };
         let (authority, path) = match rest.find('/') {
@@ -437,14 +437,23 @@ impl Url {
         Ok(Url { tls, host, port, path: path.to_string() })
     }
 
-    fn host_header(&self) -> String {
+    pub fn host_header(&self) -> String {
         if self.port == if self.tls { 443 } else { 80 } { self.host.clone() } else { format!("{}:{}", self.host, self.port) }
     }
 }
 
 type Sender = hyper::client::conn::http1::SendRequest<Full<Bytes>>;
 
-async fn connect(url: &Url, tls: Option<&Arc<crate::tls::ClientConfig>>) -> Result<Sender, String> {
+/// Open an HTTP/1.1 connection to `url`'s host (with TLS for https://).
+pub async fn connect<B>(
+    url: &Url,
+    tls: Option<&Arc<crate::tls::ClientConfig>>,
+) -> Result<hyper::client::conn::http1::SendRequest<B>, String>
+where
+    B: hyper::body::Body + Send + 'static,
+    B::Data: Send,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
     let host = url.host.trim_start_matches('[').trim_end_matches(']');
     let stream = tokio::time::timeout(TIMEOUT, tokio::net::TcpStream::connect((host, url.port)))
         .await

@@ -60,6 +60,14 @@ groups:
         annotations:
           summary: "s3rs event notifications on {{ $labels.instance }} are failing or being dropped"
 
+      - alert: S3rsReplicationLagging
+        expr: s3rs_replication_lag_seconds > 300
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "s3rs on {{ $labels.instance }} has changes waiting to be replicated for over 5 minutes"
+          description: "{{ $value | humanizeDuration }} behind. The server log names the failing target and why; changes stay queued on disk."
+
       - alert: S3rsAccessLogDropping
         expr: increase(s3rs_access_log_dropped_total[15m]) > 0
         labels: { severity: warning }

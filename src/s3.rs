@@ -56,6 +56,8 @@ pub struct Options {
     pub tls: bool,
     /// Event notifications (webhooks and live listeners).
     pub events: Arc<events::Bus>,
+    /// Bucket replication to remote servers.
+    pub replication: Arc<crate::replication::Replicator>,
 }
 
 pub struct Server {
@@ -82,6 +84,7 @@ pub struct Server {
     behind_proxy: bool,
     tls: bool,
     pub events: Arc<events::Bus>,
+    pub replication: Arc<crate::replication::Replicator>,
     /// Weak self-reference, for background tasks that must re-check permissions.
     me: std::sync::OnceLock<std::sync::Weak<Server>>,
     req_counter: AtomicU64,
@@ -308,7 +311,7 @@ fn stored_headers(h: &HeaderMap) -> S3Result<Vec<(String, String)>> {
     Ok(out)
 }
 
-fn valid_bucket_name(b: &str) -> bool {
+pub(crate) fn valid_bucket_name(b: &str) -> bool {
     let bytes = b.as_bytes();
     (3..=63).contains(&b.len())
         && bytes.iter().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == b'.' || *c == b'-')
@@ -367,7 +370,7 @@ impl Server {
             access_log: opts.access_log.map(|f| Arc::new(crate::accesslog::AccessLog::new(f))),
             admin_token: opts.admin_token,
             backup_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            metrics: crate::metrics::Metrics::new(opts.events.stats.clone()),
+            metrics: crate::metrics::Metrics::new(opts.events.stats.clone(), opts.replication.stats.clone()),
             default_cors,
             access_cache: RwLock::new(HashMap::new()),
             access_gen: AtomicU64::new(0),
@@ -379,6 +382,7 @@ impl Server {
             behind_proxy: opts.behind_proxy,
             tls: opts.tls,
             events: opts.events,
+            replication: opts.replication,
             me: std::sync::OnceLock::new(),
             req_counter: AtomicU64::new(1),
             rid_base: util::new_id() as u64,
@@ -1211,6 +1215,13 @@ impl Server {
                         None => Xml::new("NotificationConfiguration").finish("NotificationConfiguration"),
                     })),
                     "accelerate" => Ok(Resp::xml(Xml::new("AccelerateConfiguration").finish("AccelerateConfiguration"))),
+                    "replication" => {
+                        let doc = self
+                            .store
+                            .bucket_config(bucket, "replication")?
+                            .ok_or_else(err::ReplicationConfigurationNotFoundError)?;
+                        Ok(Resp::xml(String::from_utf8_lossy(&doc).into_owned()))
+                    }
                     "requestPayment" => {
                         let mut x = Xml::new("RequestPaymentConfiguration");
                         x.elem("Payer", "BucketOwner");
@@ -1341,6 +1352,33 @@ impl Server {
                 self.set_bucket_config(bucket, "quota", value).await?;
                 Ok(Resp::ok())
             }
+            BucketOp::PutConfig("replication") => {
+                self.store.require_bucket(bucket)?;
+                // Replication writes to other servers with the server's own credentials for
+                // them, so a key limited to some buckets (or by a policy) must not be able to
+                // point it at arbitrary destination buckets.
+                let unrestricted = match &r.principal {
+                    Principal::Everyone => true,
+                    Principal::User(c) => c.buckets.is_none() && c.policy.is_none() && !c.read_only,
+                    Principal::Anonymous => false,
+                };
+                if !unrestricted {
+                    return Err(err::AccessDenied()
+                        .with_message("Replication can only be configured with an access key that is not limited to some buckets or by a policy"));
+                }
+                let body = self.read_body(r, MAX_XML_BODY).await?;
+                let text = std::str::from_utf8(&body).map_err(|_| err::MalformedXML())?;
+                let doc = xml::parse(text).ok_or_else(err::MalformedXML)?;
+                let rules = crate::replication::parse_config(&doc, &self.replication.target_ids())?;
+                self.set_bucket_config(bucket, "replication", Some(body.to_vec())).await?;
+                // Existing objects: queue them in the background, resuming after a restart.
+                let backfill = rules.iter().any(|r| r.enabled && r.existing);
+                self.set_bucket_config(bucket, "replication-backfill", backfill.then(Vec::new)).await?;
+                if backfill {
+                    tokio::spawn(crate::replication::Replicator::backfill(self.store.clone(), bucket.to_string()));
+                }
+                Ok(Resp::ok())
+            }
             BucketOp::PutConfig(_) => Err(err::NotImplemented()),
             BucketOp::Create => {
                 if !valid_bucket_name(bucket) {
@@ -1363,6 +1401,12 @@ impl Server {
                 let mut resp = Resp::ok();
                 resp.set("location", &format!("/{bucket}"));
                 Ok(resp)
+            }
+            BucketOp::DeleteConfig("replication") => {
+                self.store.require_bucket(bucket)?;
+                self.set_bucket_config(bucket, "replication-backfill", None).await?;
+                self.set_bucket_config(bucket, "replication", None).await?;
+                Ok(Resp::new(StatusCode::NO_CONTENT))
             }
             BucketOp::DeleteConfig(kind @ ("policy" | "cors" | "tagging" | "lifecycle" | "encryption" | "website" | "quota")) => {
                 let kind: &'static str = store::CONFIG_KINDS.iter().find(|k| **k == kind).unwrap();

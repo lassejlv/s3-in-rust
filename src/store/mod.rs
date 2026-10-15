@@ -18,6 +18,7 @@ use crate::util::{self, now_ms};
 use bytes::Bytes;
 use meta::{ObjectMeta, ObjectSummary, PartMeta, Storage, UploadMeta};
 use redb::{Database, Durability, ReadableDatabase, ReadableTable, TableDefinition};
+use std::collections::HashMap;
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -46,6 +47,9 @@ pub const CONFIG_KINDS: &[&str] = &[
     "website",
     "notification",
     "quota",
+    "replication",
+    // Where the backfill of a new replication configuration has got to (see Op::ReplBackfill).
+    "replication-backfill",
 ];
 /// Per-bucket usage: bucket -> (stored object versions, bytes). Delete markers don't count.
 const USAGE: TableDefinition<&str, (u64, u64)> = TableDefinition::new("usage");
@@ -81,6 +85,10 @@ pub(crate) fn check_format_read(txn: &redb::ReadTransaction) -> Result<(), Strin
 }
 /// Per-bucket bytes held by multipart upload parts that are not part of an object yet.
 const PART_BYTES: TableDefinition<&str, u64> = TableDefinition::new("part_bytes");
+/// Keys waiting to be replicated: bucket \0 key -> (sequence number of the latest change,
+/// time in ms of the oldest change not yet replicated). Written in the same transaction as the
+/// change, so a crash never loses one; see crate::replication.
+const REPL: TableDefinition<&[u8], (u64, u64)> = TableDefinition::new("replication_queue");
 const USAGE_VERSION: u64 = 2;
 /// Contents of the clean-shutdown marker. Older releases wrote an empty marker without
 /// maintaining usage, so any other content (or none) makes the next start recompute usage.
@@ -236,6 +244,20 @@ pub struct Store {
     pub space: Arc<space::Space>,
     /// While non-zero (a backup is streaming), data files are not deleted.
     gc_paused: Arc<std::sync::atomic::AtomicUsize>,
+    /// Signalled when a commit added keys to the replication queue.
+    pub repl_wake: Arc<tokio::sync::Notify>,
+}
+
+/// A key waiting to be replicated (see crate::replication).
+#[derive(Debug, Clone)]
+pub struct ReplEntry {
+    /// The queue key (bucket \0 key), for resuming a scan.
+    pub raw: Vec<u8>,
+    pub bucket: String,
+    pub key: String,
+    pub seq: u64,
+    /// When the oldest change not yet replicated was made.
+    pub since_ms: u64,
 }
 
 /// A backup in progress: the plan, its snapshot file, and a hold on data file deletion.
@@ -422,6 +444,21 @@ pub enum Op {
         bucket: String,
         items: Vec<(String, u64)>,
     },
+    /// Remove a replication queue entry if it still has sequence number `seq` (a newer change
+    /// keeps it queued).
+    ReplDone {
+        bucket: String,
+        key: String,
+        seq: u64,
+    },
+    /// Queue up to `limit` existing objects of a bucket for replication, continuing from the
+    /// bucket's "replication-backfill" cursor (empty: from the start) and advancing it, or
+    /// removing it once the whole bucket is queued. Returns `OpOut::More(true)` while objects
+    /// remain.
+    ReplBackfill {
+        bucket: String,
+        limit: usize,
+    },
     Flush,
     /// Answered by the writer without touching the database (health checks).
     Ping,
@@ -429,6 +466,7 @@ pub enum Op {
 
 pub enum OpOut {
     Done,
+    More(bool),
     Object(ObjectMeta),
     Deleted(Vec<S3Result<DeleteOutcome>>),
     /// What lifecycle operations removed.
@@ -563,6 +601,7 @@ impl Store {
             txn.open_table(USAGE)?;
             txn.open_table(STATE)?;
             txn.open_table(PART_BYTES)?;
+            txn.open_table(REPL)?;
             txn.commit()?;
         }
         // After a crash or a run of an older release, the counters may not match the data.
@@ -624,9 +663,11 @@ impl Store {
         let wdb = db.clone();
         let wdel = del_tx.clone();
         let durable = cfg.fsync;
+        let repl_wake = Arc::new(tokio::sync::Notify::new());
         std::thread::Builder::new().name("s3rs-writer".into()).spawn({
             let space = space.clone();
-            move || writer_loop(wdb, rx, wdel, durable, space)
+            let wake = repl_wake.clone();
+            move || writer_loop(wdb, rx, wdel, durable, space, wake)
         })?;
 
         Ok(Arc::new(Store {
@@ -638,6 +679,7 @@ impl Store {
             deleter: del_tx,
             space,
             gc_paused,
+            repl_wake,
         }))
     }
 
@@ -712,6 +754,53 @@ impl Store {
                 "the metadata writer is not responding",
             )),
         }
+    }
+
+    // ---------------------------------------------------------------- replication queue
+
+    /// Up to `limit` replication queue entries after `after` (a previous entry's `raw` key).
+    pub fn repl_scan(&self, after: Option<&[u8]>, limit: usize) -> S3Result<Vec<ReplEntry>> {
+        let txn = self.db.get()?.begin_read()?;
+        let t = txn.open_table(REPL)?;
+        let lo = match after {
+            Some(a) => Bound::Excluded(a),
+            None => Bound::Unbounded,
+        };
+        let mut out = Vec::new();
+        for e in t.range::<&[u8]>((lo, Bound::Unbounded))?.take(limit) {
+            let (k, v) = e?;
+            let raw = k.value().to_vec();
+            let sep = raw.iter().position(|b| *b == 0).unwrap_or(raw.len());
+            let (seq, since_ms) = v.value();
+            out.push(ReplEntry {
+                bucket: String::from_utf8_lossy(&raw[..sep]).into_owned(),
+                key: String::from_utf8_lossy(raw.get(sep + 1..).unwrap_or_default()).into_owned(),
+                raw,
+                seq,
+                since_ms,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Number of keys waiting to be replicated.
+    pub fn repl_pending(&self) -> S3Result<u64> {
+        use redb::ReadableTableMetadata;
+        Ok(self.db.get()?.begin_read()?.open_table(REPL)?.len()?)
+    }
+
+    /// Buckets whose replication backfill (queuing existing objects) has not finished.
+    pub fn repl_backfills(&self) -> S3Result<Vec<String>> {
+        let txn = self.db.get()?.begin_read()?;
+        let config = txn.open_table(CONFIG)?;
+        let mut out = Vec::new();
+        for e in txn.open_table(BUCKETS)?.iter()? {
+            let (b, _) = e?;
+            if config.get((b.value(), "replication-backfill"))?.is_some() {
+                out.push(b.value().to_string());
+            }
+        }
+        Ok(out)
     }
 
     // ---------------------------------------------------------------- reads
@@ -1331,7 +1420,14 @@ pub fn data_path(root: &Path, id: u128) -> PathBuf {
 
 // -------------------------------------------------------------------- writer
 
-fn writer_loop(cell: Arc<DbCell>, rx: mpsc::Receiver<Job>, deleter: mpsc::Sender<Gc>, durable: bool, space: Arc<space::Space>) {
+fn writer_loop(
+    cell: Arc<DbCell>,
+    rx: mpsc::Receiver<Job>,
+    deleter: mpsc::Sender<Gc>,
+    durable: bool,
+    space: Arc<space::Space>,
+    repl_wake: Arc<tokio::sync::Notify>,
+) {
     let ballast = &space.ballast;
     // In non-durable mode redb can only recycle pages freed by earlier commits once a durable
     // commit happens, so make one at least this often even under constant load.
@@ -1400,7 +1496,8 @@ fn writer_loop(cell: Arc<DbCell>, rx: mpsc::Receiver<Job>, deleter: mpsc::Sender
         let backup: Option<Vec<Op>> = ballast.present().then(|| batch.iter().map(|j| j.op.clone()).collect());
         let mut results: Vec<S3Result<OpOut>> = Vec::with_capacity(batch.len());
         let mut obsolete: Vec<u128> = Vec::new();
-        let mut outcome = run_batch(&cell, &mut batch, immediate, &mut last_seq, &mut results, &mut obsolete);
+        let mut queued = false;
+        let mut outcome = run_batch(&cell, &mut batch, immediate, &mut last_seq, &mut results, &mut obsolete, &mut queued);
         if let Err(e) = &outcome {
             elog!("metadata commit failed: {e}");
             // On a full disk, give up the ballast first: reopening the database may need space.
@@ -1417,7 +1514,8 @@ fn writer_loop(cell: Arc<DbCell>, rx: mpsc::Receiver<Job>, deleter: mpsc::Sender
                 }
                 results.clear();
                 obsolete.clear();
-                outcome = run_batch(&cell, &mut batch, immediate, &mut last_seq, &mut results, &mut obsolete);
+                queued = false;
+                outcome = run_batch(&cell, &mut batch, immediate, &mut last_seq, &mut results, &mut obsolete, &mut queued);
                 if let Err(e) = &outcome {
                     elog!("metadata commit failed again: {e}");
                     if recover(&cell) {
@@ -1430,6 +1528,9 @@ fn writer_loop(cell: Arc<DbCell>, rx: mpsc::Receiver<Job>, deleter: mpsc::Sender
 
         match outcome {
             Ok(()) => {
+                if queued {
+                    repl_wake.notify_one();
+                }
                 if immediate {
                     // Durable: everything held back so far is now safe to delete.
                     dirty = false;
@@ -1466,6 +1567,7 @@ fn run_batch(
     last_seq: &mut u64,
     results: &mut Vec<S3Result<OpOut>>,
     obsolete: &mut Vec<u128>,
+    queued: &mut bool,
 ) -> S3Result<()> {
     let db = cell.get()?;
     let mut txn = db.begin_write()?;
@@ -1483,11 +1585,22 @@ fn run_batch(
             versions: txn.open_table(VERSIONS)?,
             usage: txn.open_table(USAGE)?,
             part_bytes: txn.open_table(PART_BYTES)?,
+            repl: txn.open_table(REPL)?,
         };
+        // Replication rule prefixes per bucket, looked up once per batch.
+        let mut repl_rules: HashMap<String, Vec<String>> = HashMap::new();
         for job in batch.iter_mut() {
             let mut garbage = Vec::new();
             let op = std::mem::replace(&mut job.op, Op::Flush);
+            let touched = repl_touched(&mut tx, &mut repl_rules, &op)?;
+            let backfill = matches!(op, Op::ReplBackfill { .. });
             let r = apply(&mut tx, op, &mut garbage, last_seq);
+            if r.is_ok()
+                && let Some((bucket, keys)) = touched
+            {
+                *queued |= repl_enqueue(&mut tx, &bucket, &keys)?;
+            }
+            *queued |= backfill && r.is_ok();
             // Storage failures abort the whole transaction; S3-level errors only fail their op.
             if let Err(e) = &r
                 && matches!(e.code, "InternalError" | "StorageFull")
@@ -1538,6 +1651,7 @@ struct Tables<'t> {
     versions: redb::Table<'t, &'static [u8], &'static [u8]>,
     usage: redb::Table<'t, &'static str, (u64, u64)>,
     part_bytes: redb::Table<'t, &'static str, u64>,
+    repl: redb::Table<'t, &'static [u8], (u64, u64)>,
 }
 
 fn usage_add(tx: &mut Tables, bucket: &str, objects: i64, bytes: i64) -> S3Result<()> {
@@ -2014,9 +2128,110 @@ fn bucket_has_versions(tx: &Tables, bucket: &str) -> S3Result<bool> {
     Ok(tx.versions.range::<&[u8]>(lo.as_slice()..hi.as_slice())?.next().is_some())
 }
 
+/// Sequence numbers for replication queue entries: increasing, also across restarts.
+fn next_repl_seq() -> u64 {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let floor = now_ms() << 16;
+    let prev = SEQ
+        .fetch_update(std::sync::atomic::Ordering::SeqCst, std::sync::atomic::Ordering::SeqCst, |c| Some(c.max(floor) + 1))
+        .unwrap_or_default();
+    prev.max(floor) + 1
+}
+
+/// Queue `key` for replication, keeping the time of the oldest change not yet replicated.
+fn repl_insert(tx: &mut Tables, bucket: &str, key: &str, now: u64) -> S3Result<()> {
+    let k = obj_key(bucket, key);
+    let since = tx.repl.get(k.as_slice())?.map_or(now, |v| v.value().1);
+    tx.repl.insert(k.as_slice(), (next_repl_seq(), since))?;
+    Ok(())
+}
+
+/// The bucket and keys an operation may change, if the bucket replicates any of them. Ops that
+/// change a bucket's configuration drop its cached rules.
+fn repl_touched(tx: &mut Tables, rules: &mut HashMap<String, Vec<String>>, op: &Op) -> S3Result<Option<(String, Vec<String>)>> {
+    let (bucket, keys): (&str, Vec<&str>) = match op {
+        Op::PutObject { bucket, key, .. } | Op::Complete { bucket, key, .. } | Op::SetObjectTags { bucket, key, .. } => {
+            (bucket, vec![key.as_str()])
+        }
+        Op::DeleteObjects { bucket, items, .. } => (bucket, items.iter().map(|(k, _)| k.as_str()).collect()),
+        Op::Expire { bucket, items } => (bucket, items.iter().map(|(k, _)| k.as_str()).collect()),
+        Op::SetBucketConfig { bucket, .. } | Op::DeleteBucket(bucket) => {
+            rules.remove(bucket.as_str());
+            return Ok(None);
+        }
+        _ => return Ok(None),
+    };
+    if !rules.contains_key(bucket) {
+        let prefixes = match tx.config.get((bucket, "replication"))? {
+            Some(raw) => crate::replication::load(raw.value()).into_iter().filter(|r| r.enabled).map(|r| r.prefix).collect(),
+            None => Vec::new(),
+        };
+        rules.insert(bucket.to_string(), prefixes);
+    }
+    let prefixes = &rules[bucket];
+    let keys: Vec<String> =
+        keys.into_iter().filter(|k| prefixes.iter().any(|p| k.starts_with(p.as_str()))).map(String::from).collect();
+    Ok((!keys.is_empty()).then(|| (bucket.to_string(), keys)))
+}
+
+/// Queue the keys `repl_touched` found. Returns whether anything was queued.
+fn repl_enqueue(tx: &mut Tables, bucket: &str, keys: &[String]) -> S3Result<bool> {
+    let now = now_ms();
+    for key in keys {
+        repl_insert(tx, bucket, key, now)?;
+    }
+    Ok(!keys.is_empty())
+}
+
 fn apply(tx: &mut Tables, op: Op, garbage: &mut Vec<u128>, last_seq: &mut u64) -> S3Result<OpOut> {
     match op {
         Op::Flush | Op::Ping => Ok(OpOut::Done),
+        Op::ReplDone { bucket, key, seq } => {
+            let k = obj_key(&bucket, &key);
+            if tx.repl.get(k.as_slice())?.map(|v| v.value().0) == Some(seq) {
+                tx.repl.remove(k.as_slice())?;
+            }
+            Ok(OpOut::Done)
+        }
+        Op::ReplBackfill { bucket, limit } => {
+            let Some(cursor) = tx.config.get((bucket.as_str(), "replication-backfill"))?.map(|v| v.value().to_vec()) else {
+                return Ok(OpOut::More(false));
+            };
+            let prefixes: Vec<String> = match tx.config.get((bucket.as_str(), "replication"))? {
+                Some(raw) => crate::replication::load(raw.value())
+                    .into_iter()
+                    .filter(|r| r.enabled && r.existing)
+                    .map(|r| r.prefix)
+                    .collect(),
+                None => Vec::new(),
+            };
+            let start = obj_key(&bucket, std::str::from_utf8(&cursor).unwrap_or(""));
+            let end = prefix_successor(&obj_key(&bucket, "")).expect("bucket prefix ends with 0");
+            let lo = if cursor.is_empty() { Bound::Included(start.as_slice()) } else { Bound::Excluded(start.as_slice()) };
+            let mut keys = Vec::new();
+            if !prefixes.is_empty() {
+                for e in tx.objects.range::<&[u8]>((lo, Bound::Excluded(end.as_slice())))?.take(limit) {
+                    let (k, _) = e?;
+                    keys.push(String::from_utf8_lossy(&k.value()[bucket.len() + 1..]).into_owned());
+                }
+            }
+            let now = now_ms();
+            for key in &keys {
+                if prefixes.iter().any(|p| key.starts_with(p.as_str())) {
+                    repl_insert(tx, &bucket, key, now)?;
+                }
+            }
+            match keys.last() {
+                Some(last) if keys.len() == limit => {
+                    tx.config.insert((bucket.as_str(), "replication-backfill"), last.as_bytes())?;
+                    Ok(OpOut::More(true))
+                }
+                _ => {
+                    tx.config.remove((bucket.as_str(), "replication-backfill"))?;
+                    Ok(OpOut::More(false))
+                }
+            }
+        }
         Op::CreateBucket(name) => {
             if tx.buckets.get(name.as_str())?.is_some() {
                 return Err(err::BucketAlreadyOwnedByYou());

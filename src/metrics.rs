@@ -27,11 +27,12 @@ pub struct Metrics {
     bytes_out: AtomicU64,
     pub lifecycle: std::sync::Arc<crate::lifecycle::Stats>,
     pub events: std::sync::Arc<crate::events::Stats>,
+    pub replication: std::sync::Arc<crate::replication::Stats>,
 }
 
 impl Metrics {
-    pub fn new(events: std::sync::Arc<crate::events::Stats>) -> Self {
-        Metrics { events, ..Default::default() }
+    pub fn new(events: std::sync::Arc<crate::events::Stats>, replication: std::sync::Arc<crate::replication::Stats>) -> Self {
+        Metrics { events, replication, ..Default::default() }
     }
 }
 
@@ -119,6 +120,21 @@ impl Metrics {
         {
             let _ = writeln!(o, "s3rs_notifications_total{{result=\"{name}\"}} {}", v.load(Relaxed));
         }
+        let r = &self.replication;
+        let _ = writeln!(o, "# TYPE s3rs_replication_total counter");
+        for (name, v) in
+            [("replicated", &r.replicated), ("unchanged", &r.unchanged), ("skipped", &r.skipped), ("failed", &r.failed)]
+        {
+            let _ = writeln!(o, "s3rs_replication_total{{result=\"{name}\"}} {}", v.load(Relaxed));
+        }
+        let _ =
+            writeln!(o, "# TYPE s3rs_replication_bytes_total counter\ns3rs_replication_bytes_total {}", r.bytes.load(Relaxed));
+        if let Ok(n) = store.repl_pending() {
+            let _ = writeln!(o, "# TYPE s3rs_replication_pending gauge\ns3rs_replication_pending {n}");
+        }
+        let oldest = r.oldest_ms.load(Relaxed);
+        let lag = if oldest == 0 { 0.0 } else { crate::util::now_ms().saturating_sub(oldest) as f64 / 1000.0 };
+        let _ = writeln!(o, "# TYPE s3rs_replication_lag_seconds gauge\ns3rs_replication_lag_seconds {lag:.3}");
         if per_bucket && let Ok(usage) = store.all_usage() {
             let _ = writeln!(o, "# TYPE s3rs_bucket_objects gauge");
             for (b, n, _) in &usage {

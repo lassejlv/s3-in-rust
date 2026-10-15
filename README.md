@@ -118,7 +118,7 @@ Each flag can also be set with the environment variable shown (switches take `1`
 | `--cache-mb` | `S3RS_CACHE_MB` | `256` | Metadata cache size |
 | `--max-connections` | `S3RS_MAX_CONNECTIONS` | from the fd limit, ≤ 10000 | Stops accepting beyond this many open connections (see [Limits and timeouts](#limits-and-timeouts)) |
 | `--min-free-space` | `S3RS_MIN_FREE_SPACE` | 2% of the disk (16M–256M) | Refuses uploads when the data disk's free space would drop below this (e.g. `512M`, `2G`; `0` turns it off). See [Disk space](#disk-space). |
-| `--no-fsync` | `S3RS_NO_FSYNC` | off | Skips fsync. Faster, but a power loss can lose up to ~1s of acknowledged writes. |
+| `--no-fsync` | `S3RS_NO_FSYNC` | off | Skips fsync. Faster, but a crash or power loss can lose about the last second of acknowledged writes. |
 | `--access-log` | `S3RS_ACCESS_LOG` | off | Logs every request to stdout as `json` or `text` (see [Access logs](#access-logs)) |
 | `-v, --verbose` | `S3RS_VERBOSE` | off | Same as `--access-log text` |
 

@@ -231,22 +231,30 @@ struct DbCell {
     path: PathBuf,
     cache_bytes: usize,
     db: std::sync::RwLock<Option<Arc<Database>>>,
+    /// Set once the database was reopened: commits that were not yet durable are lost, so
+    /// their new data files are orphans for the next start's recovery scan.
+    reopened: std::sync::atomic::AtomicBool,
 }
 
 impl DbCell {
     fn get(&self) -> S3Result<Arc<Database>> {
-        self.db
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone()
-            .ok_or_else(|| S3Error::internal("the metadata database is being reopened after an I/O error"))
+        self.db.read().unwrap_or_else(|e| e.into_inner()).clone().ok_or_else(|| {
+            S3Error::new(
+                "ServiceUnavailable",
+                hyper::StatusCode::SERVICE_UNAVAILABLE,
+                "The metadata database is being reopened after an I/O error. Please retry.",
+            )
+        })
     }
 
-    /// Close and reopen the database. Waits for in-flight reads that still hold the old handle.
+    /// Close and reopen the database. The handle is taken out first, so requests fail fast with
+    /// a retryable 503 meanwhile instead of blocking; then this waits (without holding the lock)
+    /// for in-flight reads that still use the old handle.
     fn reopen(&self) -> S3Result<()> {
-        let mut slot = self.db.write().unwrap_or_else(|e| e.into_inner());
+        let old = self.db.write().unwrap_or_else(|e| e.into_inner()).take();
+        self.reopened.store(true, std::sync::atomic::Ordering::SeqCst);
         let deadline = Instant::now() + Duration::from_secs(30);
-        if let Some(mut old) = slot.take() {
+        if let Some(mut old) = old {
             loop {
                 match Arc::try_unwrap(old) {
                     Ok(db) => {
@@ -258,7 +266,7 @@ impl DbCell {
                         std::thread::sleep(Duration::from_millis(10));
                     }
                     Err(still_shared) => {
-                        *slot = Some(still_shared);
+                        *self.db.write().unwrap_or_else(|e| e.into_inner()) = Some(still_shared);
                         return Err(S3Error::internal("cannot reopen the metadata database: still in use"));
                     }
                 }
@@ -268,12 +276,13 @@ impl DbCell {
         loop {
             match Database::builder().set_cache_size(self.cache_bytes).create(&self.path) {
                 Ok(db) => {
-                    *slot = Some(Arc::new(db));
+                    *self.db.write().unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(db));
                     return Ok(());
                 }
                 Err(redb::DatabaseError::DatabaseAlreadyOpen) if Instant::now() < deadline => {
                     std::thread::sleep(Duration::from_millis(20));
                 }
+                // Left closed; the next write tries again.
                 Err(e) => return Err(e.into()),
             }
         }
@@ -534,6 +543,7 @@ impl Store {
             path: root.join("meta.redb"),
             cache_bytes: cfg.cache_bytes,
             db: std::sync::RwLock::new(Some(Arc::new(db))),
+            reopened: std::sync::atomic::AtomicBool::new(false),
         });
         let space = Arc::new(space::Space::new(&root, cfg.min_free));
         if let Err(e) = space.restore_ballast() {
@@ -597,6 +607,10 @@ impl Store {
     /// for pending file deletions first, so the data directory has no orphans; if they don't
     /// finish in time, no marker is written and the next start runs the recovery scan.
     pub fn mark_clean_shutdown(&self) {
+        if self.db.reopened.load(std::sync::atomic::Ordering::SeqCst) {
+            eprintln!("shutdown: the metadata database was reopened after an I/O error; the next start will run a recovery scan");
+            return;
+        }
         let (done, wait) = mpsc::channel();
         if self.deleter.send(Gc::Sync(done)).is_ok() && wait.recv_timeout(Duration::from_secs(60)).is_ok() {
             let _ = std::fs::write(self.root.join(CLEAN_MARKER), CLEAN_TAG);
@@ -1270,6 +1284,10 @@ fn writer_loop(cell: Arc<DbCell>, rx: mpsc::Receiver<Job>, deleter: mpsc::Sender
     let mut dirty = false;
     let mut last_durable = Instant::now();
     let mut last_seq = 0u64;
+    // Data files made obsolete by commits that are not durable yet (--no-fsync). They are
+    // deleted only once a durable commit covers those commits: if the database had to be
+    // reopened (or the process died) before that, the metadata still refers to them.
+    let mut held: Vec<u128> = Vec::new();
     loop {
         let first = if durable || !dirty {
             match rx.recv() {
@@ -1281,9 +1299,21 @@ fn writer_loop(cell: Arc<DbCell>, rx: mpsc::Receiver<Job>, deleter: mpsc::Sender
                 Ok(j) => j,
                 Err(mpsc::RecvTimeoutError::Timeout) => {
                     // Periodically make non-durable commits durable so redb can reclaim pages.
-                    if cell.get().and_then(|db| flush(&db)).is_ok() {
-                        dirty = false;
-                        last_durable = Instant::now();
+                    match cell.get().and_then(|db| flush(&db)) {
+                        Ok(()) => {
+                            dirty = false;
+                            last_durable = Instant::now();
+                            if !held.is_empty() {
+                                let _ = deleter.send(Gc::Remove(std::mem::take(&mut held)));
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("metadata flush failed: {e}");
+                            if recover(&cell) {
+                                held.clear();
+                                dirty = false;
+                            }
+                        }
                     }
                     continue;
                 }
@@ -1310,7 +1340,11 @@ fn writer_loop(cell: Arc<DbCell>, rx: mpsc::Receiver<Job>, deleter: mpsc::Sender
             eprintln!("metadata commit failed: {e}");
             // On a full disk, give up the ballast first: reopening the database may need space.
             let retry = e.code == "StorageFull" && backup.is_some() && ballast.release();
-            recover(&cell);
+            if recover(&cell) {
+                // Non-durable commits were rolled back with the reopen.
+                held.clear();
+                dirty = false;
+            }
             if retry && let Some(ops) = backup {
                 eprintln!("disk full: released the {} MiB ballast file and retrying", ballast.size >> 20);
                 for (job, op) in batch.iter_mut().zip(ops) {
@@ -1321,19 +1355,27 @@ fn writer_loop(cell: Arc<DbCell>, rx: mpsc::Receiver<Job>, deleter: mpsc::Sender
                 outcome = run_batch(&cell, &mut batch, immediate, &mut last_seq, &mut results, &mut obsolete);
                 if let Err(e) = &outcome {
                     eprintln!("metadata commit failed again: {e}");
-                    recover(&cell);
+                    if recover(&cell) {
+                        held.clear();
+                        dirty = false;
+                    }
                 }
             }
         }
 
         match outcome {
             Ok(()) => {
-                dirty = !immediate;
                 if immediate {
+                    // Durable: everything held back so far is now safe to delete.
+                    dirty = false;
                     last_durable = Instant::now();
-                }
-                if !obsolete.is_empty() {
-                    let _ = deleter.send(Gc::Remove(obsolete));
+                    obsolete.append(&mut held);
+                    if !obsolete.is_empty() {
+                        let _ = deleter.send(Gc::Remove(obsolete));
+                    }
+                } else {
+                    dirty = true;
+                    held.append(&mut obsolete);
                 }
                 for (job, r) in batch.into_iter().zip(results) {
                     let _ = job.reply.send(r);
@@ -1346,8 +1388,8 @@ fn writer_loop(cell: Arc<DbCell>, rx: mpsc::Receiver<Job>, deleter: mpsc::Sender
             }
         }
     }
-    if dirty && let Ok(db) = cell.get() {
-        let _ = flush(&db);
+    if dirty && cell.get().and_then(|db| flush(&db)).is_ok() && !held.is_empty() {
+        let _ = deleter.send(Gc::Remove(held));
     }
 }
 
@@ -1399,7 +1441,9 @@ fn run_batch(
 
 /// After a failed write: an I/O error (typically a full disk) poisons redb; reopen it so later
 /// writes, including the deletes that free space, can work again.
-fn recover(cell: &DbCell) {
+/// Returns whether the database was closed (and reopened if possible), which rolls back
+/// commits that were not durable yet.
+fn recover(cell: &DbCell) -> bool {
     let broken = match cell.get() {
         Ok(db) => poisoned(&db),
         Err(_) => true,
@@ -1410,6 +1454,7 @@ fn recover(cell: &DbCell) {
             Err(e) => eprintln!("could not reopen the metadata database yet: {e}"),
         }
     }
+    broken
 }
 
 fn flush(db: &Database) -> S3Result<()> {

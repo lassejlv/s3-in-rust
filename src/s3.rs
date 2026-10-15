@@ -903,8 +903,8 @@ impl Server {
         let Some(token) = &self.admin_token else {
             return Err(err::AccessDenied().with_message("The admin API is disabled; start the server with --admin-token"));
         };
-        let given = header(&parts.headers, "authorization").and_then(|h| h.strip_prefix("Bearer ")).unwrap_or("");
-        if !util::ct_eq(given.trim().as_bytes(), token.as_bytes()) {
+        let given = header(&parts.headers, "authorization").and_then(|h| h.strip_prefix("Bearer ")).map(str::trim);
+        if !given.is_some_and(|g| !token.is_empty() && util::ct_eq(g.as_bytes(), token.as_bytes())) {
             return Err(err::AccessDenied());
         }
         if parts.method != Method::GET {

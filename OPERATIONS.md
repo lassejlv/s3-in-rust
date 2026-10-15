@@ -60,9 +60,12 @@ Kubernetes. Use `GET /_health` for liveness and readiness.
 - **CPU:** small requests are cheap (100k GETs/s on 4 cores). Each upload is hashed (MD5, plus
   SHA-256 for signed payloads) and possibly encrypted (AES-GCM), which costs a few hundred MB/s to
   1 GB/s of throughput per core.
-- **fsync:** keep it on (the default). Group commit keeps durable writes cheap. With `--no-fsync`, a
-  power loss (not a process crash) can lose about the last second of acknowledged writes and leave
-  recently written objects incomplete. `s3rs fsck --deep` finds those objects.
+- **fsync:** keep it on (the default). Group commit keeps durable writes cheap. `--no-fsync` makes
+  metadata commits durable only about once a second:
+  - A crash, a power loss, or a database reopen after a full disk rolls back about the last second
+    of acknowledged writes. Each key returns to an earlier, consistent state.
+  - A power loss can also leave recently written objects incomplete. `s3rs fsck --deep` finds
+    those objects.
 
 ## Monitoring
 

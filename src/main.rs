@@ -291,6 +291,28 @@ fn parse_args() -> Result<Config, String> {
     Ok(c)
 }
 
+/// Refuse empty tokens (an empty bearer token would match a request without one) and the
+/// placeholder values from deploy/s3rs.env. Tokens are compared trimmed.
+fn check_secrets(mut c: Config) -> Result<Config, String> {
+    for (name, v) in [("--metrics-token", &mut c.metrics_token), ("--admin-token", &mut c.admin_token)] {
+        if let Some(t) = v {
+            *t = t.trim().to_string();
+            if t.is_empty() {
+                return Err(format!("{name} must not be empty"));
+            }
+        }
+    }
+    let placeholder = |v: &Option<String>| v.as_deref().is_some_and(|v| v.trim().eq_ignore_ascii_case("change-me"));
+    for (name, v) in
+        [("the secret key", &c.secret_key), ("the metrics token", &c.metrics_token), ("the admin token", &c.admin_token)]
+    {
+        if placeholder(v) {
+            return Err(format!("{name} is still the placeholder `change-me`; set a real value"));
+        }
+    }
+    Ok(c)
+}
+
 /// A size in bytes, optionally with a K/M/G/T suffix (powers of 1024), e.g. `512M`.
 fn parse_size(v: &str) -> Result<u64, String> {
     let v = v.trim();
@@ -573,7 +595,7 @@ fn main() {
     if args.first().map(String::as_str) == Some("backup") {
         backup(&args[1..]);
     }
-    let cfg = match parse_args() {
+    let cfg = match parse_args().and_then(check_secrets) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("{e}");

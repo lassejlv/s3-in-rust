@@ -81,24 +81,19 @@ def finish(p, data, label):
 def fill_disk(path):
     """Another process fills the filesystem completely (it may be full already)."""
     try:
-        f = open(path, "wb")
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC)
     except OSError:
         return
-    with f:
-        chunk = b"\0" * (1 << 20)
-        try:
-            while True:
-                f.write(chunk)
-                f.flush()
-        except OSError:
-            pass
-        small = b"\0" * 4096
-        try:
-            while True:
-                f.write(small)
-                f.flush()
-        except OSError:
-            pass
+    try:
+        for size in (1 << 20, 4096, 1):
+            chunk = b"\0" * size
+            try:
+                while True:
+                    os.write(fd, chunk)
+            except OSError:
+                pass
+    finally:
+        os.close(fd)
 
 
 def scenario(label, extra, expect_ballast):

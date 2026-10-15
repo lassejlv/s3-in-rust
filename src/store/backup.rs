@@ -151,6 +151,7 @@ pub fn offline(root: &Path, out: &mut impl Write) -> Result<Plan, String> {
         }
         e => format!("cannot open {}: {e}", db_path.display()),
     })?;
+    super::check_format_read(&db.begin_read().map_err(|e| e.to_string())?)?;
     let snap = SnapshotFile(root.join("tmp").join(format!("backup-{}.redb", util::id_hex(util::new_id()))));
     std::fs::create_dir_all(root.join("tmp")).map_err(|e| e.to_string())?;
     let plan = snapshot(&db, root, &snap.0).map_err(|e: S3Error| e.message)?;

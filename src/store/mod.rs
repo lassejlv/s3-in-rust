@@ -51,6 +51,34 @@ pub const CONFIG_KINDS: &[&str] = &[
 const USAGE: TableDefinition<&str, (u64, u64)> = TableDefinition::new("usage");
 /// Small server-wide state values (e.g. the usage bookkeeping version).
 const STATE: TableDefinition<&str, u64> = TableDefinition::new("state");
+
+/// Version of the data directory format, stored in STATE as "format". Raise it with any change
+/// that an older release would misread or mishandle (say, a new table whose rules it would not
+/// enforce, or a record it would decode wrongly); changes that older releases can safely ignore
+/// don't need it. A release refuses to open a data directory with a newer format than its own
+/// instead of serving wrong data or dropping what it doesn't know.
+pub(crate) const FORMAT: u64 = 1;
+
+/// Whether this release can open a data directory whose stored format is `stored`.
+pub(crate) fn check_format(stored: Option<u64>) -> Result<(), String> {
+    match stored {
+        Some(v) if v > FORMAT => Err(format!(
+            "the data directory has format version {v}, which only a newer release of s3rs understands \
+             (this release reads version {FORMAT} and older)"
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// `check_format` for tools that open the database read-only (fsck, offline backup).
+pub(crate) fn check_format_read(txn: &redb::ReadTransaction) -> Result<(), String> {
+    let stored = match txn.open_table(STATE) {
+        Ok(t) => t.get("format").map_err(|e| e.to_string())?.map(|v| v.value()),
+        Err(redb::TableError::TableDoesNotExist(_)) => None,
+        Err(e) => return Err(e.to_string()),
+    };
+    check_format(stored)
+}
 /// Per-bucket bytes held by multipart upload parts that are not part of an object yet.
 const PART_BYTES: TableDefinition<&str, u64> = TableDefinition::new("part_bytes");
 const USAGE_VERSION: u64 = 2;
@@ -515,6 +543,14 @@ impl Store {
         let db = Database::builder().set_cache_size(cfg.cache_bytes).create(root.join("meta.redb"))?;
         {
             let txn = db.begin_write()?;
+            {
+                let mut state = txn.open_table(STATE)?;
+                let stored = state.get("format")?.map(|v| v.value());
+                check_format(stored).map_err(S3Error::internal)?;
+                if stored != Some(FORMAT) {
+                    state.insert("format", FORMAT)?;
+                }
+            }
             txn.open_table(BUCKETS)?;
             txn.open_table(OBJECTS)?;
             txn.open_table(INLINE)?;
@@ -2253,6 +2289,49 @@ mod tests {
         })
         .unwrap();
         (store, dir)
+    }
+
+    #[test]
+    fn newer_data_formats_are_refused() {
+        let dir = std::env::temp_dir().join(format!("s3rs-test-{}", util::id_hex(util::new_id())));
+        std::fs::create_dir_all(&dir).unwrap();
+        {
+            let db = Database::create(dir.join("meta.redb")).unwrap();
+            let txn = db.begin_write().unwrap();
+            txn.open_table(STATE).unwrap().insert("format", FORMAT + 1).unwrap();
+            txn.commit().unwrap();
+        }
+        let open = || {
+            Store::open(StoreConfig {
+                root: dir.clone(),
+                fsync: false,
+                inline_threshold: 1024,
+                cache_bytes: 1 << 20,
+                min_free: Some(0),
+            })
+        };
+        let e = open().err().expect("a newer format is refused");
+        assert!(e.message.contains("newer release"), "{}", e.message);
+        assert!(fsck::run(&dir, false, None, true).err().unwrap().contains("newer release"));
+        assert!(backup::offline(&dir, &mut std::io::sink()).err().unwrap().contains("newer release"));
+        // The refusal changed nothing: the stored format is still the newer one.
+        {
+            let db = Database::create(dir.join("meta.redb")).unwrap();
+            let txn = db.begin_read().unwrap();
+            assert_eq!(txn.open_table(STATE).unwrap().get("format").unwrap().unwrap().value(), FORMAT + 1);
+            assert!(txn.open_table(BUCKETS).is_err(), "no tables were created");
+        }
+        // A data directory from before the format was recorded is upgraded to the current one.
+        std::fs::remove_dir_all(&dir).unwrap();
+        let store = open().unwrap();
+        drop(store);
+        std::thread::sleep(Duration::from_millis(200));
+        let db = Database::create(dir.join("meta.redb")).unwrap();
+        let txn = db.begin_read().unwrap();
+        assert_eq!(txn.open_table(STATE).unwrap().get("format").unwrap().unwrap().value(), FORMAT);
+        drop(txn);
+        drop(db);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn small(data: &str) -> (ObjectMeta, Option<Bytes>) {

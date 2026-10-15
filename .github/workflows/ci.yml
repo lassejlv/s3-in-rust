@@ -245,3 +245,29 @@ jobs:
       - name: Server log
         if: always()
         run: cat /tmp/s3rs.log
+
+  upgrade:
+    name: upgrade from older builds
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install boto3
+      - run: cargo build --release
+      # Data written by older builds must read back exactly in this one. The bases are the first
+      # commit and the one before the usage counters changed format; add each release here.
+      - name: upgrade test
+        shell: bash
+        run: |
+          for base in fa33991 352c28b; do
+            git worktree add -f /tmp/src-$base $base
+            (cd /tmp/src-$base && CARGO_TARGET_DIR=/tmp/target-old cargo build --release -q)
+            cp /tmp/target-old/release/s3rs /tmp/s3rs-$base
+            python3 tests/upgrade.py /tmp/s3rs-$base ./target/release/s3rs
+          done

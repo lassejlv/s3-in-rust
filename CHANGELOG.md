@@ -18,6 +18,8 @@ First release.
   archives.
 - Full-disk safety: a free-space reserve (507 StorageFull), a ballast file, and in-place recovery
   of the metadata database.
+- The data directory records its format version: a release refuses to open data written in a
+  newer format than it understands, rather than misreading it.
 
 **S3 API**
 - Buckets, objects, multipart uploads, copies, listings (v1, v2, versions), tagging, ACLs (canned),
@@ -41,5 +43,5 @@ First release.
 **Testing**
 - Unit tests, including AWS SigV4 test vectors and parser fuzzing.
 - Compatibility suites: boto3, aws-cli, minio-go and a Playwright console test, all also over HTTPS.
-- A SIGKILL crash-consistency test, a disk-full test, a backup/restore test and HTTP-level
-  fuzzing, all in CI.
+- A SIGKILL crash-consistency test, a disk-full test, a backup/restore test, an upgrade test
+  (data written by older builds) and HTTP-level fuzzing, all in CI.

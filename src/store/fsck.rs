@@ -92,6 +92,7 @@ pub fn run(root: &Path, deep: bool, master: Option<[u8; 32]>, repair: bool) -> R
     let mut usage: HashMap<String, (u64, u64)> = HashMap::new();
     {
         let txn = db.begin_read().map_err(|e| e.to_string())?;
+        super::check_format_read(&txn)?;
         let inline = table(&txn, INLINE)?;
         for def in [OBJECTS, VERSIONS] {
             let Some(t) = table(&txn, def)? else { continue };

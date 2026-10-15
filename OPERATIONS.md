@@ -122,10 +122,19 @@ A backup holds the state at the moment it started. Writes made during the backup
 - New releases read data directories written by older ones. Some new features compute data on
   their first start: for example, usage counters were computed from existing objects when they
   were introduced. The start log reports this.
-- **Downgrading** works as long as the older release understands the metadata it finds. Records
-  carry a format version, and an older release refuses a record it doesn't know instead of
-  misreading it. After running an older release, the next start of a newer one recomputes the
-  counters that the older release didn't maintain.
+- **Downgrading** works as long as the older release understands the data directory. The data
+  directory records a format version, raised only by changes an older release would misread or
+  mishandle (the release notes say so). A release refuses to start, and `s3rs fsck` and
+  `s3rs backup` refuse to run, on a data directory with a newer format than its own (`the data
+  directory has format version N, which only a newer release of s3rs understands`); restore the
+  backup taken before the upgrade to go back. Within one format version, individual records also
+  carry a version, and an older release refuses a record it doesn't know instead of misreading
+  it. After running an older release, the next start of a newer one recomputes the counters that
+  the older release didn't maintain.
+- Upgrades are tested: `tests/upgrade.py OLD NEW` writes every kind of data with an older binary
+  (objects of all sizes, metadata, multipart uploads in progress, versions, delete markers, tags,
+  SSE-S3 and SSE-C) and checks that the newer one reads it back exactly, keeps working on it and
+  passes `fsck --deep`.
 - `s3rs fsck` runs on a stopped server and checks a data directory after any upgrade or incident.
 
 ## Incidents

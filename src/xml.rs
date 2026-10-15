@@ -20,6 +20,34 @@ impl Node {
     pub fn child_text(&self, name: &str) -> Option<&str> {
         self.child(name).map(|c| c.text.as_str())
     }
+
+    /// The element as a document again (in S3's namespace; text-only and element-only content,
+    /// as `parse` reads it).
+    pub fn to_document(&self) -> String {
+        let mut out = String::from("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
+        self.write(&mut out, true);
+        out
+    }
+
+    fn write(&self, out: &mut String, root: bool) {
+        out.push('<');
+        out.push_str(&self.name);
+        if root {
+            out.push_str(" xmlns=\"");
+            out.push_str(NS);
+            out.push('"');
+        }
+        out.push('>');
+        if self.children.is_empty() {
+            xml_escape(&self.text, out);
+        }
+        for c in &self.children {
+            c.write(out, false);
+        }
+        out.push_str("</");
+        out.push_str(&self.name);
+        out.push('>');
+    }
 }
 
 fn decode_entities(s: &str, out: &mut String) -> Option<()> {
@@ -182,6 +210,11 @@ impl Xml {
     pub fn owner(&mut self, tag: &str) -> &mut Self {
         self.open(tag).elem("ID", crate::OWNER_ID).elem("DisplayName", crate::OWNER_ID).close(tag)
     }
+    /// A document whose root has no namespace (S3's PostResponse).
+    pub fn bare(root: &str) -> Self {
+        Xml(format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<{root}>"))
+    }
+
     pub fn finish(mut self, root: &str) -> String {
         self.close(root);
         self.0

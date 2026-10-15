@@ -209,7 +209,10 @@ fn policy_err(msg: impl Into<String>) -> S3Error {
 
 /// Fields that never need a policy condition.
 fn exempt(field: &str) -> bool {
-    matches!(field, "policy" | "x-amz-signature" | "signature" | "awsaccesskeyid" | "file") || field.starts_with("x-ignore-")
+    // Checksums only protect the upload's integrity, so they need no condition (as on S3).
+    matches!(field, "policy" | "x-amz-signature" | "signature" | "awsaccesskeyid" | "file")
+        || field.starts_with("x-ignore-")
+        || field.starts_with("x-amz-checksum-")
 }
 
 impl PostPolicy {
@@ -236,6 +239,7 @@ impl PostPolicy {
         let mut conds = Vec::new();
         for c in list {
             match c {
+                Json::Obj(m) if m.is_empty() => return Err(malformed("Invalid Policy: Invalid condition")),
                 Json::Obj(m) => {
                     for (k, v) in m {
                         let Json::Str(v) = v else { return Err(malformed("Invalid Policy: Invalid condition")) };
@@ -274,6 +278,8 @@ impl PostPolicy {
                         return Err(policy_err(format!("Policy Condition failed: [\"eq\", \"${f}\", \"{v}\"]")));
                     }
                 }
+                // An empty prefix allows any value, including none.
+                Cond::StartsWith(_, p) if p.is_empty() => {}
                 Cond::StartsWith(f, p) => {
                     let ok = value(f).is_some_and(|actual| {
                         if f == "content-type" {

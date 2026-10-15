@@ -284,7 +284,8 @@ impl Auth {
             }
             return Ok(self.principal(ak));
         }
-        Err(err::AccessDenied().with_message("POST policy requires a signature"))
+        Err(err::InvalidArgument()
+            .with_message("Bucket POST with a policy must contain a signature (Signature or X-Amz-Signature)"))
     }
 
     /// AWS Signature Version 2 (legacy; still used by some clients for presigned URLs).

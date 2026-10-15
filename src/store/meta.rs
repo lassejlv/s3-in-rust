@@ -55,6 +55,28 @@ impl ChecksumAlgo {
         }
     }
 
+    /// The algorithm's name in S3 APIs (`x-amz-checksum-algorithm`).
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Crc32 => "CRC32",
+            Self::Crc32c => "CRC32C",
+            Self::Crc64Nvme => "CRC64NVME",
+            Self::Sha1 => "SHA1",
+            Self::Sha256 => "SHA256",
+        }
+    }
+
+    /// The XML element of a checksum value, e.g. `ChecksumSHA256`.
+    pub fn xml_name(self) -> &'static str {
+        match self {
+            Self::Crc32 => "ChecksumCRC32",
+            Self::Crc32c => "ChecksumCRC32C",
+            Self::Crc64Nvme => "ChecksumCRC64NVME",
+            Self::Sha1 => "ChecksumSHA1",
+            Self::Sha256 => "ChecksumSHA256",
+        }
+    }
+
     pub const ALL: [ChecksumAlgo; 5] = [Self::Crc32, Self::Crc32c, Self::Crc64Nvme, Self::Sha1, Self::Sha256];
 }
 
@@ -105,6 +127,8 @@ pub struct PartMeta {
     pub md5: [u8; 16],
     pub mtime_ms: u64,
     pub file: u128,
+    /// The part's checksum, when the upload has a checksum algorithm.
+    pub checksum: Option<(ChecksumAlgo, String)>,
 }
 
 struct W(Vec<u8>);
@@ -287,12 +311,24 @@ impl PartMeta {
         w.0.extend_from_slice(&self.md5);
         w.u64(self.mtime_ms);
         w.u128(self.file);
+        if let Some((a, v)) = &self.checksum {
+            w.u8(*a as u8);
+            w.str(v);
+        }
         w.0
     }
 
     pub fn decode(b: &[u8]) -> S3Result<Self> {
         let mut r = R(b);
-        Ok(PartMeta { size: r.u64()?, md5: r.take(16)?.try_into().unwrap(), mtime_ms: r.u64()?, file: r.u128()? })
+        let (size, md5, mtime_ms, file) = (r.u64()?, r.take(16)?.try_into().unwrap(), r.u64()?, r.u128()?);
+        // The checksum was added later, as optional trailing bytes (older releases ignore them).
+        let checksum = if r.0.is_empty() {
+            None
+        } else {
+            let a = ChecksumAlgo::from_u8(r.u8()?).ok_or_else(corrupt)?;
+            Some((a, r.str()?))
+        };
+        Ok(PartMeta { size, md5, mtime_ms, file, checksum })
     }
 }
 

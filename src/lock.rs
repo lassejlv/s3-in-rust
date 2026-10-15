@@ -101,10 +101,9 @@ impl State {
     /// May the retention be replaced by `new` (`None` removes it)?
     pub fn check_retention_change(&self, new: Option<Retention>, now: u64, bypass: bool) -> S3Result<()> {
         let Some(old) = self.active(now) else { return Ok(()) };
-        // Extending (same mode, later or equal date) is always allowed, as is GOVERNANCE -> COMPLIANCE.
-        let extends = new.is_some_and(|n| {
-            n.until >= old.until && (n.mode == old.mode || (old.mode == Mode::Governance && n.mode == Mode::Compliance))
-        });
+        // Extending (same mode, later or equal date) is always allowed; changing the mode of a
+        // GOVERNANCE retention needs the bypass like any other change to it.
+        let extends = new.is_some_and(|n| n.until >= old.until && n.mode == old.mode);
         if extends {
             return Ok(());
         }
@@ -180,20 +179,21 @@ impl BucketLock {
         }
         let Some(rule) = doc.child("Rule") else { return Ok(BucketLock::default()) };
         let dr = rule.child("DefaultRetention").ok_or_else(err::MalformedXML)?;
-        let mode = Mode::parse(dr.child_text("Mode").ok_or_else(err::MalformedXML)?)?;
+        let mode = Mode::parse(dr.child_text("Mode").ok_or_else(err::MalformedXML)?).map_err(|_| err::MalformedXML())?;
+        let invalid_period = |msg: &str| err::InvalidArgument().with_code("InvalidRetentionPeriod").with_message(msg.to_string());
         let num = |n: &str| -> S3Result<Option<u64>> {
             match dr.child_text(n) {
                 None => Ok(None),
                 Some(v) => match v.trim().parse::<u64>() {
                     Ok(x) if x > 0 && x <= 36_500 => Ok(Some(x)),
-                    _ => Err(err::InvalidArgument().with_message("Default retention period must be a positive integer value")),
+                    _ => Err(invalid_period("Default retention period must be a positive integer value")),
                 },
             }
         };
         let period = match (num("Days")?, num("Years")?) {
             (Some(d), None) => Period::Days(d),
             (None, Some(y)) if y > 100 => {
-                return Err(err::InvalidArgument().with_message("Default retention period cannot exceed 100 years"));
+                return Err(invalid_period("Default retention period cannot exceed 100 years"));
             }
             (None, Some(y)) => Period::Years(y),
             _ => return Err(err::MalformedXML().with_message("Default retention needs exactly one of Days or Years")),
@@ -266,7 +266,8 @@ mod tests {
         assert!(c.check_retention_change(r(Mode::Governance, 3000), now, true).is_err());
         assert!(c.check_retention_change(None, now, true).is_err());
         let g = st(Mode::Governance, 2000, None);
-        assert!(g.check_retention_change(r(Mode::Compliance, 2000), now, false).is_ok());
+        assert!(g.check_retention_change(r(Mode::Compliance, 2000), now, false).is_err());
+        assert!(g.check_retention_change(r(Mode::Compliance, 2000), now, true).is_ok());
         assert!(g.check_retention_change(r(Mode::Governance, 1500), now, false).is_err());
         assert!(g.check_retention_change(None, now, true).is_ok());
         // Expired retention can be changed freely.

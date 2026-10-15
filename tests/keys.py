@@ -63,7 +63,7 @@ def denied(fn):
         fn()
         return False
     except ClientError as e:
-        return e.response["Error"]["Code"] in ("AccessDenied", "InvalidAccessKeyId", "403")
+        return e.response["Error"]["Code"] in ("AccessDenied", "InvalidAccessKeyId", "SignatureDoesNotMatch", "403")
 
 
 p = start()
@@ -121,6 +121,24 @@ try:
     assert admin("DELETE", f"/{k['access_key']}")[0] == 204
     assert denied(lambda: a.head_bucket(Bucket="team-a"))
     assert len([x for x in admin("GET")[1]["keys"] if x["source"] == "api"]) == 2
+
+    # A stored key hidden by a file key with the same name can still be revoked, so removing
+    # the file key doesn't bring the old secret back.
+    assert admin("POST", body={"access_key": "dup", "secret_key": "dupsecretA0123456"})[0] == 201
+    with open(f"{work}/creds", "a") as f:
+        f.write("dup:dupsecretB0123456:ro\n")
+    p.send_signal(signal.SIGHUP)
+    time.sleep(0.5)
+    assert denied(lambda: client("dup", "dupsecretA0123456").list_buckets())
+    client("dup", "dupsecretB0123456").list_buckets()
+    assert admin("DELETE", "/dup")[0] == 204
+    with open(f"{work}/creds", "w") as f:
+        f.write("filekey:filesecret123\n")
+    p.send_signal(signal.SIGHUP)
+    time.sleep(0.5)
+    assert denied(lambda: client("dup", "dupsecretA0123456").list_buckets())
+    assert denied(lambda: client("dup", "dupsecretB0123456").list_buckets())
+
     log = open(f"{work}/log").read()
     assert k["secret_key"] not in log and "readersecret0123" not in log
     print("KEYS TEST OK")

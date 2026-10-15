@@ -15,6 +15,7 @@ use std::time::Duration;
 
 #[derive(Debug, Clone, Default)]
 pub struct Rule {
+    pub id: String,
     pub enabled: bool,
     pub prefix: String,
     pub tags: Vec<(String, String)>,
@@ -62,9 +63,17 @@ pub fn parse(doc: &xml::Node) -> S3Result<Vec<Rule>> {
     if doc.name != "LifecycleConfiguration" {
         return Err(err::MalformedXML());
     }
-    let mut rules = Vec::new();
+    let mut rules: Vec<Rule> = Vec::new();
     for r in doc.children_named("Rule") {
+        let id = r.child_text("ID").unwrap_or("").to_string();
+        if id.len() > 255 {
+            return Err(err::InvalidArgument().with_message("ID length should not exceed allowed limit of 255"));
+        }
+        if !id.is_empty() && rules.iter().any(|x| x.id == id) {
+            return Err(err::InvalidArgument().with_message("Rule ID must be unique. Found same ID for more than one rule"));
+        }
         let mut rule = Rule {
+            id,
             enabled: match r.child_text("Status").map(str::trim) {
                 Some("Enabled") => true,
                 Some("Disabled") => false,
@@ -133,6 +142,42 @@ pub fn parse(doc: &xml::Node) -> S3Result<Vec<Rule>> {
     Ok(rules)
 }
 
+/// The configuration with an ID given to each rule without one (as S3 does), or `None` when
+/// every rule has one.
+pub fn with_ids(doc: &mut xml::Node) -> Option<String> {
+    let mut changed = false;
+    for r in doc.children.iter_mut().filter(|c| c.name == "Rule") {
+        if r.child_text("ID").is_none_or(str::is_empty) {
+            r.children.retain(|c| c.name != "ID");
+            let id = util::new_id();
+            r.children.insert(0, xml::Node { name: "ID".into(), text: format!("{id:032x}"), children: Vec::new() });
+            changed = true;
+        }
+    }
+    changed.then(|| doc.to_document())
+}
+
+/// When an object expires under the rules (unix seconds) and the rule that expires it, for the
+/// `x-amz-expiration` header.
+pub fn expiration<'a>(rules: &'a [Rule], key: &str, meta: &ObjectMeta) -> Option<(u64, &'a str)> {
+    const DAY: u64 = 86_400;
+    if meta.delete_marker {
+        return None;
+    }
+    rules
+        .iter()
+        .filter(|r| r.enabled && r.matches(key, meta))
+        .filter_map(|r| {
+            let by_days = r.expire_days.map(|d| (meta.mtime_ms / 1000 + d * DAY).div_ceil(DAY) * DAY);
+            let at = match (by_days, r.expire_date) {
+                (Some(a), Some(b)) => a.min(b),
+                (a, b) => a.or(b)?,
+            };
+            Some((at, r.id.as_str()))
+        })
+        .min_by_key(|(at, _)| *at)
+}
+
 impl Rule {
     fn matches(&self, key: &str, meta: &ObjectMeta) -> bool {
         key.starts_with(&self.prefix)
@@ -166,22 +211,21 @@ pub struct Stats {
 /// Run one sweep over all buckets. Returns (objects expired, uploads aborted).
 pub async fn sweep(store: &Arc<Store>, day_secs: u64, events: Option<&crate::events::Bus>) -> S3Result<(u64, u64)> {
     let notify = |bucket: &str, removed: &[crate::store::Removed]| {
-        let Some(bus) = events else { return };
-        for r in removed {
-            bus.emit(crate::events::Event {
-                name: if r.marker_created { "LifecycleExpiration:DeleteMarkerCreated" } else { "LifecycleExpiration:Delete" },
-                bucket: bucket.to_string(),
-                key: r.key.clone(),
-                size: r.size,
-                etag: r.etag.clone(),
-                version: r.version.clone(),
-                principal: "s3.amazonaws.com".to_string(),
-                source_ip: String::new(),
-                request_id: String::new(),
-                time_ms: util::now_ms(),
-                sequencer: r.seq,
-            });
-        }
+        let bus = events?;
+        let evs = removed.iter().map(|r| crate::events::Event {
+            name: if r.marker_created { "LifecycleExpiration:DeleteMarkerCreated" } else { "LifecycleExpiration:Delete" },
+            bucket: bucket.to_string(),
+            key: r.key.clone(),
+            size: r.size,
+            etag: r.etag.clone(),
+            version: r.version.clone(),
+            principal: "s3.amazonaws.com".to_string(),
+            source_ip: String::new(),
+            request_id: String::new(),
+            time_ms: util::now_ms(),
+            sequencer: r.seq,
+        });
+        Some(bus.emit_all(evs.collect()))
     };
     let (mut expired, mut aborted) = (0u64, 0u64);
     let st = store.clone();
@@ -209,7 +253,9 @@ pub async fn sweep(store: &Arc<Store>, day_secs: u64, events: Option<&crate::eve
                         && let Ok(OpOut::Removed(removed)) = store.submit(Op::Expire { bucket: bucket.clone(), items: due }).await
                     {
                         expired += removed.len() as u64;
-                        notify(&bucket, &removed);
+                        if let Some(queued) = notify(&bucket, &removed) {
+                            queued.await;
+                        }
                     }
                     if page.len() < 1000 {
                         break;
@@ -253,7 +299,9 @@ pub async fn sweep(store: &Arc<Store>, day_secs: u64, events: Option<&crate::eve
                             store.submit(Op::PurgeVersions { bucket: bucket.clone(), items: due }).await
                     {
                         expired += removed.len() as u64;
-                        notify(&bucket, &removed);
+                        if let Some(queued) = notify(&bucket, &removed) {
+                            queued.await;
+                        }
                     }
                     match page.last {
                         Some(l) if n >= 1000 => after = Some(l),
@@ -344,6 +392,27 @@ mod tests {
         assert!(!r.expired(&m, day + 10 * 3600, day));
         assert!(!r.expired(&m, 2 * day - 1, day));
         assert!(r.expired(&m, 2 * day, day));
+    }
+
+    #[test]
+    fn rule_ids_and_expiration_header() {
+        let text = "<LifecycleConfiguration><Rule><Status>Enabled</Status><Prefix>a&amp;b/</Prefix>\
+                    <Expiration><Days>1</Days></Expiration></Rule><Rule><ID>keep</ID><Status>Enabled</Status>\
+                    <Prefix></Prefix><Expiration><Days>30</Days></Expiration></Rule></LifecycleConfiguration>";
+        let mut doc = xml::parse(text).unwrap();
+        let stored = with_ids(&mut doc).expect("an ID was added");
+        let rules = parse(&xml::parse(&stored).unwrap()).unwrap();
+        assert_eq!(rules[0].id.len(), 32);
+        assert_eq!((rules[0].prefix.as_str(), rules[1].id.as_str()), ("a&b/", "keep"));
+        assert!(with_ids(&mut xml::parse(&stored).unwrap()).is_none());
+        // The earliest matching rule wins.
+        let (at, id) = expiration(&rules, "a&b/x", &meta(1, 10 * 3600, &[])).unwrap();
+        assert_eq!((at, id), (2 * 86_400, rules[0].id.as_str()));
+        assert_eq!(expiration(&rules, "z", &meta(1, 0, &[])).unwrap(), (30 * 86_400, "keep"));
+
+        let dup = "<LifecycleConfiguration><Rule><ID>x</ID><Status>Enabled</Status><Expiration><Days>1</Days></Expiration></Rule>\
+                   <Rule><ID>x</ID><Status>Enabled</Status><Expiration><Days>2</Days></Expiration></Rule></LifecycleConfiguration>";
+        assert_eq!(parse(&xml::parse(dup).unwrap()).unwrap_err().code, "InvalidArgument");
     }
 
     #[test]

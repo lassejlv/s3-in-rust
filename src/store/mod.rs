@@ -16,7 +16,7 @@ use crate::error::{S3Error, S3Result, err};
 use crate::lock;
 use crate::util::{self, now_ms};
 use bytes::Bytes;
-use meta::{ObjectMeta, ObjectSummary, PartMeta, Storage, UploadMeta};
+use meta::{ChecksumAlgo, ObjectMeta, ObjectSummary, PartMeta, Storage, UploadMeta};
 use redb::{Database, Durability, ReadableDatabase, ReadableTable, TableDefinition};
 use std::collections::HashMap;
 use std::ops::Bound;
@@ -381,6 +381,8 @@ pub enum WriteCond {
     NotExists,
     /// `If-Match: "etag"` — only overwrite this version.
     Matches(String),
+    /// `If-None-Match: "etag"` — don't overwrite this version.
+    NotMatches(String),
 }
 
 #[derive(Clone)]
@@ -418,7 +420,10 @@ pub enum Op {
         bucket: String,
         key: String,
         upload: u128,
-        parts: Vec<(u32, String)>,
+        /// (part number, ETag, checksum the client listed for it).
+        parts: Vec<(u32, String, Option<String>)>,
+        /// The whole object's checksum, if the client sent one.
+        checksum: Option<(ChecksumAlgo, String)>,
         cond: Option<WriteCond>,
     },
     Abort {
@@ -851,15 +856,21 @@ impl Store {
         Ok(out)
     }
 
-    /// Queued event notifications per webhook target.
-    pub fn event_counts(&self) -> S3Result<HashMap<String, u64>> {
+    /// Queued event notifications per webhook target: (events, bytes, highest queue
+    /// sequence number).
+    pub fn event_queues(&self) -> S3Result<HashMap<String, (u64, u64, u64)>> {
         let txn = self.db.get()?.begin_read()?;
-        let mut out: HashMap<String, u64> = HashMap::new();
+        let mut out: HashMap<String, (u64, u64, u64)> = HashMap::new();
         for e in txn.open_table(EVENTS)?.iter()? {
-            let (k, _) = e?;
+            let (k, v) = e?;
             let k = k.value();
-            let target = String::from_utf8_lossy(&k[..k.iter().position(|b| *b == 0).unwrap_or(k.len())]).into_owned();
-            *out.entry(target).or_default() += 1;
+            let sep = k.iter().position(|b| *b == 0).unwrap_or(k.len());
+            let target = String::from_utf8_lossy(&k[..sep]).into_owned();
+            let seq = k.get(sep + 1..).and_then(|s| <[u8; 8]>::try_from(s).ok()).map(u64::from_be_bytes).unwrap_or(0);
+            let q = out.entry(target).or_default();
+            q.0 += 1;
+            q.1 += v.value().len() as u64;
+            q.2 = q.2.max(seq);
         }
         Ok(out)
     }
@@ -1952,8 +1963,12 @@ fn pending_part_bytes(txn: &redb::WriteTransaction) -> S3Result<std::collections
 }
 
 fn check_cond(existing: Option<&ObjectMeta>, cond: &Option<WriteCond>) -> S3Result<()> {
+    // A delete marker is no object.
+    let existing = existing.filter(|m| !m.delete_marker);
     match (cond, existing) {
         (None, _) => Ok(()),
+        (Some(WriteCond::NotMatches(e)), Some(m)) if norm_etag(e) == norm_etag(&m.etag) => Err(err::PreconditionFailed()),
+        (Some(WriteCond::NotMatches(_)), _) => Ok(()),
         (Some(WriteCond::NotExists), None) => Ok(()),
         (Some(WriteCond::NotExists), Some(_)) => Err(err::PreconditionFailed()),
         (Some(WriteCond::Matches(_)), None) => Err(err::NoSuchKey()),
@@ -2268,6 +2283,14 @@ fn bucket_has_versions(tx: &Tables, bucket: &str) -> S3Result<bool> {
     hi.push(1);
     Ok(tx.versions.range::<&[u8]>(lo.as_slice()..hi.as_slice())?.next().is_some())
 }
+
+/// Stored headers with this prefix are internal: never sent to clients or copied.
+pub const INTERNAL_PREFIX: &str = "x-s3rs-";
+/// An upload's checksum algorithm and type (CreateMultipartUpload).
+pub const UPLOAD_CHECKSUM_ALGO: &str = "x-s3rs-checksum-algorithm";
+pub const UPLOAD_CHECKSUM_TYPE: &str = "x-s3rs-checksum-type";
+/// A multipart object's part checksums, comma-separated in part order.
+pub const PART_CHECKSUMS: &str = "x-s3rs-part-checksums";
 
 /// The stored header that marks an object written by replication from another server.
 pub const REPLICA_HEADER: &str = "x-amz-replication-status";
@@ -2662,7 +2685,7 @@ fn apply(tx: &mut Tables, op: Op, garbage: &mut Vec<u128>, last_seq: &mut u64) -
             }
             Ok(OpOut::Removed(out))
         }
-        Op::Complete { bucket, key, upload, parts, cond } => {
+        Op::Complete { bucket, key, upload, parts, checksum, cond } => {
             let Some(u) = tx.uploads.get(upload)?.map(|v| UploadMeta::decode(v.value())).transpose()? else {
                 return Err(err::NoSuchUpload());
             };
@@ -2674,9 +2697,10 @@ fn apply(tx: &mut Tables, op: Op, garbage: &mut Vec<u128>, last_seq: &mut u64) -
             }
             let mut segs = Vec::with_capacity(parts.len());
             let mut md5s = Vec::with_capacity(parts.len() * 16);
+            let mut part_sums: Vec<(Option<(ChecksumAlgo, String)>, u64)> = Vec::with_capacity(parts.len());
             let mut size = 0u64;
             let mut prev = 0u32;
-            for (i, (num, etag)) in parts.iter().enumerate() {
+            for (i, (num, etag, listed)) in parts.iter().enumerate() {
                 if *num <= prev && i > 0 {
                     return Err(err::InvalidPartOrder());
                 }
@@ -2688,6 +2712,12 @@ fn apply(tx: &mut Tables, op: Op, garbage: &mut Vec<u128>, last_seq: &mut u64) -
                 if norm_etag(etag) != util::hex(&p.md5) {
                     return Err(err::InvalidPart());
                 }
+                if let Some(listed) = listed
+                    && p.checksum.as_ref().is_none_or(|(_, v)| v != listed.trim())
+                {
+                    return Err(err::BadDigest().with_message(format!("The checksum of part {num} does not match")));
+                }
+                part_sums.push((p.checksum.clone(), p.size));
                 if i + 1 < parts.len() && p.size < MIN_PART_SIZE {
                     return Err(err::EntityTooSmall());
                 }
@@ -2703,12 +2733,54 @@ fn apply(tx: &mut Tables, op: Op, garbage: &mut Vec<u128>, last_seq: &mut u64) -
 
             use md5::Digest;
             let etag = format!("\"{}-{}\"", util::hex(&md5::Md5::digest(&md5s)), parts.len());
+            // The object's checksum: as declared at CreateMultipartUpload (verified against the
+            // client's value if it sent one), or composite when all parts happen to have one.
+            let header = |name: &str| u.headers.iter().find(|(k, _)| k == name).map(|(_, v)| v.clone());
+            let declared = header(UPLOAD_CHECKSUM_ALGO).and_then(|a| ChecksumAlgo::from_name(&a));
+            let algo = declared.or_else(|| {
+                let first = part_sums.first()?.0.as_ref()?.0;
+                part_sums.iter().all(|(c, _)| c.as_ref().is_some_and(|(a, _)| *a == first)).then_some(first)
+            });
+            let mut object_checksum = None;
+            let mut part_list = None;
+            if let Some(algo) = algo {
+                let kind = header(UPLOAD_CHECKSUM_TYPE)
+                    .and_then(|t| crate::checksum::Kind::parse(&t))
+                    .or_else(|| crate::checksum::Kind::for_algo(algo, None))
+                    .unwrap_or(crate::checksum::Kind::Composite);
+                let sums: Option<Vec<(&str, u64)>> = part_sums
+                    .iter()
+                    .map(|(c, n)| c.as_ref().filter(|(a, _)| *a == algo).map(|(_, v)| (v.as_str(), *n)))
+                    .collect();
+                match sums.and_then(|s: Vec<(&str, u64)>| crate::checksum::combine(algo, kind, &s).map(|total| (s, total))) {
+                    Some((s, total)) => {
+                        if declared.is_some()
+                            && let Some((a, claimed)) = &checksum
+                            && (*a != algo || claimed.trim() != total)
+                        {
+                            return Err(err::BadDigest()
+                                .with_message("The checksum you specified did not match the calculated checksum."));
+                        }
+                        part_list = Some(s.iter().map(|(v, _)| *v).collect::<Vec<_>>().join(","));
+                        object_checksum = Some((algo, total));
+                    }
+                    None if declared.is_some() => {
+                        return Err(err::InvalidPart().with_message("A part has no checksum of the upload's algorithm"));
+                    }
+                    None => {}
+                }
+            }
+            let mut headers: Vec<(String, String)> =
+                u.headers.into_iter().filter(|(k, _)| !k.starts_with(INTERNAL_PREFIX)).collect();
+            if let Some(list) = part_list {
+                headers.push((PART_CHECKSUMS.to_string(), list));
+            }
             let meta = ObjectMeta {
                 size,
                 mtime_ms: now_ms(),
                 etag,
-                headers: u.headers,
-                checksum: None,
+                headers,
+                checksum: object_checksum,
                 storage: Storage::Segments(segs.clone()),
                 tags: u.tags,
                 version: None,
@@ -2847,8 +2919,9 @@ mod tests {
         let v1 = put(&store, "k", "one").await.version.unwrap();
         store.submit(set_lock(&v1, Some(gov), None, false)).await.unwrap();
         assert_eq!(delete_version(&store, &v1, false).await.unwrap_err().code, "AccessDenied");
-        // GOVERNANCE -> COMPLIANCE is an extension; COMPLIANCE can then never be shortened.
-        store.submit(set_lock(&v1, Some(comp), None, false)).await.unwrap();
+        // GOVERNANCE -> COMPLIANCE needs the bypass; COMPLIANCE can then never be shortened.
+        assert_eq!(store.submit(set_lock(&v1, Some(comp), None, false)).await.err().unwrap().code, "AccessDenied");
+        store.submit(set_lock(&v1, Some(comp), None, true)).await.unwrap();
         assert!(store.submit(set_lock(&v1, Some(None), None, true)).await.is_err());
         assert_eq!(delete_version(&store, &v1, true).await.unwrap_err().code, "AccessDenied");
 
@@ -2974,7 +3047,7 @@ mod tests {
             bucket: "b".into(),
             key: "k".into(),
             part: n,
-            meta: PartMeta { size, md5: [n as u8; 16], mtime_ms: 0, file: util::new_id() },
+            meta: PartMeta { size, md5: [n as u8; 16], mtime_ms: 0, file: util::new_id(), checksum: None },
         };
         store.submit(part(1, 60)).await.unwrap();
         assert_eq!(store.bucket_part_bytes("b").unwrap(), 60);
@@ -2987,7 +3060,14 @@ mod tests {
         // Completing moves the bytes from parts to the object (no double counting).
         let etag = util::hex(&[1u8; 16]);
         store
-            .submit(Op::Complete { bucket: "b".into(), key: "k".into(), upload, parts: vec![(1, etag)], cond: None })
+            .submit(Op::Complete {
+                bucket: "b".into(),
+                key: "k".into(),
+                upload,
+                parts: vec![(1, etag, None)],
+                checksum: None,
+                cond: None,
+            })
             .await
             .unwrap();
         assert_eq!((store.bucket_usage("b").unwrap(), store.bucket_part_bytes("b").unwrap()), ((1, 90), 0));
@@ -3001,7 +3081,7 @@ mod tests {
                 bucket: "b".into(),
                 key: "k2".into(),
                 part: 1,
-                meta: PartMeta { size: 10, md5: [0; 16], mtime_ms: 0, file: util::new_id() },
+                meta: PartMeta { size: 10, md5: [0; 16], mtime_ms: 0, file: util::new_id(), checksum: None },
             })
             .await
             .unwrap();

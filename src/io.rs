@@ -161,7 +161,7 @@ impl ChecksumHasher {
         }
     }
 
-    fn update(&mut self, d: &[u8]) {
+    pub fn update(&mut self, d: &[u8]) {
         match self {
             Self::Crc32(h) => h.update(d),
             Self::Crc32c(c) => *c = crc32c::crc32c_append(*c, d),
@@ -171,7 +171,7 @@ impl ChecksumHasher {
         }
     }
 
-    fn finish(self) -> String {
+    pub fn finish(self) -> String {
         match self {
             Self::Crc32(h) => base64(&h.finalize().to_be_bytes()),
             Self::Crc32c(c) => base64(&c.to_be_bytes()),
@@ -212,7 +212,7 @@ impl Hashers {
             checksum: e.checksum.as_ref().map(|(a, _)| ChecksumHasher::new(*a)),
         }
     }
-    fn update(&mut self, d: &[u8]) {
+    pub fn update(&mut self, d: &[u8]) {
         self.md5.update(d);
         if let Some(h) = &mut self.sha256 {
             h.update(d);
@@ -326,6 +326,9 @@ pub async fn ingest(store: &Arc<Store>, mut body: impl Source, e: Expect) -> S3R
                 }
                 Some(b) => {
                     buf.extend_from_slice(&b);
+                    if buf.len() as u64 > e.max_len {
+                        return Err(err::EntityTooLarge());
+                    }
                     if buf.len() > threshold {
                         break;
                     }
@@ -771,6 +774,11 @@ pub async fn read_body(
 
 /// Copy plaintext `[start, start+len)` of an object into a new data file, decrypting with
 /// `src_key` and (re-)encrypting with `dst_key` as needed. Returns (file id, md5 of plaintext).
+/// What `copy_range_blocking` wrote: the new data file, the MD5 of the copied bytes and, if
+/// asked for, their checksum.
+pub type Copied = (u128, [u8; 16], Option<(ChecksumAlgo, String)>);
+
+#[allow(clippy::too_many_arguments)]
 pub fn copy_range_blocking(
     store: &Store,
     meta: &ObjectMeta,
@@ -779,7 +787,8 @@ pub fn copy_range_blocking(
     len: u64,
     src_key: Option<&WrapKey>,
     dst_key: Option<&WrapKey>,
-) -> io::Result<(u128, [u8; 16])> {
+    checksum: Option<ChecksumAlgo>,
+) -> io::Result<Copied> {
     if store.space.check(len).is_err() {
         return Err(io::ErrorKind::StorageFull.into());
     }
@@ -788,10 +797,14 @@ pub fn copy_range_blocking(
     let res = (|| {
         let mut out = File::create(&tmp)?;
         let mut md5 = Md5::new();
+        let mut sum = checksum.map(ChecksumHasher::new);
         let mut enc = dst_key.map(crypt::Encryptor::new);
         let mut sealed = Vec::new();
         let mut emit = |plain: &[u8], out: &mut File| -> io::Result<()> {
             md5.update(plain);
+            if let Some(h) = &mut sum {
+                h.update(plain);
+            }
             match &mut enc {
                 Some(e) => {
                     sealed.clear();
@@ -831,7 +844,7 @@ pub fn copy_range_blocking(
             out.sync_data()?;
         }
         install(store, &tmp, id)?;
-        Ok((id, md5.finalize().into()))
+        Ok((id, md5.finalize().into(), checksum.zip(sum).map(|(a, h)| (a, h.finish()))))
     })();
     if res.is_err() {
         let _ = std::fs::remove_file(&tmp);

@@ -318,7 +318,7 @@ fn stored_records() {
     }
     .encode();
     let upload = UploadMeta { bucket: "b".into(), key: "k".into(), initiated_ms: 1, headers: vec![], tags: vec![] }.encode();
-    let part = PartMeta { size: 5, md5: [1; 16], mtime_ms: 1, file: 9 }.encode();
+    let part = PartMeta { size: 5, md5: [1; 16], mtime_ms: 1, file: 9, checksum: None }.encode();
     let seeds: Vec<&[u8]> = vec![&obj, &upload, &part];
     fuzz("records", &seeds, |b| {
         let _ = ObjectMeta::decode(b);

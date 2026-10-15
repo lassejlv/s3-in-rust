@@ -15,6 +15,7 @@ mod accesslog;
 mod auth;
 mod body;
 mod bucketlog;
+mod checksum;
 mod chunked;
 mod conn;
 mod console;
@@ -88,6 +89,8 @@ OPTIONS (each also settable through the environment variable shown):
                                                                  [S3RS_WEBHOOKS, comma-separated]
         --webhook-secret <S>     Sign webhook bodies (X-S3rs-Signature: sha256=<hmac>)
                                                                  [S3RS_WEBHOOK_SECRET]
+        --webhook-timeout <SECS> How long a webhook may take to answer (default 10)
+                                                                 [S3RS_WEBHOOK_TIMEOUT]
         --tls-cert <PATH>        Serve HTTPS: PEM certificate chain (reloaded on SIGHUP)
                                                                  [S3RS_TLS_CERT]
         --tls-key <PATH>         PEM private key for --tls-cert  [S3RS_TLS_KEY]
@@ -154,6 +157,7 @@ struct Config {
     behind_proxy: bool,
     webhooks: Vec<(String, events::Url)>,
     webhook_secret: Option<String>,
+    webhook_timeout: u64,
     webhook_ca: Option<PathBuf>,
     replication_targets: Option<PathBuf>,
     rate_limit: Option<u32>,
@@ -219,6 +223,10 @@ fn parse_args() -> Result<Config, String> {
         behind_proxy: env_flag("S3RS_BEHIND_PROXY")?,
         webhooks: env("S3RS_WEBHOOKS").map(|v| parse_webhooks(&v)).transpose()?.unwrap_or_default(),
         webhook_secret: env("S3RS_WEBHOOK_SECRET"),
+        webhook_timeout: env("S3RS_WEBHOOK_TIMEOUT")
+            .map(|v| v.parse().map_err(|_| "S3RS_WEBHOOK_TIMEOUT must be a number of seconds".to_string()))
+            .transpose()?
+            .unwrap_or(10),
         webhook_ca: env("S3RS_WEBHOOK_CA").map(PathBuf::from),
         replication_targets: env("S3RS_REPLICATION_TARGETS").map(PathBuf::from),
         rate_limit: env("S3RS_RATE_LIMIT").map(|v| parse_rate("S3RS_RATE_LIMIT", &v)).transpose()?.flatten(),
@@ -289,6 +297,9 @@ fn parse_args() -> Result<Config, String> {
                 c.webhooks.push(w);
             }
             "--webhook-secret" => c.webhook_secret = Some(val()?),
+            "--webhook-timeout" => {
+                c.webhook_timeout = val()?.parse().map_err(|_| "--webhook-timeout must be a number of seconds".to_string())?
+            }
             "--webhook-ca" => c.webhook_ca = Some(val()?.into()),
             "--replication-targets" => c.replication_targets = Some(val()?.into()),
             "--rate-limit" => c.rate_limit = parse_rate("--rate-limit", &val()?)?,
@@ -794,7 +805,7 @@ fn main() {
     };
 
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().expect("tokio runtime");
-    rt.block_on(serve(cfg, store, auth, tls, webhook_tls));
+    rt.block_on(serve(cfg, store, auth, creds, tls, webhook_tls));
 }
 
 async fn bind(addr: SocketAddr) -> TcpListener {
@@ -864,6 +875,7 @@ async fn serve(
     cfg: Config,
     store: Arc<store::Store>,
     auth: Option<auth::Auth>,
+    creds: Vec<auth::Credential>,
     tls: Option<Arc<tls::Server>>,
     webhook_tls: Option<Arc<tls::ClientConfig>>,
 ) {
@@ -916,6 +928,7 @@ async fn serve(
             cfg.webhooks.clone(),
             cfg.webhook_secret.clone(),
             webhook_tls,
+            Duration::from_secs(cfg.webhook_timeout.max(1)),
         ),
         replication: replication::Replicator::new(
             store.clone(),
@@ -926,7 +939,7 @@ async fn serve(
         rate_limit: cfg.rate_limit,
         rate_limit_anonymous: cfg.rate_limit_anonymous,
     };
-    let file_keys = auth.as_ref().map(|_| collect_credentials(&cfg).unwrap_or_default()).unwrap_or_default();
+    let file_keys = if auth.is_some() { creds } else { Vec::new() };
     let server = Arc::new(s3::Server::new(store.clone(), auth, opts));
     server.set_self();
     // Keys created through the admin API are stored in the database.

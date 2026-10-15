@@ -105,6 +105,7 @@ Each flag can also be set with the environment variable shown (switches take `1`
 | `--behind-proxy` | `S3RS_BEHIND_PROXY` | off | Trusts `X-Forwarded-For` / `X-Forwarded-Proto` for policy conditions |
 | `--webhook ID=URL` | `S3RS_WEBHOOKS` (comma-separated) | | Event notification target (repeatable); see [Event notifications](#event-notifications) |
 | `--webhook-secret` | `S3RS_WEBHOOK_SECRET` | | Signs webhook bodies with HMAC-SHA256 |
+| `--webhook-timeout` | `S3RS_WEBHOOK_TIMEOUT` | `10` | Seconds a webhook may take to answer |
 | `--webhook-ca` | `S3RS_WEBHOOK_CA` | | Extra PEM CA certificates trusted for `https://` webhooks |
 | `--lifecycle-interval` | `S3RS_LIFECYCLE_INTERVAL` | `3600` | Seconds between lifecycle sweeps. `0` turns lifecycle off. |
 | `--encryption-key` | `S3RS_ENCRYPTION_KEY` | | Master key for SSE-S3, as 64 hex characters or base64 (e.g. `openssl rand -hex 32`) |
@@ -298,7 +299,9 @@ curl -fsS -H "$H" -X DELETE https://s3.example.com/_admin/keys/S3RSK7Q2...  # re
 ```
 
 Keys from the command line and the credentials file are listed with `"source": "file"`. They can
-only be changed there. If both define the same access key, the file wins.
+only be changed there. If both define the same access key, the file wins; the stored key can still
+be revoked with `DELETE`, so it doesn't come back when the file key is removed. Creating and
+revoking keys is always written durably, also with `--no-fsync`.
 
 **Per-key policies** use IAM's JSON format. Paths are relative to the credentials file. For example,
 this policy gives every key using it a private home prefix:
@@ -734,18 +737,25 @@ How delivery works:
   header lets receivers verify it.
 - **Delivery is durable and at least once:**
   - Events are queued on disk, per target.
+  - A write is acknowledged only once its events are queued, so a crash can't lose the event of
+    an acknowledged write.
   - An event is removed from the queue only after the target answered `2xx`.
   - Until then it is retried with backoff (up to a minute), and the events behind it wait. Each
     target therefore gets its events in order, also across outages and restarts.
+  - An answer of `4xx` (other than 408 and 429) means the receiver will never take the event: it
+    is dropped and counted as `rejected`, so it can't block the queue.
+  - The receiver must answer within `--webhook-timeout` seconds (default 10).
   - A crash between a delivery and its removal from the queue can deliver an event twice; the
     sequencer identifies duplicates.
   - Writes never wait for deliveries.
-- **Full queue:** a target that is down long enough to collect 100,000 events gets no new ones
-  until it catches up. Dropped events are counted.
+- **Full queue:** a target that is down long enough to collect 100,000 events (or 128 MiB of
+  them) gets no new ones until it catches up. Events are also dropped rather than queued when the
+  disk is down to its free-space reserve, which stays available for deletes. Dropped events are
+  counted.
 - **Removed targets:** queued events for a target that is no longer configured are dropped at
   startup.
 - **Monitoring:**
-  - `s3rs_notifications_total{result="delivered|failed|dropped"}` counts outcomes;
+  - `s3rs_notifications_total{result="delivered|failed|dropped|rejected"}` counts outcomes;
   - `s3rs_notifications_pending` counts queued events.
 
 With a `--features tls` build, webhook URLs can be `https://`. Receivers' certificates are verified

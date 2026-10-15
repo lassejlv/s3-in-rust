@@ -29,7 +29,10 @@ First release.
 **S3 API**
 - Buckets, objects, multipart uploads, copies, listings (v1, v2, versions), tagging, ACLs (canned),
   bucket policies, CORS, website hosting, notifications, ranges, conditional requests, checksums
-  (CRC32/CRC32C/CRC64NVME/SHA1/SHA256), POST uploads, GetObjectAttributes.
+  (CRC32/CRC32C/CRC64NVME/SHA1/SHA256, also for multipart uploads as COMPOSITE or FULL_OBJECT
+  checksums, with per-part checksums), POST uploads, GetObjectAttributes.
+- CompleteMultipartUpload is idempotent: a client retrying after a lost response gets the same
+  result.
 - Authentication: SigV4 (headers, presigned URLs, streaming and trailers) and SigV2.
 
 **Access control**
@@ -43,7 +46,8 @@ First release.
 - Web console at `/_console/`.
 - Per-bucket server access logs in S3's format (PutBucketLogging), written to a target bucket.
 - Prometheus metrics, JSON access logs, event notifications (webhooks and live streams). Webhook
-  events are queued on disk and delivered in order, at least once, across outages and restarts.
+  events are queued on disk with the write they describe and delivered in order, at least once,
+  across outages and restarts. A receiver's `4xx` drops the event instead of blocking the queue.
 - `/_health` checks that the metadata database and its writer respond. `s3rs healthcheck` and a
   Docker `HEALTHCHECK` use it.
 - Native HTTPS with certificate reload, as the optional `tls` build feature.

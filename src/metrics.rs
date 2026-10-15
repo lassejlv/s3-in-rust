@@ -122,9 +122,12 @@ impl Metrics {
             "# TYPE s3rs_lifecycle_aborted_uploads_total counter\ns3rs_lifecycle_aborted_uploads_total {}",
             self.lifecycle.aborted_uploads.load(Relaxed)
         );
-        for (name, v) in
-            [("delivered", &self.events.delivered), ("failed", &self.events.failed), ("dropped", &self.events.dropped)]
-        {
+        for (name, v) in [
+            ("delivered", &self.events.delivered),
+            ("failed", &self.events.failed),
+            ("dropped", &self.events.dropped),
+            ("rejected", &self.events.rejected),
+        ] {
             let _ = writeln!(o, "s3rs_notifications_total{{result=\"{name}\"}} {}", v.load(Relaxed));
         }
         let _ = writeln!(

@@ -36,6 +36,8 @@ class Hook(BaseHTTPRequestHandler):
     def do_POST(self):
         body = self.rfile.read(int(self.headers["content-length"]))
         status = mode["status"]
+        if b'"key":"poison"' in body:
+            status = 400
         if status == 200:
             received.append(json.loads(body))
         self.send_response(status)
@@ -131,6 +133,15 @@ start_t = time.time()
 s3.put_object(Bucket="events", Key="c", Body=b"x")
 wait_for(lambda: keys()[-1:] == ["c"], "a new event", timeout=10)
 print(f"a new event arrives in {time.time() - start_t:.2f}s")
+
+# 5. An event the receiver rejects for good (HTTP 4xx) is dropped instead of blocking the queue.
+s3.put_object(Bucket="events", Key="poison", Body=b"x")
+s3.put_object(Bucket="events", Key="after-poison", Body=b"x")
+wait_for(lambda: keys()[-1:] == ["after-poison"], "the event behind a rejected one", timeout=10)
+assert "poison" not in keys()
+assert metric('s3rs_notifications_total{result="rejected"}') == 1
+assert metric("s3rs_notifications_pending") == 0
+print("a rejected event is dropped and the queue moves on")
 hook_down()
 p.terminate()
 p.wait()

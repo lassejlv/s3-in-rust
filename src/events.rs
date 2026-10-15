@@ -21,10 +21,13 @@ use tokio::sync::{broadcast, watch};
 
 /// Events kept per webhook target while it is unreachable; beyond that, new events are dropped.
 const MAX_QUEUED: u64 = 100_000;
+/// ... and at most this many bytes of them.
+const MAX_QUEUED_BYTES: u64 = 128 << 20;
 /// Events read from the queue at a time.
 const BATCH: usize = 100;
 const MAX_BACKOFF: Duration = Duration::from_secs(60);
-const TIMEOUT: Duration = Duration::from_secs(10);
+/// Connecting to a webhook may take this long.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// ARN of a webhook target in notification configurations.
 pub fn target_arn(id: &str) -> String {
@@ -268,6 +271,8 @@ pub struct Stats {
     pub delivered: AtomicU64,
     pub failed: AtomicU64,
     pub dropped: AtomicU64,
+    /// Events a receiver refused for good (HTTP 4xx).
+    pub rejected: AtomicU64,
     /// Events waiting to be delivered.
     pub pending: AtomicU64,
 }
@@ -275,6 +280,27 @@ pub struct Stats {
 /// A webhook target's queue (the events themselves are in the store).
 struct Queue {
     len: AtomicU64,
+    bytes: AtomicU64,
+}
+
+impl Queue {
+    fn add(&self, stats: &Stats, n: u64, bytes: u64) {
+        self.len.fetch_add(n, Ordering::Relaxed);
+        self.bytes.fetch_add(bytes, Ordering::Relaxed);
+        stats.pending.fetch_add(n, Ordering::Relaxed);
+    }
+
+    fn remove(&self, stats: &Stats, n: u64, bytes: u64) {
+        let sub = |a: &AtomicU64, v: u64| {
+            let mut cur = a.load(Ordering::Relaxed);
+            while let Err(now) = a.compare_exchange_weak(cur, cur.saturating_sub(v), Ordering::Relaxed, Ordering::Relaxed) {
+                cur = now;
+            }
+        };
+        sub(&self.len, n);
+        sub(&self.bytes, bytes);
+        sub(&stats.pending, n);
+    }
 }
 
 pub struct Bus {
@@ -285,6 +311,8 @@ pub struct Bus {
     /// Parsed notification rules per bucket; `None` cached for buckets without rules.
     rules: RwLock<HashMap<String, Option<Arc<Vec<Rule>>>>>,
     seq: AtomicU64,
+    /// The minute of the last "dropped events" log line.
+    drop_warned: AtomicU64,
     pub stats: Arc<Stats>,
     /// Set on shutdown so open listen streams end.
     closing: watch::Sender<bool>,
@@ -299,15 +327,18 @@ impl Bus {
         targets: Vec<(String, Url)>,
         secret: Option<String>,
         tls: Option<Arc<crate::tls::ClientConfig>>,
+        timeout: Duration,
     ) -> Arc<Bus> {
         let stats = Arc::new(Stats::default());
         // Events queued before a restart are delivered; those for targets that were removed
         // from the configuration are dropped.
-        let mut counts = store.event_counts().unwrap_or_else(|e| {
+        let mut counts = store.event_queues().unwrap_or_else(|e| {
             elog!("warning: cannot read the event queue: {}", e.message);
             HashMap::new()
         });
-        for (target, n) in counts.clone() {
+        // New events queue behind the old ones even if the clock went back across the restart.
+        let first_seq = counts.values().map(|q| q.2 + 1).max().unwrap_or(0).max(now_ms() << 20);
+        for (target, (n, _, _)) in counts.clone() {
             if !targets.iter().any(|(id, _)| *id == target) {
                 elog!("webhook {target} is no longer configured: dropping its {n} queued event(s)");
                 if let Ok(keys) = store.event_keys(&target) {
@@ -318,14 +349,15 @@ impl Bus {
         }
         let mut queues = HashMap::new();
         for (id, url) in targets {
-            let n = counts.get(&id).copied().unwrap_or(0);
+            let (n, bytes, _) = counts.get(&id).copied().unwrap_or_default();
             if n > 0 {
                 elog!("webhook {id}: {n} queued event(s) from before the restart");
             }
-            stats.pending.fetch_add(n, Ordering::Relaxed);
-            let queue = Arc::new(Queue { len: AtomicU64::new(n) });
+            let queue = Arc::new(Queue { len: AtomicU64::new(0), bytes: AtomicU64::new(0) });
+            queue.add(&stats, n, bytes);
             let tls = if url.tls { tls.clone() } else { None };
-            tokio::spawn(deliver(id.clone(), url, tls, store.clone(), queue.clone(), secret.clone(), stats.clone()));
+            let target = Target { id: id.clone(), url, tls, secret: secret.clone(), timeout };
+            tokio::spawn(deliver(target, store.clone(), queue.clone(), stats.clone()));
             queues.insert(id, queue);
         }
         Arc::new(Bus {
@@ -334,7 +366,8 @@ impl Bus {
             targets: queues,
             region,
             rules: RwLock::new(HashMap::new()),
-            seq: AtomicU64::new(now_ms() << 20),
+            seq: AtomicU64::new(first_seq),
+            drop_warned: AtomicU64::new(0),
             stats,
             closing: watch::channel(false).0,
         })
@@ -384,42 +417,68 @@ impl Bus {
     }
 
     /// Publish an event to live listeners and to the webhook targets of matching rules.
-    pub fn emit(&self, mut ev: Event) {
+    /// Returns once the webhook events are queued durably (or dropped, which is counted).
+    pub async fn emit(&self, ev: Event) {
+        self.emit_all(vec![ev]).await
+    }
+
+    pub async fn emit_all(&self, evs: Vec<Event>) {
         let listeners = self.live.receiver_count() > 0;
-        if !listeners && self.targets.is_empty() {
+        if (!listeners && self.targets.is_empty()) || evs.is_empty() {
             return;
         }
-        let rules = if self.targets.is_empty() { None } else { self.rules_for(&ev.bucket) };
-        if !listeners && rules.is_none() {
-            return;
-        }
-        // Events carry the writer's commit order; the counter only covers events without one.
-        if ev.sequencer == 0 {
-            ev.sequencer = self.seq.fetch_add(1, Ordering::Relaxed);
-        }
-        let ev = Arc::new(ev);
-        if listeners {
-            let _ = self.live.send(ev.clone());
-        }
-        let mut queued = Vec::new();
-        for rule in rules.iter().flat_map(|r| r.iter()).filter(|r| r.matches(&ev)) {
-            let Some(queue) = self.targets.get(&rule.target) else { continue };
-            if queue.len.load(Ordering::Relaxed) >= MAX_QUEUED {
-                // The target has been down for a long time. Count it rather than fill the disk.
-                self.stats.dropped.fetch_add(1, Ordering::Relaxed);
+        let mut queued: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        let mut counted: Vec<(Arc<Queue>, u64)> = Vec::new();
+        for mut ev in evs {
+            let rules = if self.targets.is_empty() { None } else { self.rules_for(&ev.bucket) };
+            if !listeners && rules.is_none() {
                 continue;
             }
-            queue.len.fetch_add(1, Ordering::Relaxed);
-            self.stats.pending.fetch_add(1, Ordering::Relaxed);
-            let mut key = rule.target.as_bytes().to_vec();
-            key.push(0);
-            key.extend_from_slice(&self.seq.fetch_add(1, Ordering::Relaxed).to_be_bytes());
-            queued.push((key, ev.to_json(&self.region, &rule.id).into_bytes(), queue.clone()));
+            // Events carry the writer's commit order; the counter only covers events without one.
+            if ev.sequencer == 0 {
+                ev.sequencer = self.seq.fetch_add(1, Ordering::Relaxed);
+            }
+            let ev = Arc::new(ev);
+            if listeners {
+                let _ = self.live.send(ev.clone());
+            }
+            for rule in rules.iter().flat_map(|r| r.iter()).filter(|r| r.matches(&ev)) {
+                let Some(queue) = self.targets.get(&rule.target) else { continue };
+                let body = ev.to_json(&self.region, &rule.id).into_bytes();
+                if queue.len.load(Ordering::Relaxed) >= MAX_QUEUED
+                    || queue.bytes.load(Ordering::Relaxed) + body.len() as u64 > MAX_QUEUED_BYTES
+                {
+                    // The target has been down for a long time. Count it rather than fill the disk.
+                    self.stats.dropped.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+                queue.add(&self.stats, 1, body.len() as u64);
+                counted.push((queue.clone(), body.len() as u64));
+                let mut key = rule.target.as_bytes().to_vec();
+                key.push(0);
+                key.extend_from_slice(&self.seq.fetch_add(1, Ordering::Relaxed).to_be_bytes());
+                queued.push((key, body));
+            }
         }
-        if !queued.is_empty() {
-            // Recorded by the writer without making the request wait; delivery starts once it
-            // is committed.
-            self.store.submit_detached(crate::store::Op::QueueEvents(queued.into_iter().map(|(k, b, _)| (k, b)).collect()));
+        if queued.is_empty() {
+            return;
+        }
+        // Queued events never take the space kept free for deletes: on a nearly full disk
+        // they are dropped (and counted) instead.
+        let bytes: u64 = counted.iter().map(|(_, b)| b).sum();
+        let res = match self.store.space.check(bytes) {
+            Ok(()) => self.store.submit(crate::store::Op::QueueEvents(queued)).await.map(|_| ()),
+            Err(e) => Err(e),
+        };
+        if let Err(e) = res {
+            for (q, b) in &counted {
+                q.remove(&self.stats, 1, *b);
+            }
+            self.stats.dropped.fetch_add(counted.len() as u64, Ordering::Relaxed);
+            let now = now_ms() / 60_000;
+            if self.drop_warned.swap(now, Ordering::Relaxed) != now {
+                elog!("webhooks: dropped {} event(s): {}", counted.len(), e.message);
+            }
         }
     }
 }
@@ -499,7 +558,7 @@ where
     B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
 {
     let host = url.host.trim_start_matches('[').trim_end_matches(']');
-    let stream = tokio::time::timeout(TIMEOUT, tokio::net::TcpStream::connect((host, url.port)))
+    let stream = tokio::time::timeout(CONNECT_TIMEOUT, tokio::net::TcpStream::connect((host, url.port)))
         .await
         .map_err(|_| "connect timed out".to_string())?
         .map_err(|e| e.to_string())?;
@@ -521,30 +580,30 @@ where
     Ok(sender)
 }
 
-async fn post(
-    sender: &mut Option<Sender>,
-    url: &Url,
-    tls: Option<&Arc<crate::tls::ClientConfig>>,
-    body: &Bytes,
-    signature: Option<&str>,
-) -> Result<u16, String> {
+/// A webhook target and how to reach it.
+struct Target {
+    id: String,
+    url: Url,
+    tls: Option<Arc<crate::tls::ClientConfig>>,
+    secret: Option<String>,
+    /// How long the receiver may take to answer.
+    timeout: Duration,
+}
+
+async fn post(sender: &mut Option<Sender>, t: &Target, body: &Bytes) -> Result<u16, String> {
     let reused = sender.as_ref().is_some_and(|s| !s.is_closed());
-    match post_once(sender, url, tls, body, signature).await {
+    match post_once(sender, t, body).await {
         // A kept-alive connection the receiver had already closed: try a fresh one at once.
-        Err(_) if reused => post_once(sender, url, tls, body, signature).await,
+        Err(_) if reused => post_once(sender, t, body).await,
         r => r,
     }
 }
 
-async fn post_once(
-    sender: &mut Option<Sender>,
-    url: &Url,
-    tls: Option<&Arc<crate::tls::ClientConfig>>,
-    body: &Bytes,
-    signature: Option<&str>,
-) -> Result<u16, String> {
+async fn post_once(sender: &mut Option<Sender>, t: &Target, body: &Bytes) -> Result<u16, String> {
+    let url = &t.url;
+    let signature = t.secret.as_ref().map(|k| format!("sha256={}", util::hex(&crate::auth::hmac(k.as_bytes(), body))));
     if sender.as_ref().is_none_or(|s| s.is_closed()) {
-        *sender = Some(connect(url, tls).await?);
+        *sender = Some(connect(url, t.tls.as_ref()).await?);
     }
     let s = sender.as_mut().unwrap();
     if let Err(e) = s.ready().await {
@@ -555,11 +614,11 @@ async fn post_once(
         .header("host", url.host_header())
         .header("content-type", "application/json")
         .header("user-agent", concat!("s3rs/", env!("CARGO_PKG_VERSION")));
-    if let Some(sig) = signature {
+    if let Some(sig) = &signature {
         req = req.header("x-s3rs-signature", sig);
     }
     let req = req.body(Full::new(body.clone())).map_err(|e| e.to_string())?;
-    match tokio::time::timeout(TIMEOUT, s.send_request(req)).await {
+    match tokio::time::timeout(t.timeout, s.send_request(req)).await {
         Ok(Ok(resp)) => Ok(resp.status().as_u16()),
         Ok(Err(e)) => {
             *sender = None;
@@ -572,20 +631,20 @@ async fn post_once(
     }
 }
 
+/// Whether a webhook answer means the receiver will never take the event: a client error
+/// other than a timeout or throttling. Such an event is dropped (and counted) so it can't hold
+/// up the events behind it forever.
+fn rejected(status: u16) -> bool {
+    (400..500).contains(&status) && status != 408 && status != 429
+}
+
 /// Deliver one webhook target's queued events, in order, at least once: an event is removed
-/// from the queue only after the target accepted it (2xx); until then it is retried with
-/// backoff, and the events behind it wait.
-async fn deliver(
-    id: String,
-    url: Url,
-    tls: Option<Arc<crate::tls::ClientConfig>>,
-    store: Arc<Store>,
-    queue: Arc<Queue>,
-    secret: Option<String>,
-    stats: Arc<Stats>,
-) {
+/// from the queue only after the target accepted it (2xx) or rejected it for good (4xx);
+/// until then it is retried with backoff, and the events behind it wait.
+async fn deliver(t: Target, store: Arc<Store>, queue: Arc<Queue>, stats: Arc<Stats>) {
+    let id = &t.id;
     let mut sender: Option<Sender> = None;
-    let mut warned_at = 0u64;
+    let (mut warned_at, mut rejected_at) = (0u64, 0u64);
     let mut backoff = Duration::from_millis(500);
     let mut failing = false;
     let mut committed = store.events_committed.subscribe();
@@ -605,12 +664,21 @@ async fn deliver(
             continue;
         }
         let mut done = Vec::new();
+        let (mut delivered, mut done_bytes) = (0u64, 0u64);
         let mut error = None;
         for (key, body) in batch {
+            let len = body.len() as u64;
             let body = Bytes::from(body);
-            let signature = secret.as_ref().map(|k| format!("sha256={}", util::hex(&crate::auth::hmac(k.as_bytes(), &body))));
-            match post(&mut sender, &url, tls.as_ref(), &body, signature.as_deref()).await {
-                Ok(status) if (200..300).contains(&status) => done.push(key),
+            match post(&mut sender, &t, &body).await {
+                Ok(status) if (200..300).contains(&status) => delivered += 1,
+                Ok(status) if rejected(status) => {
+                    stats.rejected.fetch_add(1, Ordering::Relaxed);
+                    let now = now_ms() / 60_000;
+                    if now != rejected_at {
+                        rejected_at = now;
+                        elog!("webhook {id}: the receiver rejected an event with HTTP {status}; dropping it");
+                    }
+                }
                 Ok(status) => {
                     error = Some(format!("HTTP {status}"));
                     break;
@@ -620,12 +688,12 @@ async fn deliver(
                     break;
                 }
             }
+            done.push(key);
+            done_bytes += len;
         }
         if !done.is_empty() {
-            let n = done.len() as u64;
-            stats.delivered.fetch_add(n, Ordering::Relaxed);
-            queue.len.fetch_sub(n.min(queue.len.load(Ordering::Relaxed)), Ordering::Relaxed);
-            stats.pending.fetch_sub(n.min(stats.pending.load(Ordering::Relaxed)), Ordering::Relaxed);
+            stats.delivered.fetch_add(delivered, Ordering::Relaxed);
+            queue.remove(&stats, done.len() as u64, done_bytes);
             if let Err(e) = store.submit(crate::store::Op::DeleteEvents(done)).await {
                 elog!("webhook {id}: updating the event queue failed: {}", e.message);
             }

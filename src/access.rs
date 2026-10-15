@@ -504,6 +504,7 @@ pub struct BucketAccess {
     /// Object Lock configuration (present = Object Lock enabled).
     pub lock: Option<crate::lock::BucketLock>,
     pub website: Option<std::sync::Arc<crate::website::Config>>,
+    pub lifecycle: Option<std::sync::Arc<Vec<crate::lifecycle::Rule>>>,
 }
 
 impl BucketAccess {

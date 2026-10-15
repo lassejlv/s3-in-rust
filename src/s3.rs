@@ -22,7 +22,7 @@ use hyper::{Method, Request, Response, StatusCode};
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
 
 const MAX_OBJECT_SIZE: u64 = 5 * 1024 * 1024 * 1024;
@@ -94,6 +94,8 @@ pub struct Server {
     key_limit: Option<crate::ratelimit::Limiter>,
     /// Keys from the command line and credentials file; merged with the stored ones.
     file_creds: RwLock<Vec<auth::Credential>>,
+    keys_reload: Mutex<()>,
+    completed: std::sync::Mutex<Completed>,
     anon_limit: Option<crate::ratelimit::Limiter>,
     /// Weak self-reference, for background tasks that must re-check permissions.
     me: std::sync::OnceLock<std::sync::Weak<Server>>,
@@ -280,8 +282,10 @@ pub(crate) fn parse_range(spec: &str, size: u64) -> Option<S3Result<(u64, u64)>>
 }
 
 fn write_cond(h: &HeaderMap) -> Option<WriteCond> {
-    if header(h, "if-none-match").is_some_and(|v| v.trim() == "*") {
-        return Some(WriteCond::NotExists);
+    match header(h, "if-none-match").map(str::trim) {
+        Some("*") => return Some(WriteCond::NotExists),
+        Some(e) if header(h, "if-match").is_none() => return Some(WriteCond::NotMatches(e.to_string())),
+        _ => {}
     }
     header(h, "if-match").map(|v| WriteCond::Matches(v.to_string()))
 }
@@ -409,6 +413,8 @@ impl Server {
             bucket_log,
             key_limit: opts.rate_limit.map(crate::ratelimit::Limiter::new),
             file_creds: RwLock::new(Vec::new()),
+            keys_reload: Mutex::new(()),
+            completed: std::sync::Mutex::new(Completed::default()),
             anon_limit: opts.rate_limit_anonymous.map(crate::ratelimit::Limiter::new),
             me: std::sync::OnceLock::new(),
             req_counter: AtomicU64::new(1),
@@ -458,7 +464,14 @@ impl Server {
             .and_then(|v| xml::parse(&String::from_utf8_lossy(&v)))
             .and_then(|d| crate::website::Config::parse(&d).ok())
             .map(Arc::new);
-        let a = Arc::new(BucketAccess { acl, policy, cors, versioning, default_sse, lock, website });
+        let lifecycle = self
+            .store
+            .bucket_config(bucket, "lifecycle")?
+            .and_then(|v| xml::parse(&String::from_utf8_lossy(&v)))
+            .and_then(|d| crate::lifecycle::parse(&d).ok())
+            .filter(|r| r.iter().any(|r| r.enabled && (r.expire_days.is_some() || r.expire_date.is_some())))
+            .map(Arc::new);
+        let a = Arc::new(BucketAccess { acl, policy, cors, versioning, default_sse, lock, website, lifecycle });
         let mut cache = self.access_cache.write().unwrap();
         if self.access_gen.load(Ordering::SeqCst) == generation {
             if cache.len() > 10_000 {
@@ -964,6 +977,8 @@ impl Server {
 
     fn reload_keys(&self) -> S3Result<usize> {
         let Some(a) = &self.auth else { return Ok(0) };
+        // One reload at a time, so one that read the keys earlier can't overwrite a later one.
+        let _one = self.keys_reload.lock().unwrap();
         let stored = self.store.access_keys()?;
         let all = crate::keys::merge(&self.file_creds.read().unwrap(), &stored);
         let n = all.len();
@@ -1011,6 +1026,8 @@ impl Server {
                 let secret = record.secret.clone();
                 let info = crate::keys::describe(&access_key, "api", Some(&record), None);
                 self.store.submit(Op::CreateKey { access_key: access_key.clone(), record: record.encode() }).await?;
+                // Key changes are durable even with --no-fsync.
+                self.store.submit(Op::Flush).await?;
                 self.reload_keys()?;
                 elog!("admin: created access key {access_key}");
                 let crate::access::Json::Obj(mut fields) = info else { unreachable!() };
@@ -1021,7 +1038,10 @@ impl Server {
             }
             (&Method::DELETE, t) if t.len() > 1 => {
                 let access_key = uri_decode(&t[1..], false).ok_or_else(err::InvalidArgument)?;
-                if self.file_creds.read().unwrap().iter().any(|c| c.access_key == access_key) {
+                // A stored key hidden by a file key can still be deleted (else it would come back
+                // when the file key is removed).
+                let stored = self.store.access_keys()?.iter().any(|(k, _)| *k == access_key);
+                if !stored && self.file_creds.read().unwrap().iter().any(|c| c.access_key == access_key) {
                     return Err(S3Error::new(
                         "KeyInCredentialsFile",
                         StatusCode::CONFLICT,
@@ -1029,6 +1049,7 @@ impl Server {
                     ));
                 }
                 self.store.submit(Op::DeleteKey(access_key.clone())).await?;
+                self.store.submit(Op::Flush).await?;
                 self.reload_keys()?;
                 elog!("admin: revoked access key {access_key}");
                 Ok(Resp::new(StatusCode::NO_CONTENT))
@@ -1258,7 +1279,7 @@ impl Server {
         let Some(bucket) = bucket else {
             return match m {
                 Method::GET if r.q("events").is_some() => self.listen(&r, None),
-                Method::GET => self.list_buckets(&r.principal),
+                Method::GET => self.list_buckets(&r),
                 _ => Err(err::MethodNotAllowed()),
             };
         };
@@ -1449,9 +1470,10 @@ impl Server {
             }
             BucketOp::PutConfig("lifecycle") => {
                 let body = self.read_body(r, MAX_XML_BODY).await?;
-                let doc = xml::parse(&String::from_utf8_lossy(&body)).ok_or_else(err::MalformedXML)?;
+                let mut doc = xml::parse(&String::from_utf8_lossy(&body)).ok_or_else(err::MalformedXML)?;
                 crate::lifecycle::parse(&doc)?;
-                self.set_bucket_config(bucket, "lifecycle", Some(body.to_vec())).await?;
+                let stored = crate::lifecycle::with_ids(&mut doc).map(String::into_bytes).unwrap_or_else(|| body.to_vec());
+                self.set_bucket_config(bucket, "lifecycle", Some(stored)).await?;
                 Ok(Resp::ok())
             }
             BucketOp::PutConfig("object-lock") => {
@@ -1704,7 +1726,12 @@ impl Server {
                     }
                     // An empty Retention element removes the retention (GOVERNANCE + bypass only).
                     let ret = match (doc.child_text("Mode"), doc.child_text("RetainUntilDate")) {
-                        (Some(m), Some(u)) => Some(lock::parse_retention(m, u, now_ms() / 1000)?),
+                        // In a document, an unknown mode is malformed XML (in headers it is an
+                        // invalid argument).
+                        (Some(m), Some(u)) => {
+                            lock::Mode::parse(m).map_err(|_| err::MalformedXML())?;
+                            Some(lock::parse_retention(m, u, now_ms() / 1000)?)
+                        }
                         (None, None) => None,
                         _ => return Err(err::MalformedXML()),
                     };
@@ -1713,7 +1740,8 @@ impl Server {
                     if doc.name != "LegalHold" {
                         return Err(err::MalformedXML());
                     }
-                    (None, Some(lock::parse_legal_hold(doc.child_text("Status").ok_or_else(err::MalformedXML)?)?))
+                    let status = doc.child_text("Status").ok_or_else(err::MalformedXML)?;
+                    (None, Some(lock::parse_legal_hold(status).map_err(|_| err::MalformedXML())?))
                 };
                 let op = Op::SetObjectLock {
                     bucket: bucket.into(),
@@ -1765,7 +1793,7 @@ impl Server {
                     return Err(S3Error::internal("unexpected writer reply"));
                 };
                 let outcome = res.pop().ok_or_else(|| S3Error::internal("missing delete result"))??;
-                self.notify_removed(r, bucket, key, version.as_deref(), &outcome);
+                self.notify_removed(r, bucket, key, version.as_deref(), &outcome).await;
                 let mut resp = Resp::new(StatusCode::NO_CONTENT);
                 if let Some(v) = &outcome.version_id {
                     resp.set("x-amz-version-id", v);
@@ -1781,17 +1809,53 @@ impl Server {
 
     // -------------------------------------------------------------- listing
 
-    fn list_buckets(&self, principal: &Principal) -> S3Result<Resp> {
+    /// ListBuckets, optionally paginated (`max-buckets`, `continuation-token`) and filtered by
+    /// `prefix`.
+    fn list_buckets(&self, r: &Req) -> S3Result<Resp> {
+        let max = match r.q("max-buckets") {
+            None => usize::MAX,
+            Some(v) => v
+                .parse::<usize>()
+                .ok()
+                .filter(|n| (1..=10_000).contains(n))
+                .ok_or_else(|| err::InvalidArgument().with_message("max-buckets must be an integer between 1 and 10000"))?,
+        };
+        let prefix = r.q("prefix").unwrap_or("");
+        let after = match r.q("continuation-token").filter(|t| !t.is_empty()) {
+            Some(t) => Some(
+                unbase64(t)
+                    .and_then(|b| String::from_utf8(b).ok())
+                    .ok_or_else(|| err::InvalidArgument().with_message("The continuation token provided is incorrect"))?,
+            ),
+            None => None,
+        };
+        let mut buckets = self
+            .store
+            .list_buckets()?
+            .into_iter()
+            .filter(|(n, _)| r.principal.can_access(n) && n.starts_with(prefix))
+            .filter(|(n, _)| after.as_ref().is_none_or(|a| n > a))
+            .peekable();
         let mut x = Xml::new("ListAllMyBucketsResult");
         x.owner("Owner").open("Buckets");
-        for (name, created) in self.store.list_buckets()?.into_iter().filter(|(n, _)| principal.can_access(n)) {
+        let mut last = None;
+        for (name, created) in buckets.by_ref().take(max) {
             x.open("Bucket")
                 .elem("Name", &name)
                 .elem("CreationDate", iso8601(created))
                 .elem("BucketRegion", &self.region)
                 .close("Bucket");
+            last = Some(name);
         }
         x.close("Buckets");
+        if buckets.peek().is_some()
+            && let Some(last) = last
+        {
+            x.elem("ContinuationToken", base64(last.as_bytes()));
+        }
+        if r.q("prefix").is_some() {
+            x.elem("Prefix", prefix);
+        }
         Ok(Resp::xml(x.finish("ListAllMyBucketsResult")))
     }
 
@@ -1814,7 +1878,11 @@ impl Server {
             None => None,
         };
         let marker: Option<&str> = if v2 { token.as_deref().or(r.q("start-after")) } else { r.q("marker") };
-        let res = self.store.list_objects(bucket, prefix, delimiter, marker.filter(|m| !m.is_empty()), max)?;
+        let mut res = self.store.list_objects(bucket, prefix, delimiter, marker.filter(|m| !m.is_empty()), max)?;
+        // Asking for no keys is answered as a complete (empty) listing, as on S3.
+        if max == 0 {
+            (res.truncated, res.next_marker) = (false, None);
+        }
         let fetch_owner = !v2 || r.q("fetch-owner") == Some("true");
 
         let mut x = Xml::new("ListBucketResult");
@@ -1869,7 +1937,10 @@ impl Server {
         if vid_marker.is_some() && key_marker.is_none() {
             return Err(err::InvalidArgument().with_message("A version-id marker cannot be specified without a key marker."));
         }
-        let res = self.store.list_object_versions(bucket, prefix, delimiter, key_marker, vid_marker, max)?;
+        let mut res = self.store.list_object_versions(bucket, prefix, delimiter, key_marker, vid_marker, max)?;
+        if max == 0 {
+            res.truncated = false;
+        }
         let mut x = Xml::new("ListVersionsResult");
         x.elem("Name", bucket)
             .elem("Prefix", enc.e(prefix))
@@ -2025,8 +2096,11 @@ impl Server {
                 .elem("PartNumber", n.to_string())
                 .elem("LastModified", iso8601(p.mtime_ms))
                 .elem("ETag", format!("\"{}\"", util::hex(&p.md5)))
-                .elem("Size", p.size.to_string())
-                .close("Part");
+                .elem("Size", p.size.to_string());
+            if let Some((a, v)) = &p.checksum {
+                x.elem(a.xml_name(), v);
+            }
+            x.close("Part");
         }
         Ok(Resp::xml(x.finish("ListPartsResult")))
     }
@@ -2079,14 +2153,10 @@ impl Server {
         if has("Checksum")
             && let Some((algo, value)) = &meta.checksum
         {
-            let tag = match algo {
-                ChecksumAlgo::Crc32 => "ChecksumCRC32",
-                ChecksumAlgo::Crc32c => "ChecksumCRC32C",
-                ChecksumAlgo::Crc64Nvme => "ChecksumCRC64NVME",
-                ChecksumAlgo::Sha1 => "ChecksumSHA1",
-                ChecksumAlgo::Sha256 => "ChecksumSHA256",
-            };
-            x.open("Checksum").elem(tag, value).close("Checksum");
+            x.open("Checksum")
+                .elem(algo.xml_name(), value)
+                .elem("ChecksumType", crate::checksum::Kind::of(value).name())
+                .close("Checksum");
         }
         if has("ObjectParts")
             && let Storage::Segments(segs) = &meta.storage
@@ -2112,8 +2182,13 @@ impl Server {
                 x.elem("NextPartNumberMarker", last.to_string());
             }
             x.elem("MaxParts", max.to_string()).elem("IsTruncated", truncated.to_string());
+            let sums = part_checksums(&meta);
             for (n, size) in &parts {
-                x.open("Part").elem("PartNumber", n.to_string()).elem("Size", size.to_string()).close("Part");
+                x.open("Part").elem("PartNumber", n.to_string()).elem("Size", size.to_string());
+                if let (Some((a, _)), Some(v)) = (&meta.checksum, sums.get(n - 1)) {
+                    x.elem(a.xml_name(), v);
+                }
+                x.close("Part");
             }
             x.close("ObjectParts");
         }
@@ -2150,27 +2225,42 @@ impl Server {
         }
     }
 
-    fn notify_created(&self, r: &Req, name: &'static str, bucket: &str, key: &str, m: &ObjectMeta) {
+    /// Publish an event for a new object. Returns once it is queued durably for webhooks, so
+    /// an acknowledged write always has its event.
+    async fn notify_created(&self, r: &Req, name: &'static str, bucket: &str, key: &str, m: &ObjectMeta) {
         let mut ev = self.event(&r.principal, r.client.ip, &r.rid, name, bucket, key);
         ev.size = m.size;
         ev.etag = m.etag.clone();
         ev.version = m.version.clone();
         ev.sequencer = m.seq;
-        self.events.emit(ev);
+        self.events.emit(ev).await;
+    }
+
+    async fn notify_removed(&self, r: &Req, bucket: &str, key: &str, requested: Option<&str>, o: &store::DeleteOutcome) {
+        if let Some(ev) = self.removed_event(r, bucket, key, requested, o) {
+            self.events.emit(ev).await;
+        }
     }
 
     /// `requested` is the version id the client asked to delete, if any.
-    fn notify_removed(&self, r: &Req, bucket: &str, key: &str, requested: Option<&str>, o: &store::DeleteOutcome) {
+    fn removed_event(
+        &self,
+        r: &Req,
+        bucket: &str,
+        key: &str,
+        requested: Option<&str>,
+        o: &store::DeleteOutcome,
+    ) -> Option<events::Event> {
         // Deleting a missing key or version succeeds but changes nothing: no event.
         if !o.removed {
-            return;
+            return None;
         }
         let marker_created = requested.is_none() && o.delete_marker;
         let name = if marker_created { "ObjectRemoved:DeleteMarkerCreated" } else { "ObjectRemoved:Delete" };
         let mut ev = self.event(&r.principal, r.client.ip, &r.rid, name, bucket, key);
         ev.version = if marker_created { o.version_id.clone().filter(|v| v != "null") } else { requested.map(str::to_string) };
         ev.sequencer = o.seq;
-        self.events.emit(ev);
+        Some(ev)
     }
 
     /// MinIO-compatible ListenBucketNotification: a never-ending JSON-lines stream of events
@@ -2500,7 +2590,8 @@ impl Server {
         set_sse_headers(&mut resp, &headers);
         if let OpOut::Object(m) = &out {
             set_version_header(&mut resp, m);
-            self.notify_created(r, "ObjectCreated:Put", bucket, key, m);
+            self.set_expiration(&mut resp, bucket, key, m);
+            self.notify_created(r, "ObjectCreated:Put", bucket, key, m).await;
         }
         if let Some((a, v)) = &ing.checksum {
             resp.set(a.header(), v);
@@ -2508,8 +2599,19 @@ impl Server {
         Ok(resp)
     }
 
+    /// `x-amz-expiration` for an object a lifecycle rule will expire.
+    fn set_expiration(&self, resp: &mut Resp, bucket: &str, key: &str, meta: &ObjectMeta) {
+        if let Ok(a) = self.bucket_access(bucket)
+            && let Some(rules) = &a.lifecycle
+            && let Some((at, id)) = crate::lifecycle::expiration(rules, key, meta)
+        {
+            resp.set("x-amz-expiration", &format!("expiry-date=\"{}\", rule-id=\"{id}\"", http_date(at * 1000)));
+        }
+    }
+
     async fn get_object(&self, r: &Req, bucket: &str, key: &str, head: bool) -> S3Result<Resp> {
         let h = &r.parts.headers;
+        let key_name = key;
         for attempt in 0..3 {
             let (meta, inline) = self.lookup(bucket, key, r.q("versionId").filter(|v| !v.is_empty()))?;
             // SSE-C: the key is required before anything about the object (even its ETag via
@@ -2523,7 +2625,7 @@ impl Server {
                 return Ok(resp);
             }
             let mut ctype = false;
-            for (k, v) in &meta.headers {
+            for (k, v) in meta.headers.iter().filter(|(k, _)| !k.starts_with(store::INTERNAL_PREFIX)) {
                 ctype |= k == "content-type";
                 resp.set(k, v);
             }
@@ -2533,6 +2635,7 @@ impl Server {
             if !meta.tags.is_empty() {
                 resp.set("x-amz-tagging-count", &meta.tags.len().to_string());
             }
+            self.set_expiration(&mut resp, bucket, key_name, &meta);
             for (q, hname) in [
                 ("response-content-type", "content-type"),
                 ("response-content-language", "content-language"),
@@ -2556,13 +2659,21 @@ impl Server {
                     _ => vec![meta.size],
                 };
                 if pn > segs.len() {
-                    return Err(err::InvalidRange().with_message("The requested partnumber is not satisfiable"));
+                    return Err(err::InvalidPart().with_message("The requested partnumber is not satisfiable"));
                 }
                 let start: u64 = segs[..pn - 1].iter().sum();
                 if segs[pn - 1] > 0 {
                     range = Some((start, start + segs[pn - 1] - 1));
                 }
                 resp.set("x-amz-mp-parts-count", &segs.len().to_string());
+                // The part's own checksum (a single-part object's is the object's).
+                if let Some((a, v)) = &meta.checksum {
+                    let part = if segs.len() == 1 { Some(v.as_str()) } else { part_checksums(&meta).get(pn - 1).copied() };
+                    if let Some(p) = part {
+                        resp.set("x-amz-checksum-type", crate::checksum::Kind::of(v).name());
+                        resp.set(a.header(), p);
+                    }
+                }
             } else if let Some(spec) = header(h, "range")
                 && let Some(rr) = parse_range(spec, meta.size)
             {
@@ -2579,6 +2690,7 @@ impl Server {
                         && let Some((a, v)) = &meta.checksum
                     {
                         resp.set(a.header(), v);
+                        resp.set("x-amz-checksum-type", crate::checksum::Kind::of(v).name());
                     }
                     (0, meta.size)
                 }
@@ -2670,12 +2782,12 @@ impl Server {
                     let (st, src2, data, size) = (self.store.clone(), src.clone(), inline.clone(), src.size);
                     let (sk2, dk2) = (src_key.clone(), dst_key.clone());
                     let res = tokio::task::spawn_blocking(move || {
-                        io::copy_range_blocking(&st, &src2, data.as_ref(), 0, size, sk2.as_ref(), dk2.as_ref())
+                        io::copy_range_blocking(&st, &src2, data.as_ref(), 0, size, sk2.as_ref(), dk2.as_ref(), None)
                     })
                     .await
                     .map_err(S3Error::internal)?;
                     match res {
-                        Ok((id, md5)) => (Storage::Segments(vec![(id, size)]), vec![id], Some(md5)),
+                        Ok((id, md5, _)) => (Storage::Segments(vec![(id, size)]), vec![id], Some(md5)),
                         Err(e) if e.kind() == std::io::ErrorKind::NotFound && attempt < 2 => continue,
                         Err(e) => return Err(e.into()),
                     }
@@ -2700,6 +2812,10 @@ impl Server {
             let mut headers = if replace { stored_headers(&r.parts.headers)? } else { inheritable(&src.headers) };
             headers.extend(dst_enc.as_ref().map(|(_, h)| h.clone()).unwrap_or_default());
             headers.extend(lock_headers.iter().cloned());
+            // Shared segments keep the source's parts, and with them the parts' checksums.
+            if new_md5.is_none() {
+                headers.extend(src.headers.iter().filter(|(k, _)| k == store::PART_CHECKSUMS).cloned());
+            }
             let tags = if replace_tags { request_tags(r)? } else { src.tags.clone() };
             let meta = ObjectMeta {
                 size: src.size,
@@ -2730,14 +2846,8 @@ impl Server {
             };
             x.elem("LastModified", iso8601(mtime)).elem("ETag", &new_etag);
             if let Some((a, v)) = &src.checksum {
-                let tag = match a {
-                    ChecksumAlgo::Crc32 => "ChecksumCRC32",
-                    ChecksumAlgo::Crc32c => "ChecksumCRC32C",
-                    ChecksumAlgo::Crc64Nvme => "ChecksumCRC64NVME",
-                    ChecksumAlgo::Sha1 => "ChecksumSHA1",
-                    ChecksumAlgo::Sha256 => "ChecksumSHA256",
-                };
-                x.elem(tag, v);
+                x.elem(a.xml_name(), v);
+                x.elem("ChecksumType", crate::checksum::Kind::of(v).name());
             }
             let mut resp = Resp::xml(x.finish("CopyObjectResult"));
             set_sse_headers(&mut resp, dst_enc.as_ref().map(|(_, h)| h.as_slice()).unwrap_or(&[]));
@@ -2746,7 +2856,7 @@ impl Server {
             }
             if let OpOut::Object(m) = &out {
                 set_version_header(&mut resp, m);
-                self.notify_created(r, "ObjectCreated:Copy", bucket, key, m);
+                self.notify_created(r, "ObjectCreated:Copy", bucket, key, m).await;
             }
             return Ok(resp);
         }
@@ -2762,12 +2872,49 @@ impl Server {
         let mut headers = stored_headers(&r.parts.headers)?;
         headers.extend(enc.map(|(_, h)| h).unwrap_or_default());
         headers.extend(self.new_lock_headers(&r.parts.headers, bucket)?);
+        // A checksum algorithm (and type) for the parts and the whole object.
+        let algo = match r.header("x-amz-checksum-algorithm") {
+            Some(a) => Some(ChecksumAlgo::from_name(a.trim()).ok_or_else(|| {
+                err::InvalidRequest().with_message("x-amz-checksum-algorithm must be CRC32, CRC32C, CRC64NVME, SHA1 or SHA256")
+            })?),
+            None => None,
+        };
+        let kind = match r.header("x-amz-checksum-type") {
+            Some(t) => Some(
+                crate::checksum::Kind::parse(t)
+                    .ok_or_else(|| err::InvalidRequest().with_message("x-amz-checksum-type must be COMPOSITE or FULL_OBJECT"))?,
+            ),
+            None => None,
+        };
+        let checksum = match (algo, kind) {
+            (Some(a), k) => Some((
+                a,
+                crate::checksum::Kind::for_algo(a, k).ok_or_else(|| {
+                    err::InvalidRequest().with_message(format!(
+                        "The {} checksum type is not supported with {}",
+                        k.map_or("", |k| k.name()),
+                        a.name()
+                    ))
+                })?,
+            )),
+            (None, Some(_)) => {
+                return Err(err::InvalidRequest().with_message("x-amz-checksum-type requires x-amz-checksum-algorithm"));
+            }
+            (None, None) => None,
+        };
+        if let Some((a, k)) = checksum {
+            headers.push((store::UPLOAD_CHECKSUM_ALGO.into(), a.name().into()));
+            headers.push((store::UPLOAD_CHECKSUM_TYPE.into(), k.name().into()));
+        }
         let meta = UploadMeta { bucket: bucket.into(), key: key.into(), initiated_ms: now_ms(), headers: headers.clone(), tags };
         self.store.submit(Op::CreateUpload { id, meta }).await?;
         let mut x = Xml::new("InitiateMultipartUploadResult");
         x.elem("Bucket", bucket).elem("Key", key).elem("UploadId", util::id_hex(id));
         let mut resp = Resp::xml(x.finish("InitiateMultipartUploadResult"));
         set_sse_headers(&mut resp, &headers);
+        if let Some((a, k)) = checksum {
+            resp.set("x-amz-checksum-algorithm", a.name()).set("x-amz-checksum-type", k.name());
+        }
         Ok(resp)
     }
 
@@ -2779,7 +2926,10 @@ impl Server {
             })?;
         let u = self.store.get_upload(upload)?.filter(|u| u.bucket == bucket && u.key == key).ok_or_else(err::NoSuchUpload)?;
         // Parts are encrypted like the upload: master key, or the same customer key every time.
-        let part_key = self.read_key(&u.headers, &r.parts.headers, "x-amz-")?;
+        let part_key = self.read_key(&u.headers, &r.parts.headers, "x-amz-").map_err(|e| match e.code {
+            "AccessDenied" => err::InvalidRequest().with_message("The provided customer key does not match the upload's key."),
+            _ => e,
+        })?;
 
         if r.header("x-amz-copy-source").is_some() {
             return self.upload_part_copy(r, bucket, key, upload, part, part_key, &u.headers).await;
@@ -2791,6 +2941,21 @@ impl Server {
             io::discard_small(&mut r.body, Some(len)).await;
             return Err(e);
         }
+        // Parts of an upload with a checksum algorithm get that checksum (computed if the
+        // request doesn't carry it).
+        if let Some(algo) = upload_checksum_algo(&u.headers) {
+            match &expect.checksum {
+                None => expect.checksum = Some((algo, None)),
+                Some((a, _)) if *a != algo => {
+                    return Err(err::InvalidRequest().with_message(format!(
+                        "The upload's checksum algorithm is {}; the part has a {} checksum",
+                        algo.name(),
+                        a.name()
+                    )));
+                }
+                Some(_) => {}
+            }
+        }
         let expect_key = part_key.clone();
         expect.encrypt = part_key;
         let body = std::mem::replace(&mut r.body, BodyStream::empty());
@@ -2799,7 +2964,7 @@ impl Server {
         let Data::File(file) = ing.data else { return Err(S3Error::internal("part stored inline")) };
         // For SSE-C uploads the part ETag is keyed (it must not reveal the plaintext MD5).
         let part_digest = crypt::etag_digest(expect_key.as_ref(), ing.md5);
-        let meta = PartMeta { size: ing.size, md5: part_digest, mtime_ms: now_ms(), file };
+        let meta = PartMeta { size: ing.size, md5: part_digest, mtime_ms: now_ms(), file, checksum: ing.checksum.clone() };
         self.store.submit_owning(Op::PutPart { upload, bucket: bucket.into(), key: key.into(), part, meta }, vec![file]).await?;
         let mut resp = Resp::ok();
         resp.set("etag", &format!("\"{}\"", util::hex(&part_digest)));
@@ -2845,24 +3010,28 @@ impl Server {
                 return Err(err::EntityTooLarge());
             }
             let (st, src2, dk) = (self.store.clone(), src.clone(), part_key.clone());
+            let algo = upload_checksum_algo(upload_headers);
             let res = tokio::task::spawn_blocking(move || {
-                io::copy_range_blocking(&st, &src2, inline.as_ref(), start, len, src_key.as_ref(), dk.as_ref())
+                io::copy_range_blocking(&st, &src2, inline.as_ref(), start, len, src_key.as_ref(), dk.as_ref(), algo)
             })
             .await
             .map_err(S3Error::internal)?;
-            let (file, md5) = match res {
+            let (file, md5, checksum) = match res {
                 Ok(v) => v,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound && attempt < 2 => continue,
                 Err(e) => return Err(e.into()),
             };
             let md5 = crypt::etag_digest(part_key.as_ref(), md5);
-            let meta = PartMeta { size: len, md5, mtime_ms: now_ms(), file };
+            let meta = PartMeta { size: len, md5, mtime_ms: now_ms(), file, checksum: checksum.clone() };
             let mtime = meta.mtime_ms;
             self.store
                 .submit_owning(Op::PutPart { upload, bucket: bucket.into(), key: key.into(), part, meta }, vec![file])
                 .await?;
             let mut x = Xml::new("CopyPartResult");
             x.elem("LastModified", iso8601(mtime)).elem("ETag", format!("\"{}\"", util::hex(&md5)));
+            if let Some((a, v)) = &checksum {
+                x.elem(a.xml_name(), v);
+            }
             let mut resp = Resp::xml(x.finish("CopyPartResult"));
             set_sse_headers(&mut resp, upload_headers);
             return Ok(resp);
@@ -2908,7 +3077,12 @@ impl Server {
             self.authorize(&who, "s3:PutObjectTagging", Some(bucket), Some(&key), &ctx)?;
         }
         let range = match f.get("policy") {
-            Some(policy) => crate::post::PostPolicy::parse(policy)?.check(f, bucket)?,
+            // Conditions on the key apply to it with `${filename}` filled in.
+            Some(policy) => {
+                let mut fields = f.clone();
+                fields.insert("key".into(), key.clone());
+                crate::post::PostPolicy::parse(policy)?.check(&fields, bucket)?
+            }
             None => None,
         };
         self.store.require_bucket(bucket)?;
@@ -2945,6 +3119,7 @@ impl Server {
             max_len: max.min(MAX_OBJECT_SIZE),
             allow_inline: !versioned,
             encrypt: enc.map(|(k, _)| k),
+            checksum: ChecksumAlgo::ALL.iter().find_map(|a| f.get(a.header()).map(|v| (*a, Some(v.trim().to_string())))),
             ..Default::default()
         };
         let ing = io::ingest(&self.store, file, expect).await?;
@@ -2960,7 +3135,7 @@ impl Server {
             mtime_ms: now_ms(),
             etag: etag.clone(),
             headers,
-            checksum: None,
+            checksum: ing.checksum.clone(),
             storage,
             tags,
             version: None,
@@ -2975,7 +3150,7 @@ impl Server {
             OpOut::Object(m) => {
                 let mut ev = self.event(&who, client.ip, rid, "ObjectCreated:Post", bucket, &key);
                 (ev.size, ev.etag, ev.version, ev.sequencer) = (m.size, m.etag.clone(), m.version.clone(), m.seq);
-                self.events.emit(ev);
+                self.events.emit(ev).await;
                 m.version.clone()
             }
             _ => None,
@@ -2997,7 +3172,7 @@ impl Server {
         }
         let mut resp = match f.get("success_action_status").map(String::as_str) {
             Some("201") => {
-                let mut x = Xml::new("PostResponse");
+                let mut x = Xml::bare("PostResponse");
                 x.elem("Location", &location).elem("Bucket", bucket).elem("Key", &key).elem("ETag", &etag);
                 let mut r = Resp::xml(x.finish("PostResponse"));
                 r.status = StatusCode::CREATED;
@@ -3007,6 +3182,9 @@ impl Server {
             _ => Resp::new(StatusCode::NO_CONTENT),
         };
         resp.set("etag", &etag).set("location", &location);
+        if let Some((a, v)) = &ing.checksum {
+            resp.set(a.header(), v);
+        }
         if let Some(v) = &version {
             resp.set("x-amz-version-id", v);
         }
@@ -3048,18 +3226,48 @@ impl Server {
         for p in doc.children_named("Part") {
             let n: u32 = p.child_text("PartNumber").and_then(|n| n.trim().parse().ok()).ok_or_else(err::MalformedXML)?;
             let etag = p.child_text("ETag").ok_or_else(err::MalformedXML)?.to_string();
-            parts.push((n, etag));
+            let checksum = ChecksumAlgo::ALL.iter().find_map(|a| p.child_text(a.xml_name())).map(str::to_string);
+            parts.push((n, etag, checksum));
+        }
+        let checksum = ChecksumAlgo::ALL.iter().find_map(|a| r.header(a.header()).map(|v| (*a, v.trim().to_string())));
+        // An SSE-C key sent along must be the upload's.
+        if r.header(SSE_C_ALG).is_some()
+            && let Some(u) = self.store.get_upload(upload)?
+        {
+            self.read_key(&u.headers, &r.parts.headers, "x-amz-").map_err(|e| match e.code {
+                "AccessDenied" => {
+                    err::InvalidRequest().with_message("The provided customer key does not match the upload's key.")
+                }
+                _ => e,
+            })?;
+            if !u.headers.iter().any(|(k, _)| k == SSE_C_MD5) {
+                return Err(err::InvalidRequest().with_message("The upload is not encrypted with a customer-provided key."));
+            }
         }
         let cond = write_cond(&r.parts.headers);
-        let out = self.store.submit(Op::Complete { bucket: bucket.into(), key: key.into(), upload, parts, cond }).await?;
-        let OpOut::Object(meta) = out else { return Err(S3Error::internal("unexpected writer reply")) };
-        self.notify_created(r, "ObjectCreated:CompleteMultipartUpload", bucket, key, &meta);
+        let op = Op::Complete { bucket: bucket.into(), key: key.into(), upload, parts, checksum, cond };
+        let meta = match self.store.submit(op).await {
+            Ok(OpOut::Object(meta)) => {
+                self.notify_created(r, "ObjectCreated:CompleteMultipartUpload", bucket, key, &meta).await;
+                self.completed.lock().unwrap().remember(upload, bucket, key, &meta);
+                meta
+            }
+            Ok(_) => return Err(S3Error::internal("unexpected writer reply")),
+            // Completing an upload that was just completed (a client retrying after a lost
+            // response) succeeds again, as on S3.
+            Err(e) if e.code == "NoSuchUpload" => self.completed.lock().unwrap().get(upload, bucket, key).ok_or(e)?,
+            Err(e) => return Err(e),
+        };
         let mut x = Xml::new("CompleteMultipartUploadResult");
         x.elem("Location", format!("{}/{bucket}/{}", self.base_url(&r.parts, r.client), uri_encode(key, true)))
             .elem("Bucket", bucket)
             .elem("Key", key)
             .elem("ETag", &meta.etag);
+        if let Some((a, v)) = &meta.checksum {
+            x.elem(a.xml_name(), v).elem("ChecksumType", crate::checksum::Kind::of(v).name());
+        }
         let mut resp = Resp::xml(x.finish("CompleteMultipartUploadResult"));
+        set_sse_headers(&mut resp, &meta.headers);
         set_version_header(&mut resp, &meta);
         Ok(resp)
     }
@@ -3099,11 +3307,12 @@ impl Server {
             return Err(S3Error::internal("unexpected writer reply"));
         };
         let mut x = Xml::new("DeleteResult");
-        for ((k, requested), res) in valid.iter().zip(&results) {
-            if let Ok(o) = res {
-                self.notify_removed(r, bucket, k, requested.as_deref(), o);
-            }
-        }
+        let evs = valid
+            .iter()
+            .zip(&results)
+            .filter_map(|((k, requested), res)| self.removed_event(r, bucket, k, requested.as_deref(), res.as_ref().ok()?))
+            .collect();
+        self.events.emit_all(evs).await;
         for ((k, requested), res) in valid.iter().zip(results) {
             match res {
                 Ok(_) if quiet => {}
@@ -3172,8 +3381,48 @@ fn etag_of(md5: [u8; 16], key: Option<&WrapKey>) -> String {
 }
 
 /// Stored headers a copy takes over from its source (not encryption or Object Lock state).
+/// The checksums of a multipart object's parts, in order (empty when they are not known).
+fn part_checksums(meta: &ObjectMeta) -> Vec<&str> {
+    meta.headers
+        .iter()
+        .find(|(k, _)| k == store::PART_CHECKSUMS)
+        .map(|(_, list)| list.split(',').filter(|v| !v.is_empty()).collect())
+        .unwrap_or_default()
+}
+
 fn inheritable(h: &[(String, String)]) -> Vec<(String, String)> {
-    h.iter().filter(|(k, _)| !k.starts_with(SSE) && !lock::is_lock_header(k) && k != store::REPLICA_HEADER).cloned().collect()
+    h.iter()
+        .filter(|(k, _)| {
+            !k.starts_with(SSE)
+                && !lock::is_lock_header(k)
+                && k != store::REPLICA_HEADER
+                && !k.starts_with(store::INTERNAL_PREFIX)
+        })
+        .cloned()
+        .collect()
+}
+
+/// The checksum algorithm an upload was created with.
+fn upload_checksum_algo(headers: &[(String, String)]) -> Option<ChecksumAlgo> {
+    headers.iter().find(|(k, _)| k == store::UPLOAD_CHECKSUM_ALGO).and_then(|(_, v)| ChecksumAlgo::from_name(v))
+}
+
+/// Uploads completed recently, so a client that retries a CompleteMultipartUpload (after
+/// losing the response) gets the same answer, as on S3.
+#[derive(Default)]
+struct Completed(HashMap<u128, (String, String, ObjectMeta)>);
+
+impl Completed {
+    fn remember(&mut self, upload: u128, bucket: &str, key: &str, meta: &ObjectMeta) {
+        if self.0.len() >= 10_000 {
+            self.0.clear();
+        }
+        self.0.insert(upload, (bucket.to_string(), key.to_string(), meta.clone()));
+    }
+
+    fn get(&self, upload: u128, bucket: &str, key: &str) -> Option<ObjectMeta> {
+        self.0.get(&upload).filter(|(b, k, _)| b == bucket && k == key).map(|(_, _, m)| m.clone())
+    }
 }
 
 fn r_has_auth_header(parts: &Parts) -> bool {

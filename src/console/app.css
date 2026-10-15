@@ -154,3 +154,4 @@ table.objects { width: 100%; border-collapse: collapse; }
 .access { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin: 8px 0; font-size: 13px; }
 .access .badge { margin-left: 0; }
 .access .share-url { flex: 1 1 200px; min-width: 0; }
+textarea.policy { width: 100%; font-family: ui-monospace, monospace; font-size: 12px; box-sizing: border-box; }

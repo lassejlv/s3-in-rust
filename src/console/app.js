@@ -772,7 +772,7 @@ async function bucketSettings() {
     } catch (_) { /* no permission */ }
   } catch (e) { toast(e.message, true); return; }
 
-  let wantsDelete = false;
+  let wantsDelete = false, wantsPolicy = false;
   const choice = await prompt(`Settings: ${b}`, [
     el("label", {}, "Versioning", el("select", { id: "f-ver", disabled: lock },
       el("option", { value: "Off", selected: versioning === "Off", disabled: versioning !== "Off" }, "Off"),
@@ -793,6 +793,7 @@ async function bucketSettings() {
     el("label", {}, "Clean up unfinished uploads after (days)", el("input", { id: "f-abort", type: "number", min: "1", step: "1", value: life.abort })),
     life.others.length ? el("p", { class: "muted" }, `This bucket also has ${life.others.length} lifecycle rule(s) set by other tools; they are kept.`) : null,
     el("hr"),
+    el("button", { type: "button", onclick: () => { wantsPolicy = true; $("modal").close("cancel"); } }, "Edit bucket policy…"), " ",
     el("button", { type: "button", class: "danger", onclick: () => { wantsDelete = true; $("modal").close("cancel"); } }, "Delete bucket…"),
   ], "Save", () => ({
     ver: $("f-ver").value, acl: $("f-acl").value, web: $("f-web").checked, index: $("f-index").value.trim(), error: $("f-error").value.trim(),
@@ -800,6 +801,7 @@ async function bucketSettings() {
     expire: $("f-expire").value.trim(), noncurrent: $("f-noncurrent").value.trim(), abort: $("f-abort").value.trim(),
   }));
   if (wantsDelete) return deleteBucket(b);
+  if (wantsPolicy) return editPolicy(b);
   if (!choice) return;
   try {
     if (choice.ver !== versioning && choice.ver !== "Off") await setVersioning(b, choice.ver);
@@ -862,6 +864,39 @@ function lifecycleDoc(choice, others) {
   if (choice.noncurrent) rules.push(rule(LIFE_IDS.noncurrent, `<NoncurrentVersionExpiration><NoncurrentDays>${days(choice.noncurrent)}</NoncurrentDays></NoncurrentVersionExpiration>`));
   if (choice.abort) rules.push(rule(LIFE_IDS.abort, `<AbortIncompleteMultipartUpload><DaysAfterInitiation>${days(choice.abort)}</DaysAfterInitiation></AbortIncompleteMultipartUpload>`));
   return rules.length ? `<LifecycleConfiguration>${rules.join("")}</LifecycleConfiguration>` : null;
+}
+
+// The bucket policy as JSON text: an empty policy removes it.
+async function editPolicy(b) {
+  let current = "";
+  try {
+    const r = await S3.request("GET", `/${b}`, { query: { policy: "" } });
+    current = JSON.stringify(JSON.parse(await r.text()), null, 2);
+  } catch (e) {
+    if (e.code !== "NoSuchBucketPolicy") { toast(e.message, true); return; }
+  }
+  const example = JSON.stringify({ Version: "2012-10-17", Statement: [{ Effect: "Allow", Principal: "*", Action: "s3:GetObject", Resource: `arn:aws:s3:::${b}/public/*` }] }, null, 2);
+  const text = await prompt(`Bucket policy: ${b}`, [
+    el("textarea", {
+      id: "f-policy", class: "policy", rows: "16", spellcheck: "false", placeholder: example,
+      // Invalid JSON keeps the dialog open (with the browser's validation message).
+      oninput: (e) => {
+        const t = e.target.value.trim();
+        try { if (t) JSON.parse(t); e.target.setCustomValidity(""); } catch (err) { e.target.setCustomValidity(`Not valid JSON: ${err.message}`); }
+      },
+    }, current),
+    el("p", { class: "muted" }, "IAM policy JSON. Leave empty to remove the policy."),
+  ], "Save", () => ({ t: $("f-policy").value.trim() }));
+  if (!text) return;
+  try {
+    if (text.t) {
+      await S3.request("PUT", `/${b}`, { query: { policy: "" }, body: text.t, headers: { "content-type": "application/json" } });
+      toast("Bucket policy saved");
+    } else if (current) {
+      await S3.request("DELETE", `/${b}`, { query: { policy: "" } });
+      toast("Bucket policy removed");
+    }
+  } catch (e) { toast(e.message, true); }
 }
 
 async function deleteBucket(b) {

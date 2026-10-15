@@ -179,6 +179,24 @@ const shot = (page, name) => (out ? page.screenshot({ path: `${out}/${name}.png`
   await page.click('#modal-ok');
   await page.waitForSelector('.toast:has-text("Settings saved") >> nth=-1');
 
+  step('settings: bucket policy');
+  await page.click('#settings');
+  await page.click('#modal-body button:has-text("Edit bucket policy")');
+  await page.waitForSelector('#f-policy');
+  await page.fill('#f-policy', '{"Statement": [');
+  await page.click('#modal-ok');
+  if (!(await page.isVisible('#f-policy'))) throw new Error('invalid JSON was accepted');
+  await page.fill('#f-policy', JSON.stringify({ Version: '2012-10-17', Statement: [{ Effect: 'Deny', Principal: '*', Action: 's3:GetObject', Resource: `arn:aws:s3:::${BUCKET}/hello.txt` }] }));
+  await page.click('#modal-ok');
+  await page.waitForSelector('.toast:has-text("Bucket policy saved")');
+  if ((await fetch(`${BASE}/${BUCKET}/hello.txt`)).status !== 403) throw new Error('policy not applied');
+  await page.click('#settings');
+  await page.click('#modal-body button:has-text("Edit bucket policy")');
+  await page.waitForFunction(() => document.querySelector('#f-policy') && document.querySelector('#f-policy').value.includes('Deny'));
+  await page.fill('#f-policy', '');
+  await page.click('#modal-ok');
+  await page.waitForSelector('.toast:has-text("Bucket policy removed")');
+
   step('delete selected (folder + files)');
   if (await page.isVisible('#details')) await page.click('#details-close');
   await page.check('#select-all');

@@ -159,6 +159,8 @@ jobs:
         run: python3 tests/ratelimit.py ./target/release/s3rs
       - name: durable event notifications
         run: python3 tests/events.py ./target/release/s3rs
+      - name: bucket logging
+        run: python3 tests/bucketlog.py ./target/release/s3rs
       - name: access keys through the admin API
         run: python3 tests/keys.py ./target/release/s3rs
       - name: HTTP fuzzing (mutated requests; no 500s, no panics)

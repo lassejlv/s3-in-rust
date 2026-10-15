@@ -14,6 +14,7 @@ mod access;
 mod accesslog;
 mod auth;
 mod body;
+mod bucketlog;
 mod chunked;
 mod conn;
 mod console;
@@ -1066,6 +1067,22 @@ async fn serve(
     // Tells connections still in their TLS handshake to give up, so they don't delay the drain.
     let (stopping_tx, stopping) = tokio::sync::watch::channel(false);
     tokio::spawn(server.replication.clone().run(stopping.clone()));
+    {
+        let server = server.clone();
+        let mut stopping = stopping.clone();
+        tokio::spawn(async move {
+            loop {
+                let stop = tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_secs(5)) => false,
+                    _ = stopping.changed() => *stopping.borrow(),
+                };
+                if stop {
+                    return;
+                }
+                server.flush_bucket_logs(false).await;
+            }
+        });
+    }
     let shutdown = shutdown_signal();
     tokio::pin!(shutdown);
     loop {
@@ -1144,6 +1161,7 @@ async fn serve(
             false
         }
     };
+    server.flush_bucket_logs(true).await;
     let _ = store.submit(store::Op::Flush).await;
     server.flush_logs();
     // Only a complete drain is a clean shutdown; otherwise cancelled uploads may leave orphaned

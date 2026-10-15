@@ -89,6 +89,8 @@ pub struct Server {
     tls: bool,
     pub events: Arc<events::Bus>,
     pub replication: Arc<crate::replication::Replicator>,
+    /// Per-bucket server access logs (PutBucketLogging).
+    pub bucket_log: Arc<crate::bucketlog::Logger>,
     key_limit: Option<crate::ratelimit::Limiter>,
     /// Keys from the command line and credentials file; merged with the stored ones.
     file_creds: RwLock<Vec<auth::Credential>>,
@@ -367,6 +369,7 @@ fn parse_max(v: Option<&str>, default: usize) -> S3Result<usize> {
 
 impl Server {
     pub fn new(store: Arc<Store>, auth: Option<Auth>, opts: Options) -> Self {
+        let bucket_log = crate::bucketlog::Logger::new(store.clone());
         let default_cors = (!opts.cors_origins.is_empty()).then(|| {
             vec![CorsRule {
                 origins: opts.cors_origins.clone(),
@@ -386,7 +389,11 @@ impl Server {
             access_log: opts.access_log.map(|f| Arc::new(crate::accesslog::AccessLog::new(f))),
             admin_token: opts.admin_token,
             backup_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            metrics: crate::metrics::Metrics::new(opts.events.stats.clone(), opts.replication.stats.clone()),
+            metrics: crate::metrics::Metrics::new(
+                opts.events.stats.clone(),
+                opts.replication.stats.clone(),
+                bucket_log.stats.clone(),
+            ),
             default_cors,
             access_cache: RwLock::new(HashMap::new()),
             access_gen: AtomicU64::new(0),
@@ -399,6 +406,7 @@ impl Server {
             tls: opts.tls,
             events: opts.events,
             replication: opts.replication,
+            bucket_log,
             key_limit: opts.rate_limit.map(crate::ratelimit::Limiter::new),
             file_creds: RwLock::new(Vec::new()),
             anon_limit: opts.rate_limit_anonymous.map(crate::ratelimit::Limiter::new),
@@ -662,11 +670,13 @@ impl Server {
         let origin = header(req.headers(), "origin").map(str::to_string);
         let cors_bucket = origin.as_ref().and_then(|_| self.resolve(req.uri(), req.headers()).ok()).and_then(|(b, _, _)| b);
         // Written when the response has been sent, or with 499 if this future is dropped first.
-        let mut pending = self.access_log.as_ref().map(|log| {
+        let logging = self.access_log.is_some() || self.bucket_log.enabled();
+        let mut pending = logging.then(|| {
             let h = req.headers();
             let n = |name| header(h, name).and_then(|v| v.parse::<u64>().ok());
             crate::accesslog::PendingLog::new(
-                log.clone(),
+                self.access_log.clone(),
+                Some(self.bucket_log.clone()),
                 "api",
                 &rid,
                 peer.ip(),
@@ -763,7 +773,8 @@ impl Server {
         let mut resp = resp;
         if let Some(log) = &self.access_log {
             let mut p = crate::accesslog::PendingLog::new(
-                log.clone(),
+                Some(log.clone()),
+                None,
                 "website",
                 &rid,
                 peer.ip(),
@@ -1350,7 +1361,14 @@ impl Server {
                         }
                         Ok(Resp::xml(x.finish(root)))
                     }
-                    "logging" => Ok(Resp::xml(Xml::new("BucketLoggingStatus").finish("BucketLoggingStatus"))),
+                    "logging" => {
+                        let target = self
+                            .store
+                            .bucket_config(bucket, "logging")?
+                            .and_then(|v| xml::parse(&String::from_utf8_lossy(&v)))
+                            .and_then(|d| crate::bucketlog::parse_config(&d).ok().flatten());
+                        Ok(Resp::xml(crate::bucketlog::config_xml(target.as_ref())))
+                    }
                     "notification" => Ok(Resp::xml(match self.store.bucket_config(bucket, "notification")? {
                         Some(doc) => String::from_utf8_lossy(&doc).into_owned(),
                         None => Xml::new("NotificationConfiguration").finish("NotificationConfiguration"),
@@ -1518,6 +1536,24 @@ impl Server {
                 if backfill {
                     tokio::spawn(crate::replication::Replicator::backfill(self.store.clone(), bucket.to_string()));
                 }
+                Ok(Resp::ok())
+            }
+            BucketOp::PutConfig("logging") => {
+                self.store.require_bucket(bucket)?;
+                let doc = self.read_xml(r).await?;
+                let target = crate::bucketlog::parse_config(&doc)?;
+                if let Some(t) = &target {
+                    // The logs are written with the server's authority, so whoever turns logging
+                    // on must be allowed to write to the target.
+                    self.store
+                        .require_bucket(&t.bucket)
+                        .map_err(|_| err::InvalidArgument().with_message("The target bucket for logging does not exist"))?;
+                    let ctx = self.req_ctx(r);
+                    self.authorize(&r.principal, "s3:PutObject", Some(&t.bucket), Some(&t.prefix), &ctx)?;
+                }
+                let value = target.as_ref().map(|t| crate::bucketlog::config_xml(Some(t)).into_bytes());
+                self.set_bucket_config(bucket, "logging", value).await?;
+                self.bucket_log.invalidate(bucket, target.is_some());
                 Ok(Resp::ok())
             }
             BucketOp::PutConfig(_) => Err(err::NotImplemented()),
@@ -2298,6 +2334,65 @@ impl Server {
             ));
         }
         Ok(None)
+    }
+
+    /// Write the server access logs that are due to their target buckets (all of them on
+    /// shutdown).
+    pub async fn flush_bucket_logs(&self, all: bool) {
+        for (target, source, data) in self.bucket_log.take_due(all) {
+            let key = crate::bucketlog::object_key(&target, &source, &self.region, now_ms() / 1000);
+            match self.put_internal(&target.bucket, &key, Bytes::from(data), "text/plain").await {
+                Ok(()) => {
+                    self.bucket_log.stats.written.fetch_add(1, Ordering::Relaxed);
+                }
+                Err(e) => {
+                    self.bucket_log.stats.dropped.fetch_add(1, Ordering::Relaxed);
+                    elog!("bucket logging: writing {}/{key} for {source} failed: {}", target.bucket, e.message);
+                }
+            }
+        }
+    }
+
+    /// Store an object written by the server itself (log files), with the bucket's default
+    /// encryption and Object Lock retention, as an upload would get.
+    async fn put_internal(&self, bucket: &str, key: &str, data: Bytes, content_type: &str) -> S3Result<()> {
+        struct Once(Option<Bytes>);
+        impl io::Source for Once {
+            async fn next(&mut self) -> S3Result<Option<Bytes>> {
+                Ok(self.0.take())
+            }
+        }
+        let enc = self.write_encryption(&HeaderMap::new(), bucket, None)?;
+        let mut headers = vec![("content-type".to_string(), content_type.to_string())];
+        headers.extend(enc.as_ref().map(|(_, h)| h.clone()).unwrap_or_default());
+        headers.extend(self.new_lock_headers(&HeaderMap::new(), bucket)?);
+        headers.sort();
+        let versioned = self.bucket_access(bucket)?.versioning == store::Versioning::Enabled;
+        let expect = Expect {
+            len: Some(data.len() as u64),
+            max_len: MAX_OBJECT_SIZE,
+            allow_inline: !versioned,
+            encrypt: enc.as_ref().map(|(k, _)| k.clone()),
+            ..Default::default()
+        };
+        let ing = io::ingest(&self.store, Once(Some(data)), expect).await?;
+        let (storage, inline, files) = ing.storage();
+        let meta = ObjectMeta {
+            size: ing.size,
+            mtime_ms: now_ms(),
+            etag: etag_of(ing.md5, enc.as_ref().map(|(k, _)| k)),
+            headers,
+            checksum: None,
+            storage,
+            tags: vec![],
+            version: None,
+            seq: 0,
+            delete_marker: false,
+        };
+        self.store
+            .submit_owning(Op::PutObject { bucket: bucket.into(), key: key.into(), meta, inline, cond: None }, files)
+            .await?;
+        Ok(())
     }
 
     /// Enforce the request rate limits: per access key for signed requests, per client address

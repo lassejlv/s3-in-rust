@@ -48,6 +48,7 @@ pub const CONFIG_KINDS: &[&str] = &[
     "notification",
     "quota",
     "replication",
+    "logging",
     // Where the backfill of a new replication configuration has got to (see Op::ReplBackfill).
     "replication-backfill",
 ];
@@ -901,6 +902,20 @@ impl Store {
             oldest = oldest.min(e?.1.value().1);
         }
         Ok(if oldest == u64::MAX { 0 } else { oldest })
+    }
+
+    /// Buckets that have a configuration of the given kind.
+    pub fn buckets_with_config(&self, kind: &str) -> S3Result<Vec<String>> {
+        let txn = self.db.get()?.begin_read()?;
+        let config = txn.open_table(CONFIG)?;
+        let mut out = Vec::new();
+        for e in txn.open_table(BUCKETS)?.iter()? {
+            let (b, _) = e?;
+            if config.get((b.value(), kind))?.is_some() {
+                out.push(b.value().to_string());
+            }
+        }
+        Ok(out)
     }
 
     /// Buckets whose replication backfill (queuing existing objects) has not finished.

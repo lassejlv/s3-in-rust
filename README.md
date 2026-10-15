@@ -181,6 +181,31 @@ at about 85k requests/s with JSON logs on. If stdout can't keep up, lines are dr
 in `s3rs_access_log_dropped_total`. `--access-log text` (or `-v`) prints a compact human-readable
 line instead.
 
+### Bucket logging
+
+Bucket owners can turn on S3 server access logging for their buckets with PutBucketLogging. No
+operator setup is needed:
+
+```bash
+aws s3api put-bucket-logging --bucket site --bucket-logging-status \
+  '{"LoggingEnabled": {"TargetBucket": "logs", "TargetPrefix": "site/"}}'
+```
+
+- **Format:** S3's server access log format, one line per request: time, client address,
+  requester (access key), request id, operation (`REST.GET.OBJECT`), key, request line, status,
+  error code, bytes sent, duration, user agent, signature and authentication type.
+- **Delivery:** lines are written as log objects (`site/2024-05-01-12-00-03-<id>`) in the target
+  bucket, about once a minute, or as soon as 1 MiB of lines accumulates.
+  - `TargetObjectKeyFormat` with `PartitionedPrefix` writes
+    `<prefix>s3rs/<region>/<bucket>/YYYY/MM/DD/<name>` instead.
+  - Log objects get the target bucket's default encryption and retention.
+  - Delivery is best effort, as in S3: lines still buffered when the server dies are lost.
+    A graceful shutdown writes them.
+- **Permissions:** whoever turns logging on must be allowed to `s3:PutObject` into the target
+  bucket and prefix.
+- **Monitoring:** `s3rs_bucket_log_objects_total` counts log objects written;
+  `s3rs_bucket_log_dropped_total` counts writes that failed.
+
 ### Disk space
 
 A full disk must never take the metadata database down with it, because deleting data is how you
@@ -767,7 +792,7 @@ direct uploads from web apps.
 
 | Area | Operations |
 |---|---|
-| Buckets | ListBuckets, CreateBucket (with canned ACL), DeleteBucket, HeadBucket, GetBucketLocation, Get/PutBucketVersioning, Get/PutBucketAcl, Get/Put/DeleteBucketPolicy, GetBucketPolicyStatus, Get/Put/DeleteBucketCors, Get/Put/DeleteBucketTagging, Get/Put/DeleteBucketEncryption, Get/PutObjectLockConfiguration, Get/Put/DeleteBucketWebsite, Get/PutBucketNotificationConfiguration, Get/Put/DeleteBucketReplication, ListenBucketNotification (MinIO) |
+| Buckets | ListBuckets, CreateBucket (with canned ACL), DeleteBucket, HeadBucket, GetBucketLocation, Get/PutBucketVersioning, Get/PutBucketAcl, Get/Put/DeleteBucketPolicy, GetBucketPolicyStatus, Get/Put/DeleteBucketCors, Get/Put/DeleteBucketTagging, Get/Put/DeleteBucketEncryption, Get/PutObjectLockConfiguration, Get/Put/DeleteBucketWebsite, Get/PutBucketNotificationConfiguration, Get/Put/DeleteBucketReplication, Get/PutBucketLogging, ListenBucketNotification (MinIO) |
 | Objects | PutObject, GetObject, HeadObject, GetObjectAttributes, DeleteObject, DeleteObjects, CopyObject (COPY/REPLACE for metadata and tags), Get/Put/DeleteObjectTagging, `x-amz-tagging` on upload, GetObjectAcl, Get/PutObjectRetention, Get/PutObjectLegalHold, SSE-S3 and SSE-C on every read/write/copy path |
 | Listing | ListObjects (v1), ListObjectsV2, ListObjectVersions (versions and delete markers); prefix, delimiter, pagination, `start-after`, `encoding-type=url` |
 | Multipart | CreateMultipartUpload, UploadPart, UploadPartCopy (with ranges), CompleteMultipartUpload, AbortMultipartUpload, ListParts, ListMultipartUploads |

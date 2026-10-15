@@ -30,11 +30,16 @@ pub struct Metrics {
     pub lifecycle: std::sync::Arc<crate::lifecycle::Stats>,
     pub events: std::sync::Arc<crate::events::Stats>,
     pub replication: std::sync::Arc<crate::replication::Stats>,
+    pub bucket_log: std::sync::Arc<crate::bucketlog::Stats>,
 }
 
 impl Metrics {
-    pub fn new(events: std::sync::Arc<crate::events::Stats>, replication: std::sync::Arc<crate::replication::Stats>) -> Self {
-        Metrics { events, replication, ..Default::default() }
+    pub fn new(
+        events: std::sync::Arc<crate::events::Stats>,
+        replication: std::sync::Arc<crate::replication::Stats>,
+        bucket_log: std::sync::Arc<crate::bucketlog::Stats>,
+    ) -> Self {
+        Metrics { events, replication, bucket_log, ..Default::default() }
     }
 }
 
@@ -131,6 +136,16 @@ impl Metrics {
             o,
             "# TYPE s3rs_notifications_pending gauge\ns3rs_notifications_pending {}",
             self.events.pending.load(Relaxed)
+        );
+        let _ = writeln!(
+            o,
+            "# TYPE s3rs_bucket_log_objects_total counter\ns3rs_bucket_log_objects_total {}",
+            self.bucket_log.written.load(Relaxed)
+        );
+        let _ = writeln!(
+            o,
+            "# TYPE s3rs_bucket_log_dropped_total counter\ns3rs_bucket_log_dropped_total {}",
+            self.bucket_log.dropped.load(Relaxed)
         );
         let r = &self.replication;
         let _ = writeln!(o, "# TYPE s3rs_replication_total counter");

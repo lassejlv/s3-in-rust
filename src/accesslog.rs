@@ -63,7 +63,9 @@ pub struct Entry<'a> {
 /// (with the bytes actually sent and the full duration), or, if the client goes away before
 /// the response, with status 499 ("client closed request").
 pub struct PendingLog {
-    log: Arc<AccessLog>,
+    log: Option<Arc<AccessLog>>,
+    /// Per-bucket server access logs (PutBucketLogging).
+    bucket_log: Option<Arc<crate::bucketlog::Logger>>,
     endpoint: &'static str,
     request_id: String,
     remote_ip: IpAddr,
@@ -83,7 +85,8 @@ pub struct PendingLog {
 impl PendingLog {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        log: Arc<AccessLog>,
+        log: Option<Arc<AccessLog>>,
+        bucket_log: Option<Arc<crate::bucketlog::Logger>>,
         endpoint: &'static str,
         request_id: &str,
         remote_ip: IpAddr,
@@ -95,6 +98,7 @@ impl PendingLog {
     ) -> Self {
         PendingLog {
             log,
+            bucket_log,
             endpoint,
             request_id: request_id.to_string(),
             remote_ip,
@@ -128,7 +132,7 @@ impl PendingLog {
 
 impl Drop for PendingLog {
     fn drop(&mut self) {
-        self.log.log(&Entry {
+        let entry = Entry {
             endpoint: self.endpoint,
             request_id: &self.request_id,
             remote_ip: self.remote_ip,
@@ -143,7 +147,13 @@ impl Drop for PendingLog {
             user_agent: self.user_agent.as_deref(),
             record: &self.record,
             aborted: self.aborted,
-        });
+        };
+        if let Some(log) = &self.log {
+            log.log(&entry);
+        }
+        if let Some(b) = &self.bucket_log {
+            b.record(&entry);
+        }
     }
 }
 

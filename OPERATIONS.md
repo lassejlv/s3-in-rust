@@ -99,6 +99,7 @@ Scrape `/_metrics` (Prometheus text format) and load
 | `s3rs_replication_pending`, `s3rs_replication_lag_seconds` | a growing replication backlog (target down, or writes outpacing it) |
 | `s3rs_replication_total{result}` | `failed` replication attempts (the log says why) |
 | `s3rs_bucket_objects`, `s3rs_bucket_bytes` | growth per bucket (served only with a metrics token) |
+| `s3rs_bucket_requests_total{bucket,method,code}`, `s3rs_bucket_received_bytes_total`, `s3rs_bucket_sent_bytes_total` | which buckets get the traffic and the errors (with a metrics token; counted from response sizes) |
 | `s3rs_scrub_corrupt_total`, `s3rs_scrub_passes_total` | damaged data found by `--scrub-interval`, and whether passes complete |
 | `s3rs_build_info{version,tls}`, `s3rs_uptime_seconds` | what is running, and unexpected restarts |
 

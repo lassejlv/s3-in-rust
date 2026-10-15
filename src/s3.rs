@@ -742,6 +742,10 @@ impl Server {
         let rec = pending.as_mut().map_or(&mut scratch, |p| &mut p.record);
         // An HTTP/1 request with a body that fails may leave part of that body unread; hyper
         // then closes the connection, so say so instead of letting the client reuse it.
+        let req_bytes = self.metrics_token.as_ref().map_or(0, |_| {
+            let n = |name| header(req.headers(), name).and_then(|v| v.parse::<u64>().ok());
+            n("x-amz-decoded-content-length").or_else(|| n("content-length")).unwrap_or(0)
+        });
         let h1_with_body = req.version() <= hyper::Version::HTTP_11
             && (req.headers().contains_key("transfer-encoding")
                 || header(req.headers(), "content-length").is_some_and(|v| v.trim() != "0"));
@@ -775,6 +779,17 @@ impl Server {
         }
         let elapsed = started.elapsed();
         self.metrics.finish(&method, resp.status.as_u16(), elapsed);
+        // Per-bucket series are only served (and so only kept) with a metrics token.
+        if self.metrics_token.is_some()
+            && let Some(b) = pending.as_ref().map_or(&scratch, |p| &p.record).bucket.as_deref()
+        {
+            let sent = match method {
+                Method::HEAD => 0,
+                _ => header(&resp.headers, "content-length").and_then(|v| v.parse().ok()).unwrap_or(0),
+            };
+            let exists = || self.store.require_bucket(b).is_ok();
+            self.metrics.bucket_request(b, &method, resp.status.as_u16(), req_bytes, sent, exists);
+        }
         if let Some(mut p) = pending {
             p.respond(resp.status.as_u16(), error_code);
             resp.body = Body::Logged(Box::new(std::mem::replace(&mut resp.body, Body::Empty)), Box::new(p));

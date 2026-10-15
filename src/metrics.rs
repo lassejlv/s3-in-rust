@@ -32,6 +32,19 @@ pub struct Metrics {
     pub replication: std::sync::Arc<crate::replication::Stats>,
     pub bucket_log: std::sync::Arc<crate::bucketlog::Stats>,
     pub scrub: std::sync::Arc<crate::scrub::Stats>,
+    /// Request and traffic counters per bucket (only for buckets that exist).
+    per_bucket: std::sync::RwLock<std::collections::HashMap<String, BucketCounters>>,
+}
+
+/// Most buckets tracked in `per_bucket`.
+const MAX_TRACKED_BUCKETS: usize = 10_000;
+
+#[derive(Default)]
+struct BucketCounters {
+    /// [method][status class 1xx..5xx]
+    requests: [[AtomicU64; 5]; 7],
+    bytes_in: AtomicU64,
+    bytes_out: AtomicU64,
 }
 
 impl Metrics {
@@ -72,6 +85,40 @@ impl Metrics {
         let b = BOUNDS.iter().position(|ub| secs <= *ub).unwrap_or(BOUNDS.len());
         self.latency[b].fetch_add(1, Relaxed);
         self.latency_sum_us.fetch_add(elapsed.as_micros() as u64, Relaxed);
+    }
+
+    /// Count a request on `bucket`, with its request and response body sizes. `exists` is asked
+    /// before a bucket is first tracked, so requests for made-up names add no series.
+    pub fn bucket_request(
+        &self,
+        bucket: &str,
+        m: &Method,
+        status: u16,
+        bytes_in: u64,
+        bytes_out: u64,
+        exists: impl FnOnce() -> bool,
+    ) {
+        let count = |c: &BucketCounters| {
+            let class = (status / 100).clamp(1, 5) as usize - 1;
+            c.requests[method_idx(m)][class].fetch_add(1, Relaxed);
+            if bytes_in > 0 {
+                c.bytes_in.fetch_add(bytes_in, Relaxed);
+            }
+            if bytes_out > 0 {
+                c.bytes_out.fetch_add(bytes_out, Relaxed);
+            }
+        };
+        if let Some(c) = self.per_bucket.read().unwrap().get(bucket) {
+            return count(c);
+        }
+        if !exists() {
+            return;
+        }
+        let mut map = self.per_bucket.write().unwrap();
+        if map.len() >= MAX_TRACKED_BUCKETS && !map.contains_key(bucket) {
+            return;
+        }
+        count(map.entry(bucket.to_string()).or_default());
     }
 
     pub fn add_bytes_in(&self, n: u64) {
@@ -183,6 +230,34 @@ impl Metrics {
             let _ = writeln!(o, "# TYPE s3rs_bucket_bytes gauge");
             for (b, _, bytes) in &usage {
                 let _ = writeln!(o, "s3rs_bucket_bytes{{bucket=\"{b}\"}} {bytes}");
+            }
+            // Counters of deleted buckets are dropped.
+            let mut map = self.per_bucket.write().unwrap();
+            map.retain(|b, _| usage.iter().any(|(u, _, _)| u == b));
+            let mut tracked: Vec<(&String, &BucketCounters)> = map.iter().collect();
+            tracked.sort_by(|a, b| a.0.cmp(b.0));
+            let _ = writeln!(o, "# TYPE s3rs_bucket_requests_total counter");
+            for (b, c) in &tracked {
+                for (mi, m) in METHODS.iter().enumerate() {
+                    for (ci, n) in c.requests[mi].iter().enumerate() {
+                        let n = n.load(Relaxed);
+                        if n > 0 {
+                            let _ = writeln!(
+                                o,
+                                "s3rs_bucket_requests_total{{bucket=\"{b}\",method=\"{m}\",code=\"{}xx\"}} {n}",
+                                ci + 1
+                            );
+                        }
+                    }
+                }
+            }
+            let _ = writeln!(o, "# TYPE s3rs_bucket_received_bytes_total counter");
+            for (b, c) in &tracked {
+                let _ = writeln!(o, "s3rs_bucket_received_bytes_total{{bucket=\"{b}\"}} {}", c.bytes_in.load(Relaxed));
+            }
+            let _ = writeln!(o, "# TYPE s3rs_bucket_sent_bytes_total counter");
+            for (b, c) in &tracked {
+                let _ = writeln!(o, "s3rs_bucket_sent_bytes_total{{bucket=\"{b}\"}} {}", c.bytes_out.load(Relaxed));
             }
         }
         let _ = writeln!(

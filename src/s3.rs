@@ -983,7 +983,13 @@ impl Server {
         // with virtual-hosted addressing they are only matched when no bucket was resolved.
         if !vhost && parts.uri.path() == "/_health" {
             let mut r = Resp::ok();
-            r.body = Body::full(Bytes::from_static(b"ok\n"));
+            r.body = match self.store.health().await {
+                Ok(()) => Body::full(Bytes::from_static(b"ok\n")),
+                Err(e) => {
+                    r.status = StatusCode::SERVICE_UNAVAILABLE;
+                    Body::full(Bytes::from(format!("unavailable: {}\n", e.message)))
+                }
+            };
             return Ok(r);
         }
         if !vhost && parts.uri.path() == "/_metrics" {

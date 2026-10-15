@@ -42,7 +42,10 @@ Release images (`ghcr.io/<owner>/s3rs:<version>`, with `-tls` variants) run as u
 data in the `/data` volume. Configure them with the same `S3RS_*` environment variables, and mount
 secrets as files (`S3RS_ENCRYPTION_KEY_FILE`, `S3RS_CREDENTIALS_FILE`, `S3RS_TLS_CERT`/`KEY`).
 Give the container time to drain: `docker stop -t 60`, or `terminationGracePeriodSeconds: 60` on
-Kubernetes. Use `GET /_health` for liveness and readiness.
+Kubernetes. Use `GET /_health` for liveness and readiness (an `httpGet` probe, with
+`scheme: HTTPS` for native TLS). The images define a Docker `HEALTHCHECK` that runs
+`s3rs healthcheck`. Allow for the start after a crash, which scans the data directory: about 1 s
+per million objects.
 
 ### Sizing
 

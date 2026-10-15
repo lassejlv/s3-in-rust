@@ -35,6 +35,8 @@ First release.
 **Operations**
 - Web console at `/_console/`.
 - Prometheus metrics, JSON access logs, event notifications (webhooks and live streams).
+- `/_health` checks that the metadata database and its writer respond. `s3rs healthcheck` and a
+  Docker `HEALTHCHECK` use it.
 - Native HTTPS with certificate reload, as the optional `tls` build feature.
 - Idle timeouts, a connection limit, and slow clients that never hold threads.
 - Release binaries for Linux x86_64 and arm64, container images, a hardened systemd unit and

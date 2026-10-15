@@ -423,6 +423,8 @@ pub enum Op {
         items: Vec<(String, u64)>,
     },
     Flush,
+    /// Answered by the writer without touching the database (health checks).
+    Ping,
 }
 
 pub enum OpOut {
@@ -696,6 +698,20 @@ impl Store {
             self.discard(files);
         }
         r
+    }
+
+    /// Whether the store can serve requests: the metadata database is open and readable and
+    /// the writer answers within a few seconds. A full disk does not make the store unhealthy.
+    pub async fn health(&self) -> S3Result<()> {
+        drop(self.db.get()?.begin_read()?);
+        match tokio::time::timeout(Duration::from_secs(5), self.submit(Op::Ping)).await {
+            Ok(r) => r.map(|_| ()),
+            Err(_) => Err(S3Error::new(
+                "ServiceUnavailable",
+                hyper::StatusCode::SERVICE_UNAVAILABLE,
+                "the metadata writer is not responding",
+            )),
+        }
     }
 
     // ---------------------------------------------------------------- reads
@@ -1366,6 +1382,16 @@ fn writer_loop(cell: Arc<DbCell>, rx: mpsc::Receiver<Job>, deleter: mpsc::Sender
                 Err(_) => break,
             }
         }
+        // Health probes only need the writer to be responsive: answer them without a commit
+        // (which could fail on a full disk while reads and deletes still work).
+        let (pings, rest): (Vec<Job>, Vec<Job>) = batch.into_iter().partition(|j| matches!(j.op, Op::Ping));
+        for j in pings {
+            let _ = j.reply.send(Ok(OpOut::Done));
+        }
+        let mut batch = rest;
+        if batch.is_empty() {
+            continue;
+        }
         let force_durable = batch.iter().any(|j| matches!(j.op, Op::Flush));
         let immediate = durable || force_durable || last_durable.elapsed() >= DURABLE_EVERY;
 
@@ -1990,7 +2016,7 @@ fn bucket_has_versions(tx: &Tables, bucket: &str) -> S3Result<bool> {
 
 fn apply(tx: &mut Tables, op: Op, garbage: &mut Vec<u128>, last_seq: &mut u64) -> S3Result<OpOut> {
     match op {
-        Op::Flush => Ok(OpOut::Done),
+        Op::Flush | Op::Ping => Ok(OpOut::Done),
         Op::CreateBucket(name) => {
             if tx.buckets.get(name.as_str())?.is_some() {
                 return Err(err::BucketAlreadyOwnedByYou());

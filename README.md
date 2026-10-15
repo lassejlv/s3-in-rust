@@ -124,7 +124,10 @@ Each flag can also be set with the environment variable shown (switches take `1`
 
 The server refuses to start without credentials unless you pass `--anonymous`.
 
-`GET /_health` returns `200 ok`. `GET /_metrics` serves Prometheus metrics: request counts by method
+`GET /_health` returns `200 ok` while the metadata database is readable and its writer
+responds, and `503` otherwise. A full disk does not make the server unhealthy: reads and deletes
+still work. `s3rs healthcheck` probes it from the same host, for container health checks (the
+images define a `HEALTHCHECK` with it). `GET /_metrics` serves Prometheus metrics: request counts by method
 and status, a latency histogram, bytes in and out, lifecycle activity, and the bucket count. Both
 endpoints are public unless you set `--metrics-token`, which applies to `/_metrics` only. Per-bucket
 series (which name every bucket) are included only when `/_metrics` is protected by a token.

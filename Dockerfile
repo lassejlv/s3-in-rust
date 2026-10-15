@@ -11,4 +11,6 @@ FROM debian:trixie-slim
 COPY --from=build /src/target/release/s3rs /usr/local/bin/s3rs
 ENV S3RS_DATA_DIR=/data S3RS_LISTEN=0.0.0.0:9000
 EXPOSE 9000
+# `s3rs healthcheck` reads S3RS_LISTEN and S3RS_TLS_CERT like the server.
+HEALTHCHECK --interval=30s --timeout=20s --start-period=60s --retries=3 CMD ["/usr/local/bin/s3rs", "healthcheck"]
 ENTRYPOINT ["/usr/local/bin/s3rs"]

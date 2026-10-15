@@ -122,6 +122,10 @@ jobs:
           npm install --no-save --no-package-lock playwright@1.56.1
           npx playwright install --with-deps chromium
           node tests/console.js
+      - name: healthcheck subcommand
+        run: |
+          ./target/release/s3rs healthcheck -l 0.0.0.0:9000
+          ! ./target/release/s3rs healthcheck -l 127.0.0.1:9002
       - name: fsck after a graceful shutdown
         run: |
           kill -TERM "$(cat /tmp/s3rs.pid)"
@@ -237,6 +241,10 @@ jobs:
           kill -HUP "$(cat /tmp/s3rs.pid)"
           for i in $(seq 50); do grep -q 'reloaded the TLS certificate' /tmp/s3rs.log && break; sleep 0.1; done
           test "$(serial)" = "$(openssl x509 -in /tmp/tls/leaf2.pem -noout -serial)"
+      - name: healthcheck subcommand over HTTPS
+        run: |
+          S3RS_LISTEN=127.0.0.1:9000 S3RS_TLS_CERT=/tmp/tls/leaf.pem ./target/release/s3rs healthcheck
+          ! ./target/release/s3rs healthcheck -l 127.0.0.1:9000
       - name: fsck after a graceful shutdown
         run: |
           kill -TERM "$(cat /tmp/s3rs.pid)"

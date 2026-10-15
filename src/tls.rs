@@ -124,6 +124,64 @@ mod imp {
         Ok(Arc::new(cfg))
     }
 
+    /// Accepts any server certificate (signatures are still checked). Only for `s3rs
+    /// healthcheck`, which probes the server on its own host, where the certificate's names
+    /// usually don't include the address it dials.
+    #[derive(Debug)]
+    struct AnyCert(Arc<CryptoProvider>);
+
+    impl rustls::client::danger::ServerCertVerifier for AnyCert {
+        fn verify_server_cert(
+            &self,
+            _end_entity: &CertificateDer<'_>,
+            _intermediates: &[CertificateDer<'_>],
+            _server_name: &ServerName<'_>,
+            _ocsp_response: &[u8],
+            _now: rustls_pki_types::UnixTime,
+        ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+            Ok(rustls::client::danger::ServerCertVerified::assertion())
+        }
+
+        fn verify_tls12_signature(
+            &self,
+            message: &[u8],
+            cert: &CertificateDer<'_>,
+            dss: &rustls::DigitallySignedStruct,
+        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            rustls::crypto::verify_tls12_signature(message, cert, dss, &self.0.signature_verification_algorithms)
+        }
+
+        fn verify_tls13_signature(
+            &self,
+            message: &[u8],
+            cert: &CertificateDer<'_>,
+            dss: &rustls::DigitallySignedStruct,
+        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            rustls::crypto::verify_tls13_signature(message, cert, dss, &self.0.signature_verification_algorithms)
+        }
+
+        fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+            self.0.signature_verification_algorithms.supported_schemes()
+        }
+    }
+
+    /// A blocking TLS client stream for `s3rs healthcheck` (see `AnyCert`).
+    pub fn probe_stream(
+        stream: std::net::TcpStream,
+    ) -> Result<rustls::StreamOwned<rustls::ClientConnection, std::net::TcpStream>, String> {
+        let provider = provider();
+        let mut cfg = ClientConfig::builder_with_provider(provider.clone())
+            .with_safe_default_protocol_versions()
+            .map_err(|e| e.to_string())?
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(AnyCert(provider)))
+            .with_no_client_auth();
+        cfg.alpn_protocols = vec![b"http/1.1".to_vec()];
+        let name = ServerName::try_from("localhost").map_err(|e| e.to_string())?;
+        let conn = rustls::ClientConnection::new(Arc::new(cfg), name).map_err(|e| e.to_string())?;
+        Ok(rustls::StreamOwned::new(conn, stream))
+    }
+
     /// Check that `host` (a DNS name or IP address, without brackets) can be verified by TLS.
     pub fn check_server_name(host: &str) -> Result<(), String> {
         ServerName::try_from(host).map(|_| ()).map_err(|e| format!("{host}: {e}"))
@@ -179,6 +237,10 @@ mod stub {
 
     pub fn check_server_name(_host: &str) -> Result<(), String> {
         Ok(())
+    }
+
+    pub fn probe_stream(_stream: std::net::TcpStream) -> Result<std::net::TcpStream, String> {
+        Err(UNSUPPORTED.into())
     }
 
     pub fn client_config(_extra_ca: Option<&Path>) -> Result<Arc<ClientConfig>, String> {

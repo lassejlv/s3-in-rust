@@ -40,7 +40,7 @@ use hyper::service::service_fn;
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use hyper_util::server::conn::auto;
 use std::convert::Infallible;
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -55,7 +55,10 @@ const USAGE: &str = "\
 s3rs - fast, lightweight S3-compatible object storage
 
 USAGE:
-    s3rs [OPTIONS]
+    s3rs [OPTIONS]               Run the server
+    s3rs fsck [--help]           Check a stopped server's data directory
+    s3rs backup [--help]         Archive a stopped server's data directory
+    s3rs healthcheck [--help]    Probe a running server (for container health checks)
 
 OPTIONS (each also settable through the environment variable shown):
     -l, --listen <ADDR>          Address to listen on            [S3RS_LISTEN, default 0.0.0.0:9000]
@@ -597,8 +600,91 @@ Checks a data directory while the server is stopped:
     std::process::exit(1);
 }
 
+/// `s3rs healthcheck [-l ADDR] [--tls]`: GET /_health from a server on this host, for container
+/// health checks (the images have no curl). Exits 0 when it answers `ok`.
+fn healthcheck(args: &[String]) -> ! {
+    use std::io::{Read, Write};
+    let mut listen = env("S3RS_LISTEN").unwrap_or_else(|| "0.0.0.0:9000".into());
+    let mut tls = env("S3RS_TLS_CERT").is_some();
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "-l" | "--listen" => match it.next() {
+                Some(v) => listen = v.clone(),
+                None => {
+                    elog!("{a} requires a value");
+                    std::process::exit(2);
+                }
+            },
+            "--tls" => tls = true,
+            "-h" | "--help" => {
+                println!(
+                    "usage: s3rs healthcheck [-l ADDR] [--tls]
+
+Asks the server listening on ADDR (default: S3RS_LISTEN; an unspecified address means this
+host) for /_health and exits 0 if it is healthy, 1 if not. Uses HTTPS when --tls is given or
+S3RS_TLS_CERT is set; the certificate is not verified."
+                );
+                std::process::exit(0);
+            }
+            other => {
+                elog!("unknown healthcheck argument: {other}");
+                std::process::exit(2);
+            }
+        }
+    }
+    let probe = || -> Result<String, String> {
+        let mut addr: SocketAddr = listen.parse().map_err(|e| format!("{listen}: {e}"))?;
+        if addr.ip().is_unspecified() {
+            addr.set_ip(if addr.is_ipv4() { Ipv4Addr::LOCALHOST.into() } else { Ipv6Addr::LOCALHOST.into() });
+        }
+        let timeout = Duration::from_secs(10);
+        let stream = std::net::TcpStream::connect_timeout(&addr, timeout).map_err(|e| format!("{addr}: {e}"))?;
+        stream.set_read_timeout(Some(timeout)).map_err(|e| e.to_string())?;
+        stream.set_write_timeout(Some(timeout)).map_err(|e| e.to_string())?;
+        let request = b"GET /_health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+        let mut response = Vec::new();
+        if tls {
+            let mut s = tls::probe_stream(stream)?;
+            s.write_all(request).map_err(|e| format!("{addr}: {e}"))?;
+            // A server that closes without close_notify still sent the whole response.
+            if let Err(e) = s.read_to_end(&mut response)
+                && e.kind() != std::io::ErrorKind::UnexpectedEof
+            {
+                return Err(format!("{addr}: {e}"));
+            }
+        } else {
+            let mut s = stream;
+            s.write_all(request).map_err(|e| format!("{addr}: {e}"))?;
+            s.read_to_end(&mut response).map_err(|e| format!("{addr}: {e}"))?;
+        }
+        let text = String::from_utf8_lossy(&response);
+        let status = text.split(' ').nth(1).unwrap_or("");
+        let body = text.split_once("\r\n\r\n").map(|(_, b)| b.trim()).unwrap_or("");
+        match (status, body) {
+            ("200", "ok") => Ok(body.to_string()),
+            ("", _) if !tls => Err(format!("{addr}: no HTTP response (if the server uses HTTPS, pass --tls)")),
+            ("", _) => Err(format!("{addr}: no HTTP response")),
+            _ => Err(format!("{addr}: {status} {body}")),
+        }
+    };
+    match probe() {
+        Ok(_) => {
+            println!("ok");
+            std::process::exit(0)
+        }
+        Err(e) => {
+            println!("unhealthy: {e}");
+            std::process::exit(1)
+        }
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().map(String::as_str) == Some("healthcheck") {
+        healthcheck(&args[1..]);
+    }
     if args.first().map(String::as_str) == Some("fsck") {
         fsck(&args[1..]);
     }

@@ -117,6 +117,10 @@ def scenario(label, extra, expect_ballast):
     filler = os.path.join(MOUNT, label + ".filler")
     if expect_ballast:
         fill_disk(filler)
+    # A full disk does not make the server unhealthy: it still serves reads and deletes.
+    health = urllib.request.urlopen(f"{ENDPOINT}/_health", timeout=10)
+    assert health.status == 200 and health.read() == b"ok\n", f"{label}: unhealthy on a full disk"
+    assert subprocess.run([BIN, "healthcheck", "-l", ENDPOINT.split("//")[1]], capture_output=True).returncode == 0
     # With the reserve, deletes always work. On a disk another process filled to the last byte,
     # the ballast lets deletes start; once that process's file is gone, all of them must work.
     deleted = 0

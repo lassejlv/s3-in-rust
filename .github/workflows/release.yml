@@ -57,6 +57,7 @@ jobs:
             pid=$!
             for i in $(seq 50); do curl -sf http://127.0.0.1:9000/_health && break; sleep 0.1; done
             curl -sf http://127.0.0.1:9000/_health
+            $b healthcheck -l 127.0.0.1:9000
             kill $pid && wait $pid || true
           done
       - name: Package

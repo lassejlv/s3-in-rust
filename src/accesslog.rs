@@ -201,7 +201,7 @@ fn json(e: &Entry) -> String {
     if let Some(n) = e.bytes_out {
         let _ = write!(s, ",\"bytes_out\":{n}");
     }
-    let _ = write!(s, ",\"duration_ms\":{:.3}}}\n", e.duration.as_secs_f64() * 1000.0);
+    let _ = writeln!(s, ",\"duration_ms\":{:.3}}}", e.duration.as_secs_f64() * 1000.0);
     s
 }
 

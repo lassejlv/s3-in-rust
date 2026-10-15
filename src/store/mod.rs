@@ -89,6 +89,10 @@ const PART_BYTES: TableDefinition<&str, u64> = TableDefinition::new("part_bytes"
 /// time in ms of the oldest change not yet replicated). Written in the same transaction as the
 /// change, so a crash never loses one; see crate::replication.
 const REPL: TableDefinition<&[u8], (u64, u64)> = TableDefinition::new("replication_queue");
+/// Replication keys that failed and wait to be retried: retry time (ms, big-endian) + queue key
+/// -> (sequence number, time of the oldest change not yet replicated). They go back to REPL when
+/// their time comes (Op::ReplRequeue).
+const REPL_WAIT: TableDefinition<&[u8], (u64, u64)> = TableDefinition::new("replication_wait");
 /// Access keys created through the admin API: access key -> record (see crate::keys).
 const KEYS: TableDefinition<&str, &[u8]> = TableDefinition::new("access_keys");
 const USAGE_VERSION: u64 = 2;
@@ -390,6 +394,8 @@ pub enum Op {
         bucket: String,
         items: Vec<(String, Option<String>)>,
         bypass: bool,
+        /// Made by replication from another server: not replicated again.
+        replica: bool,
     },
     CreateUpload {
         id: u128,
@@ -424,6 +430,8 @@ pub enum Op {
         key: String,
         version: Option<String>,
         tags: Vec<(String, String)>,
+        /// Made by replication from another server: not replicated again.
+        replica: bool,
     },
     /// Change a version's Object Lock retention (`Some(None)` removes it) and/or legal hold.
     SetObjectLock {
@@ -452,6 +460,20 @@ pub enum Op {
         bucket: String,
         key: String,
         seq: u64,
+    },
+    /// A replication attempt for a key failed: unless the key changed meanwhile, move it from the
+    /// queue to the waiting table until `retry_ms`.
+    ReplFailed {
+        bucket: String,
+        key: String,
+        seq: u64,
+        retry_ms: u64,
+    },
+    /// Move up to `limit` waiting keys whose retry time is before `before_ms` back to the queue.
+    /// Returns `OpOut::More(true)` while more are due.
+    ReplRequeue {
+        before_ms: u64,
+        limit: usize,
     },
     /// Queue up to `limit` existing objects of a bucket for replication, continuing from the
     /// bucket's "replication-backfill" cursor (empty: from the start) and advancing it, or
@@ -611,6 +633,7 @@ impl Store {
             txn.open_table(STATE)?;
             txn.open_table(PART_BYTES)?;
             txn.open_table(REPL)?;
+            txn.open_table(REPL_WAIT)?;
             txn.open_table(KEYS)?;
             txn.commit()?;
         }
@@ -804,10 +827,28 @@ impl Store {
         Ok(out)
     }
 
-    /// Number of keys waiting to be replicated.
+    /// Number of keys waiting to be replicated (queued, or waiting to be retried).
     pub fn repl_pending(&self) -> S3Result<u64> {
         use redb::ReadableTableMetadata;
-        Ok(self.db.get()?.begin_read()?.open_table(REPL)?.len()?)
+        let txn = self.db.get()?.begin_read()?;
+        Ok(txn.open_table(REPL)?.len()? + txn.open_table(REPL_WAIT)?.len()?)
+    }
+
+    /// Whether a waiting key's retry time is before `now_ms`.
+    pub fn repl_due(&self, now_ms: u64) -> S3Result<bool> {
+        let txn = self.db.get()?.begin_read()?;
+        let end = now_ms.to_be_bytes();
+        Ok(txn.open_table(REPL_WAIT)?.range::<&[u8]>(..end.as_slice())?.next().is_some())
+    }
+
+    /// The time of the oldest change waiting to be retried (0: none).
+    pub fn repl_wait_oldest(&self) -> S3Result<u64> {
+        let txn = self.db.get()?.begin_read()?;
+        let mut oldest = u64::MAX;
+        for e in txn.open_table(REPL_WAIT)?.iter()? {
+            oldest = oldest.min(e?.1.value().1);
+        }
+        Ok(if oldest == u64::MAX { 0 } else { oldest })
     }
 
     /// Buckets whose replication backfill (queuing existing objects) has not finished.
@@ -1607,6 +1648,7 @@ fn run_batch(
             usage: txn.open_table(USAGE)?,
             part_bytes: txn.open_table(PART_BYTES)?,
             repl: txn.open_table(REPL)?,
+            repl_wait: txn.open_table(REPL_WAIT)?,
             keys: txn.open_table(KEYS)?,
         };
         // Replication rule prefixes per bucket, looked up once per batch.
@@ -1619,6 +1661,7 @@ fn run_batch(
             let r = apply(&mut tx, op, &mut garbage, last_seq);
             if r.is_ok()
                 && let Some((bucket, keys)) = touched
+                && !matches!(&r, Ok(OpOut::Object(m)) if is_replica(&m.headers))
             {
                 *queued |= repl_enqueue(&mut tx, &bucket, &keys)?;
             }
@@ -1674,6 +1717,7 @@ struct Tables<'t> {
     usage: redb::Table<'t, &'static str, (u64, u64)>,
     part_bytes: redb::Table<'t, &'static str, u64>,
     repl: redb::Table<'t, &'static [u8], (u64, u64)>,
+    repl_wait: redb::Table<'t, &'static [u8], (u64, u64)>,
     keys: redb::Table<'t, &'static str, &'static [u8]>,
 }
 
@@ -2151,6 +2195,13 @@ fn bucket_has_versions(tx: &Tables, bucket: &str) -> S3Result<bool> {
     Ok(tx.versions.range::<&[u8]>(lo.as_slice()..hi.as_slice())?.next().is_some())
 }
 
+/// The stored header that marks an object written by replication from another server.
+pub const REPLICA_HEADER: &str = "x-amz-replication-status";
+
+pub fn is_replica(headers: &[(String, String)]) -> bool {
+    headers.iter().any(|(k, v)| k == REPLICA_HEADER && v == "REPLICA")
+}
+
 /// Sequence numbers for replication queue entries: increasing, also across restarts.
 fn next_repl_seq() -> u64 {
     static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -2169,12 +2220,18 @@ fn repl_insert(tx: &mut Tables, bucket: &str, key: &str, now: u64) -> S3Result<(
 /// The bucket and keys an operation may change, if the bucket replicates any of them. Ops that
 /// change a bucket's configuration drop its cached rules.
 fn repl_touched(tx: &mut Tables, rules: &mut HashMap<String, Vec<String>>, op: &Op) -> S3Result<Option<(String, Vec<String>)>> {
+    // Changes made by replication from another server are not replicated again, deletes of
+    // specific versions are not replicated (as in S3), and neither are lifecycle expirations
+    // (each side applies its own lifecycle rules).
     let (bucket, keys): (&str, Vec<&str>) = match op {
+        Op::PutObject { meta, .. } if is_replica(&meta.headers) => return Ok(None),
+        Op::SetObjectTags { replica: true, .. } | Op::DeleteObjects { replica: true, .. } => return Ok(None),
         Op::PutObject { bucket, key, .. } | Op::Complete { bucket, key, .. } | Op::SetObjectTags { bucket, key, .. } => {
             (bucket, vec![key.as_str()])
         }
-        Op::DeleteObjects { bucket, items, .. } => (bucket, items.iter().map(|(k, _)| k.as_str()).collect()),
-        Op::Expire { bucket, items } => (bucket, items.iter().map(|(k, _)| k.as_str()).collect()),
+        Op::DeleteObjects { bucket, items, .. } => {
+            (bucket, items.iter().filter(|(_, v)| v.is_none()).map(|(k, _)| k.as_str()).collect())
+        }
         Op::SetBucketConfig { bucket, .. } | Op::DeleteBucket(bucket) => {
             rules.remove(bucket.as_str());
             return Ok(None);
@@ -2223,6 +2280,40 @@ fn apply(tx: &mut Tables, op: Op, garbage: &mut Vec<u128>, last_seq: &mut u64) -
                 tx.repl.remove(k.as_slice())?;
             }
             Ok(OpOut::Done)
+        }
+        Op::ReplFailed { bucket, key, seq, retry_ms } => {
+            let k = obj_key(&bucket, &key);
+            let current = tx.repl.get(k.as_slice())?.map(|v| v.value());
+            if let Some((cur, since)) = current
+                && cur == seq
+            {
+                tx.repl.remove(k.as_slice())?;
+                let mut w = retry_ms.to_be_bytes().to_vec();
+                w.extend_from_slice(&k);
+                tx.repl_wait.insert(w.as_slice(), (seq, since))?;
+            }
+            Ok(OpOut::Done)
+        }
+        Op::ReplRequeue { before_ms, limit } => {
+            let end = before_ms.to_be_bytes();
+            let mut due = Vec::new();
+            for e in tx.repl_wait.range::<&[u8]>(..end.as_slice())?.take(limit + 1) {
+                let (k, v) = e?;
+                due.push((k.value().to_vec(), v.value()));
+            }
+            let more = due.len() > limit;
+            due.truncate(limit);
+            for (w, (seq, since)) in due {
+                tx.repl_wait.remove(w.as_slice())?;
+                let k = &w[8..];
+                // A newer change re-queued the key already; keep the older start time.
+                let merged = match tx.repl.get(k)?.map(|v| v.value()) {
+                    Some((cur, s)) => (cur, s.min(since)),
+                    None => (seq, since),
+                };
+                tx.repl.insert(k, merged)?;
+            }
+            Ok(OpOut::More(more))
         }
         Op::ReplBackfill { bucket, limit } => {
             let Some(cursor) = tx.config.get((bucket.as_str(), "replication-backfill"))?.map(|v| v.value().to_vec()) else {
@@ -2296,6 +2387,9 @@ fn apply(tx: &mut Tables, op: Op, garbage: &mut Vec<u128>, last_seq: &mut u64) -
             tx.usage.remove(name.as_str())?;
             tx.part_bytes.remove(name.as_str())?;
             tx.buckets.remove(name.as_str())?;
+            let prefix = obj_key(&name, "");
+            let end = prefix_successor(&prefix).expect("bucket prefix ends with 0");
+            tx.repl.retain_in::<&[u8], _>(prefix.as_slice()..end.as_slice(), |_, _| false)?;
             Ok(OpOut::Done)
         }
         Op::PutObject { bucket, key, meta, inline, cond } => {
@@ -2327,7 +2421,7 @@ fn apply(tx: &mut Tables, op: Op, garbage: &mut Vec<u128>, last_seq: &mut u64) -
             }
             Ok(OpOut::Removed(out))
         }
-        Op::DeleteObjects { bucket, items, bypass } => {
+        Op::DeleteObjects { bucket, items, bypass, .. } => {
             if tx.buckets.get(bucket.as_str())?.is_none() {
                 return Err(err::NoSuchBucket());
             }
@@ -2414,7 +2508,7 @@ fn apply(tx: &mut Tables, op: Op, garbage: &mut Vec<u128>, last_seq: &mut u64) -
             };
             Ok(OpOut::Done)
         }
-        Op::SetObjectTags { bucket, key, version, tags } => {
+        Op::SetObjectTags { bucket, key, version, tags, .. } => {
             update_version(tx, &bucket, &key, version.as_deref(), |meta| {
                 meta.tags = tags;
                 Ok(())
@@ -2631,7 +2725,10 @@ mod tests {
     }
 
     async fn delete_version(store: &Store, vid: &str, bypass: bool) -> S3Result<DeleteOutcome> {
-        match store.submit(Op::DeleteObjects { bucket: "b".into(), items: vec![("k".into(), Some(vid.into()))], bypass }).await {
+        match store
+            .submit(Op::DeleteObjects { bucket: "b".into(), items: vec![("k".into(), Some(vid.into()))], bypass, replica: false })
+            .await
+        {
             Ok(OpOut::Deleted(mut r)) => r.pop().unwrap(),
             Ok(_) => unreachable!(),
             Err(e) => Err(e),
@@ -2684,8 +2781,10 @@ mod tests {
         assert!(delete_version(&store, &v2, false).await.is_err());
         assert!(delete_version(&store, &v2, true).await.is_ok());
         // Deleting without a version id only adds a delete marker.
-        let OpOut::Deleted(r) =
-            store.submit(Op::DeleteObjects { bucket: "b".into(), items: vec![("k".into(), None)], bypass: false }).await.unwrap()
+        let OpOut::Deleted(r) = store
+            .submit(Op::DeleteObjects { bucket: "b".into(), items: vec![("k".into(), None)], bypass: false, replica: false })
+            .await
+            .unwrap()
         else {
             unreachable!()
         };
@@ -2709,6 +2808,7 @@ mod tests {
             bucket: "b".into(),
             items: vec![(key.into(), version)],
             bypass: false,
+            replica: false,
         };
         store.submit(del("b", None)).await.unwrap();
         assert_eq!(usage(&store), (1, 1));
@@ -2885,8 +2985,10 @@ mod tests {
         }
 
         // Delete marker, then removing it restores the object.
-        let OpOut::Deleted(r) =
-            store.submit(Op::DeleteObjects { bucket: "b".into(), items: vec![("k".into(), None)], bypass: false }).await.unwrap()
+        let OpOut::Deleted(r) = store
+            .submit(Op::DeleteObjects { bucket: "b".into(), items: vec![("k".into(), None)], bypass: false, replica: false })
+            .await
+            .unwrap()
         else {
             unreachable!()
         };
@@ -2895,14 +2997,24 @@ mod tests {
         assert_eq!(e.code, "NoSuchKey");
         assert!(e.headers.iter().any(|(h, v)| *h == "x-amz-delete-marker" && v == "true"));
         store
-            .submit(Op::DeleteObjects { bucket: "b".into(), items: vec![("k".into(), Some(marker))], bypass: false })
+            .submit(Op::DeleteObjects {
+                bucket: "b".into(),
+                items: vec![("k".into(), Some(marker))],
+                bypass: false,
+                replica: false,
+            })
             .await
             .unwrap();
         assert_eq!(store.get_object("b", "k").unwrap().1.unwrap(), "v4");
 
         // Deleting the current version by id promotes the previous one.
         store
-            .submit(Op::DeleteObjects { bucket: "b".into(), items: vec![("k".into(), Some(ids[4].clone()))], bypass: false })
+            .submit(Op::DeleteObjects {
+                bucket: "b".into(),
+                items: vec![("k".into(), Some(ids[4].clone()))],
+                bypass: false,
+                replica: false,
+            })
             .await
             .unwrap();
         let (m, d) = store.get_object("b", "k").unwrap();

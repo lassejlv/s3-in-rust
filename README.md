@@ -641,6 +641,8 @@ aws s3api put-bucket-replication --bucket photos --replication-configuration '{
   - SSE-C objects are skipped: the server never has their key.
 - **Deletes** are replicated only with `DeleteMarkerReplication` enabled. That isn't possible in
   rules with tag filters.
+  - Not replicated, as in S3: deletes of specific versions, and lifecycle expirations (each
+    server applies its own lifecycle rules).
 - **Existing objects** are copied when `ExistingObjectReplication` is enabled. The copy runs in the
   background and resumes after a restart.
 - **Rules** filter by prefix and/or tags. Each destination gets the state of the highest-priority
@@ -648,6 +650,14 @@ aws s3api put-bucket-replication --bucket photos --replication-configuration '{
 - **Versioned buckets:** the current version of each key is replicated, not its history.
   Versioning is not required.
 - **Object Lock** settings are not replicated.
+- **Replicas:** writes made by replication carry `x-amz-replication-status: REPLICA`, are stored
+  with it, and are never replicated onwards. Two servers can therefore replicate to each other.
+  Each one sends only its own clients' changes, so neither ever overwrites newer data with an
+  older copy.
+  - The destination honors the marker only for keys allowed the `s3:ReplicateObject`,
+    `s3:ReplicateDelete` and `s3:ReplicateTags` actions.
+  - Keys without a policy have them for the buckets they can use. Keys with a policy need them
+    granted explicitly.
 
 **How it works.** Every change to a replicated key is recorded in a queue in the metadata
 database, in the same transaction as the change itself, so no change is lost to a crash or a
@@ -657,9 +667,11 @@ have it.
 - **Unchanged objects:** a destination that already holds an identical object (same ETag,
   metadata and tags) is not sent it again. This also lets two servers replicate to each other
   without bouncing changes back and forth.
-- **Retries:** failed keys are retried with exponential backoff (up to 5 minutes). A target that
-  stops answering is probed every few seconds, and when it comes back the whole backlog is sent
-  at once.
+- **Retries:** a key that fails is set aside and retried after a delay that grows with how long
+  it has been waiting (up to 5 minutes). Failing keys don't hold up anything else, even
+  thousands of them. A target that stops answering is probed every few seconds, and when it comes
+  back the whole backlog is sent at once.
+- **Several destinations:** if one fails, the others still get the change.
 
 **Monitoring.** `s3rs_replication_pending` counts queued keys, and `s3rs_replication_lag_seconds`
 is the age of the oldest change not yet replicated. `s3rs_replication_total{result}` counts keys

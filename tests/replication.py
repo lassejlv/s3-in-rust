@@ -16,7 +16,7 @@ Server A replicates bucket `src` to bucket `dst` on server B (and, at the end, B
 - `s3rs fsck --deep` passes on both servers.
 """
 
-import hashlib
+import atexit
 import os
 import random
 import shutil
@@ -40,12 +40,15 @@ with open(f"{work}/master.key", "w") as f:
     f.write(master)
 rng = random.Random(3)
 procs = {}
+# Don't leave servers behind when a check fails.
+atexit.register(lambda: [p.kill() for p in procs.values()])
 
 
 def targets(name, port):
     path = f"{work}/{name}.targets"
     with open(path, "w") as f:
-        f.write(f"# test target\n{name} http://127.0.0.1:{port} {KEY} {SECRET}\n")
+        # `dead` never answers (nothing listens on port 9).
+        f.write(f"# test target\n{name} http://127.0.0.1:{port} {KEY} {SECRET}\ndead http://127.0.0.1:9 {KEY} {SECRET}\n")
     return path
 
 
@@ -259,7 +262,10 @@ targets("a", PORT_A)
 stop("b")
 start("b")
 b.put_bucket_replication(Bucket="dst", ReplicationConfiguration=config("arn:s3rs:replication::a:src", existing=False))
-a.put_object(Bucket="src", Key="ping", Body=b"from a")
+# boto3 refuses non-ASCII metadata (S3 accepts it as UTF-8); other clients send it.
+from botocore.handlers import validate_ascii_metadata
+a.meta.events.unregister("before-parameter-build.s3.PutObject", validate_ascii_metadata)
+a.put_object(Bucket="src", Key="ping", Body=b"from a", Metadata={"author": "José"})
 b.put_object(Bucket="dst", Key="pong", Body=b"from b")
 wait_for(lambda: not absent(b, "dst", "ping") and not absent(a, "src", "pong"), "two-way replication")
 wait_for(lambda: metric(PORT_A, "s3rs_replication_pending") == 0 and metric(PORT_B, "s3rs_replication_pending") == 0,
@@ -270,7 +276,41 @@ time.sleep(3)
 assert counts == (metric(PORT_A, 's3rs_replication_total{result="replicated"}'),
                   metric(PORT_B, 's3rs_replication_total{result="replicated"}')), "two-way replication keeps going"
 same(a, b, "src", "dst", "multi")
-print("two-way replication settles (no ping-pong)")
+assert b.head_object(Bucket="dst", Key="ping")["ResponseMetadata"]["HTTPHeaders"]["x-amz-replication-status"] == "REPLICA"
+print("two-way replication settles (no ping-pong, also with non-ASCII metadata)")
+
+# Two-way replication never brings back older data: while B is away, A overwrites and deletes;
+# when B is back, both sides have A's latest state.
+a.put_object(Bucket="src", Key="doc", Body=b"v1")
+a.put_object(Bucket="src", Key="gone", Body=b"x")
+wait_for(lambda: not absent(b, "dst", "doc") and not absent(b, "dst", "gone"), "replicated before the partition")
+stop("b")
+a.put_object(Bucket="src", Key="doc", Body=b"v2")
+a.delete_object(Bucket="src", Key="gone")
+start("b")
+wait_for(lambda: b.get_object(Bucket="dst", Key="doc")["Body"].read() == b"v2" and absent(b, "dst", "gone"),
+         "the latest state reached B", timeout=60)
+wait_for(lambda: metric(PORT_A, "s3rs_replication_pending") == 0 and metric(PORT_B, "s3rs_replication_pending") == 0,
+         "both queues drained")
+assert a.get_object(Bucket="src", Key="doc")["Body"].read() == b"v2" and absent(a, "src", "gone")
+print("two-way replication after a partition keeps the latest writes and deletes")
+
+# A destination that is down doesn't hold up the other destinations of a key, or other buckets.
+a.create_bucket(Bucket="fanout")
+b.create_bucket(Bucket="fanout-copy")
+fan = config("arn:s3rs:replication::dead:fanout", existing=False, rule_id="dead")
+fan["Rules"].append({"ID": "live", "Status": "Enabled", "Priority": 2, "Filter": {"Prefix": ""},
+                     "DeleteMarkerReplication": {"Status": "Disabled"},
+                     "Destination": {"Bucket": "arn:s3rs:replication::b:fanout-copy"}})
+a.put_bucket_replication(Bucket="fanout", ReplicationConfiguration=fan)
+for i in range(20):
+    a.put_object(Bucket="fanout", Key=f"f{i}", Body=b"x")
+a.put_object(Bucket="src", Key="after-fanout", Body=b"y")
+wait_for(lambda: all(not absent(b, "fanout-copy", f"f{i}") for i in range(20)), "the live destination got everything")
+wait_for(lambda: not absent(b, "dst", "after-fanout"), "other buckets keep replicating")
+assert metric(PORT_A, "s3rs_replication_pending") >= 20, "keys for the dead destination should stay queued"
+a.delete_bucket_replication(Bucket="fanout")
+print("a dead destination doesn't block the others")
 
 stop("a")
 stop("b")

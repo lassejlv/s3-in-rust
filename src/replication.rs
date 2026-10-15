@@ -25,7 +25,7 @@ use crate::xml;
 use bytes::Bytes;
 use http_body_util::BodyExt;
 use hyper::client::conn::http1::SendRequest;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Mutex, RwLock};
@@ -38,12 +38,10 @@ const CONCURRENCY: usize = 16;
 /// Queue entries read per scan.
 const PAGE: usize = 256;
 const MAX_BACKOFF: Duration = Duration::from_secs(300);
-/// Keys waiting to be retried at most; beyond that, a pass over the queue ends early so a long
-/// outage doesn't hold an entry per queued key in memory.
-const MAX_RETRIES: usize = 10_000;
 /// After a target refused or dropped a connection, keys for it fail at once for this long.
 const TARGET_DOWN: Duration = Duration::from_secs(5);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 const EMPTY_SHA256: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 
 // ------------------------------------------------------------------ configuration
@@ -195,7 +193,9 @@ pub fn destinations<'a>(rules: &'a [Rule], key: &str, tags: Option<&[(String, St
     for r in rules {
         let matches = match tags {
             Some(t) => r.covers(key, t),
-            None => r.covers_key(key),
+            // A key that no longer exists has no tags: rules with tag filters (which can't
+            // replicate deletes) don't apply to it.
+            None => r.covers_key(key) && r.tags.is_empty(),
         };
         if !matches {
             continue;
@@ -283,7 +283,8 @@ fn sign(
     for (k, v) in headers.iter() {
         canonical.push_str(k);
         canonical.push(':');
-        canonical.push_str(v.trim());
+        // SigV4 trims values and collapses runs of spaces inside them.
+        canonical.push_str(&v.split_whitespace().collect::<Vec<_>>().join(" "));
         canonical.push('\n');
     }
     let signed = headers.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>().join(";");
@@ -396,22 +397,8 @@ pub struct Stats {
     /// Objects that can't be replicated (SSE-C: the server doesn't have the key).
     pub skipped: AtomicU64,
     pub bytes: AtomicU64,
-    /// Keys waiting, and the time (ms) of the oldest change not yet replicated (0: none).
-    pub pending: AtomicU64,
+    /// The time (ms) of the oldest change not yet replicated (0: none).
     pub oldest_ms: AtomicU64,
-}
-
-enum Claim {
-    Yes,
-    No,
-    /// Too many keys are being retried.
-    Full,
-}
-
-struct Retry {
-    busy: bool,
-    attempts: u32,
-    at: Instant,
 }
 
 pub struct Replicator {
@@ -421,11 +408,31 @@ pub struct Replicator {
     master: Option<WrapKey>,
     pub stats: Arc<Stats>,
     pools: Mutex<HashMap<String, Arc<Pool>>>,
-    /// Keys being replicated or waiting to be retried.
-    retries: Mutex<HashMap<Vec<u8>, Retry>>,
-    /// Targets that could not be reached, until when.
+    /// Keys being replicated right now.
+    busy: Arc<Mutex<HashSet<Vec<u8>>>>,
+    /// Targets that could not be reached: requests to them fail at once until then.
     down: Mutex<HashMap<String, Instant>>,
+    /// Targets being probed.
+    probing: Mutex<HashSet<String>>,
     last_warning: Mutex<Option<Instant>>,
+}
+
+/// Releases a key's busy mark however its replication ends (also if the task panics).
+struct Busy {
+    set: Arc<Mutex<HashSet<Vec<u8>>>>,
+    raw: Vec<u8>,
+}
+
+impl Drop for Busy {
+    fn drop(&mut self) {
+        self.set.lock().unwrap().remove(&self.raw);
+    }
+}
+
+/// How long a failed key waits before the next attempt: a quarter of the time its oldest
+/// change has been waiting, from 1 s up to 5 minutes.
+fn retry_delay(since_ms: u64, now_ms: u64) -> Duration {
+    Duration::from_millis(now_ms.saturating_sub(since_ms) / 4).clamp(Duration::from_secs(1), MAX_BACKOFF)
 }
 
 impl Replicator {
@@ -442,8 +449,9 @@ impl Replicator {
             master,
             stats: Arc::new(Stats::default()),
             pools: Mutex::new(HashMap::new()),
-            retries: Mutex::new(HashMap::new()),
+            busy: Arc::new(Mutex::new(HashSet::new())),
             down: Mutex::new(HashMap::new()),
+            probing: Mutex::new(HashSet::new()),
             last_warning: Mutex::new(None),
         });
         r.set_targets(targets);
@@ -451,10 +459,22 @@ impl Replicator {
     }
 
     /// Replace the targets (on SIGHUP); open connections to changed targets are dropped.
-    pub fn set_targets(&self, targets: Vec<Target>) {
+    /// https:// targets need TLS support in the build.
+    pub fn replace_targets(&self, targets: Vec<Target>) -> Result<(), String> {
+        if self.tls.is_none()
+            && let Some(t) = targets.iter().find(|t| t.url.tls)
+        {
+            return Err(format!("target {} uses https://, which needs a build with --features tls", t.id));
+        }
+        self.set_targets(targets);
+        Ok(())
+    }
+
+    fn set_targets(&self, targets: Vec<Target>) {
         let map: HashMap<String, Arc<Target>> = targets.into_iter().map(|t| (t.id.clone(), Arc::new(t))).collect();
         *self.targets.write().unwrap() = Arc::new(map);
         self.pools.lock().unwrap().clear();
+        self.down.lock().unwrap().clear();
     }
 
     pub fn target_ids(&self) -> Vec<String> {
@@ -483,13 +503,19 @@ impl Replicator {
     /// Queue a bucket's existing objects (after a configuration with ExistingObjectReplication
     /// was set, or at startup when that was interrupted).
     pub async fn backfill(store: Arc<Store>, bucket: String) {
+        let mut failures = 0;
         loop {
             match store.submit(Op::ReplBackfill { bucket: bucket.clone(), limit: 1000 }).await {
-                Ok(OpOut::More(true)) => continue,
+                Ok(OpOut::More(true)) => failures = 0,
                 Ok(_) => return,
                 Err(e) => {
+                    failures += 1;
                     elog!("replication: queuing the existing objects of {bucket} failed: {}", e.message);
-                    return;
+                    if failures >= 10 {
+                        elog!("replication: giving up on queuing the existing objects of {bucket} until the next start");
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_secs(5)).await;
                 }
             }
         }
@@ -507,7 +533,10 @@ impl Replicator {
         }
         let permits = Arc::new(Semaphore::new(CONCURRENCY));
         let mut cursor: Option<Vec<u8>> = None;
-        let (mut seen, mut oldest, mut started) = (0u64, u64::MAX, 0usize);
+        let (mut oldest, mut started) = (u64::MAX, 0usize);
+        // The oldest change among keys waiting to be retried, refreshed now and then (it
+        // takes a scan of the waiting table).
+        let (mut wait_oldest, mut wait_checked) = (0u64, None::<Instant>);
         loop {
             if *stop.borrow() {
                 return;
@@ -524,12 +553,27 @@ impl Replicator {
                 Err(_) => return,
             };
             if page.is_empty() {
-                // End of a pass over the queue.
-                self.stats.pending.store(seen, Relaxed);
-                self.stats.oldest_ms.store(if seen > 0 { oldest } else { 0 }, Relaxed);
+                // End of a pass: bring back the keys whose retry time has come, update the lag.
+                self.requeue(util::now_ms()).await;
+                if wait_checked.is_none_or(|t: Instant| t.elapsed() >= Duration::from_secs(30)) {
+                    let store = self.store.clone();
+                    wait_oldest = tokio::task::spawn_blocking(move || store.repl_wait_oldest())
+                        .await
+                        .ok()
+                        .and_then(Result::ok)
+                        .unwrap_or(0);
+                    wait_checked = Some(Instant::now());
+                }
+                let queued = if oldest == u64::MAX { 0 } else { oldest };
+                let lag = match (queued, wait_oldest) {
+                    (0, w) => w,
+                    (q, 0) => q,
+                    (q, w) => q.min(w),
+                };
+                self.stats.oldest_ms.store(lag, Relaxed);
                 let idle = started == 0;
-                (cursor, seen, oldest, started) = (None, 0, u64::MAX, 0);
-                self.probe().await;
+                (cursor, oldest, started) = (None, u64::MAX, 0);
+                self.spawn_probes();
                 if idle {
                     tokio::select! {
                         _ = self.store.repl_wake.notified() => {}
@@ -540,18 +584,9 @@ impl Replicator {
                 continue;
             }
             cursor = page.last().map(|e| e.raw.clone());
-            let mut full = false;
             for e in page {
-                seen += 1;
                 oldest = oldest.min(e.since_ms);
-                match self.claim(&e.raw) {
-                    Claim::Yes => {}
-                    Claim::No => continue,
-                    Claim::Full => {
-                        full = true;
-                        break;
-                    }
-                }
+                let Some(busy) = self.claim(&e.raw) else { continue };
                 started += 1;
                 let permit = tokio::select! {
                     p = permits.clone().acquire_owned() => p.expect("semaphore is never closed"),
@@ -560,19 +595,26 @@ impl Replicator {
                 let this = self.clone();
                 tokio::spawn(async move {
                     this.process(e).await;
+                    drop(busy);
                     drop(permit);
                 });
             }
-            if full {
-                // Too many keys are waiting to be retried: start over (the queue is scanned
-                // from the beginning, where those keys are) after a pause.
-                let lag_floor = self.stats.oldest_ms.load(Relaxed);
-                self.stats.oldest_ms.store(if lag_floor == 0 { oldest } else { lag_floor.min(oldest) }, Relaxed);
-                (cursor, seen, oldest, started) = (None, 0, u64::MAX, 0);
-                self.probe().await;
-                tokio::select! {
-                    _ = tokio::time::sleep(Duration::from_secs(1)) => {}
-                    _ = stop.changed() => return,
+        }
+    }
+
+    /// Move waiting keys whose retry time is before `before_ms` back to the queue.
+    async fn requeue(&self, before_ms: u64) {
+        let store = self.store.clone();
+        if !tokio::task::spawn_blocking(move || store.repl_due(before_ms)).await.ok().and_then(Result::ok).unwrap_or(false) {
+            return;
+        }
+        loop {
+            match self.store.submit(Op::ReplRequeue { before_ms, limit: 1000 }).await {
+                Ok(OpOut::More(true)) => continue,
+                Ok(_) => return,
+                Err(e) => {
+                    self.warn(&format!("updating the queue failed: {}", e.message));
+                    return;
                 }
             }
         }
@@ -580,88 +622,87 @@ impl Replicator {
 
     /// A target that was unreachable answered again: retry every waiting key now instead of
     /// when its backoff ends.
-    fn recovered(&self, id: &str) {
+    async fn recovered(&self, id: &str) {
         if self.down.lock().unwrap().remove(id).is_some() {
-            let now = Instant::now();
-            for retry in self.retries.lock().unwrap().values_mut() {
-                retry.at = retry.at.min(now);
-            }
-            self.store.repl_wake.notify_one();
             elog!("replication: target {id} is reachable again");
+            self.requeue(u64::MAX).await;
+            self.store.repl_wake.notify_one();
         }
     }
 
-    /// Try to connect to each unreachable target whose wait is over, so a target that comes
-    /// back is noticed within seconds, however long the keys waiting for it back off.
-    async fn probe(&self) {
-        let due: Vec<String> = {
-            let now = Instant::now();
-            self.down.lock().unwrap().iter().filter(|(_, until)| **until <= now).map(|(id, _)| id.clone()).collect()
-        };
+    /// Probe each unreachable target whose wait is over (in the background, so a target that
+    /// drops packets doesn't hold up the others), so one that comes back is noticed within
+    /// seconds, however long the keys waiting for it back off.
+    fn spawn_probes(self: &Arc<Self>) {
+        let now = Instant::now();
+        let due: Vec<String> =
+            self.down.lock().unwrap().iter().filter(|(_, until)| **until <= now).map(|(id, _)| id.clone()).collect();
         for id in due {
-            let Some(t) = self.target(&id) else {
-                self.down.lock().unwrap().remove(&id);
+            if !self.probing.lock().unwrap().insert(id.clone()) {
                 continue;
-            };
-            let conn = tokio::time::timeout(CONNECT_TIMEOUT, crate::events::connect::<Body>(&t.url, self.tls.as_ref())).await;
-            match conn {
-                Ok(Ok(c)) => {
-                    self.pools.lock().unwrap().entry(id.clone()).or_default().0.lock().unwrap().push(c);
-                    self.recovered(&id);
-                }
-                _ => {
-                    self.down.lock().unwrap().insert(id, Instant::now() + TARGET_DOWN);
-                }
             }
+            let this = self.clone();
+            tokio::spawn(async move {
+                match this.target(&id) {
+                    None => {
+                        this.down.lock().unwrap().remove(&id);
+                    }
+                    Some(t) => {
+                        let conn =
+                            tokio::time::timeout(PROBE_TIMEOUT, crate::events::connect::<Body>(&t.url, this.tls.as_ref())).await;
+                        match conn {
+                            Ok(Ok(c)) => {
+                                this.pools.lock().unwrap().entry(id.clone()).or_default().0.lock().unwrap().push(c);
+                                this.recovered(&id).await;
+                            }
+                            _ => {
+                                this.down.lock().unwrap().insert(id.clone(), Instant::now() + TARGET_DOWN);
+                            }
+                        }
+                    }
+                }
+                this.probing.lock().unwrap().remove(&id);
+            });
         }
     }
 
-    /// Mark a key as being replicated, unless it already is or is waiting to be retried.
-    fn claim(&self, raw: &[u8]) -> Claim {
-        let mut retries = self.retries.lock().unwrap();
-        let full = retries.len() >= MAX_RETRIES;
-        match retries.get_mut(raw) {
-            Some(r) if r.busy || r.at > Instant::now() => Claim::No,
-            Some(r) => {
-                r.busy = true;
-                Claim::Yes
-            }
-            None if full => Claim::Full,
-            None => {
-                retries.insert(raw.to_vec(), Retry { busy: true, attempts: 0, at: Instant::now() });
-                Claim::Yes
-            }
-        }
+    /// Mark a key as being replicated, unless it already is.
+    fn claim(&self, raw: &[u8]) -> Option<Busy> {
+        self.busy.lock().unwrap().insert(raw.to_vec()).then(|| Busy { set: self.busy.clone(), raw: raw.to_vec() })
     }
 
     async fn process(&self, e: ReplEntry) {
         match self.replicate(&e.bucket, &e.key).await {
             Ok(()) => {
-                self.retries.lock().unwrap().remove(&e.raw);
                 if let Err(err) = self.store.submit(Op::ReplDone { bucket: e.bucket, key: e.key, seq: e.seq }).await {
                     self.warn(&format!("updating the queue failed: {}", err.message));
                 }
             }
             Err(msg) => {
                 self.stats.failed.fetch_add(1, Relaxed);
-                let mut retries = self.retries.lock().unwrap();
-                let r = retries.entry(e.raw).or_insert(Retry { busy: false, attempts: 0, at: Instant::now() });
-                r.attempts += 1;
-                let delay = Duration::from_secs(1u64 << r.attempts.min(9)).min(MAX_BACKOFF);
-                r.busy = false;
-                r.at = Instant::now() + delay;
-                drop(retries);
+                let now = util::now_ms();
+                let delay = retry_delay(e.since_ms, now);
                 self.warn(&format!("{}/{}: {msg} (retrying in {}s)", e.bucket, e.key, delay.as_secs()));
+                let op = Op::ReplFailed { bucket: e.bucket, key: e.key, seq: e.seq, retry_ms: now + delay.as_millis() as u64 };
+                if let Err(err) = self.store.submit(op).await {
+                    self.warn(&format!("updating the queue failed: {}", err.message));
+                }
             }
         }
     }
 
-    /// Bring every destination of a key up to date with its current state.
+    /// Bring every destination of a key up to date with its current state. A destination that
+    /// fails doesn't stop the others; the key is retried (destinations that are up to date are
+    /// then left alone).
     async fn replicate(&self, bucket: &str, key: &str) -> Result<(), String> {
         let store = self.store.clone();
         let (b, k) = (bucket.to_string(), key.to_string());
         let (config, object) = tokio::task::spawn_blocking(move || {
-            let config = store.bucket_config(&b, "replication")?;
+            let config = match store.bucket_config(&b, "replication") {
+                Ok(c) => c,
+                Err(e) if e.code == "NoSuchBucket" => None,
+                Err(e) => return Err(e),
+            };
             let object = match store.get_object(&b, &k) {
                 Ok(o) => Some(o),
                 Err(e) if matches!(e.code, "NoSuchKey" | "NoSuchBucket") => None,
@@ -672,24 +713,38 @@ impl Replicator {
         .await
         .map_err(|e| e.to_string())?
         .map_err(|e| e.message)?;
-        // No configuration (any more): nothing to do, the entry is dropped.
+        // No configuration (any more), or the bucket is gone: the entry is dropped.
         let Some(config) = config else { return Ok(()) };
+        // Objects that are themselves replicas (from another server) are not passed on.
+        if object.as_ref().is_some_and(|(m, _)| crate::store::is_replica(&m.headers)) {
+            return Ok(());
+        }
         let rules = load(&config);
+        let mut first_error = None;
         for rule in destinations(&rules, key, object.as_ref().map(|(m, _)| m.tags.as_slice())) {
-            let target = self.target(&rule.target).ok_or_else(|| format!("unknown replication target {}", rule.target))?;
-            match &object {
-                Some((meta, inline)) => self.put(&target, &rule.bucket, key, meta, inline.clone()).await?,
-                None if rule.delete_markers => {
-                    let r = self.send(&target, Request::new(hyper::Method::DELETE, &rule.bucket, Some(key)), None).await?;
-                    if !matches!(r.status, 200 | 204 | 404) {
-                        return Err(format!("{}: DELETE {}/{key}: {}", target.id, rule.bucket, r.describe()));
+            let result = async {
+                let target = self.target(&rule.target).ok_or_else(|| format!("unknown replication target {}", rule.target))?;
+                match &object {
+                    Some((meta, inline)) => self.put(&target, &rule.bucket, key, meta, inline.clone()).await,
+                    None if rule.delete_markers => {
+                        let mut req = Request::new(hyper::Method::DELETE, &rule.bucket, Some(key));
+                        req.headers.push(replica_header());
+                        let r = self.send(&target, req, None).await?;
+                        if !matches!(r.status, 200 | 204 | 404) {
+                            return Err(format!("{}: DELETE {}/{key}: {}", target.id, rule.bucket, r.describe()));
+                        }
+                        self.stats.replicated.fetch_add(1, Relaxed);
+                        Ok(())
                     }
-                    self.stats.replicated.fetch_add(1, Relaxed);
+                    None => Ok(()),
                 }
-                None => {}
+            }
+            .await;
+            if let Err(e) = result {
+                first_error.get_or_insert(e);
             }
         }
-        Ok(())
+        first_error.map_or(Ok(()), Err)
     }
 
     async fn put(&self, t: &Target, bucket: &str, key: &str, meta: &ObjectMeta, inline: Option<Bytes>) -> Result<(), String> {
@@ -727,6 +782,7 @@ impl Replicator {
         if sse {
             headers.push(("x-amz-server-side-encryption".into(), "AES256".into()));
         }
+        headers.push(replica_header());
         let parts: Vec<u64> = match &meta.storage {
             Storage::Segments(s) if meta.etag.contains('-') => s.iter().map(|(_, l)| *l).collect(),
             _ => Vec::new(),
@@ -805,8 +861,9 @@ impl Replicator {
         }
         .await;
         if result.is_err() {
+            // Even when the target was just marked unreachable: an abandoned upload costs storage.
             let abort = Request::new(hyper::Method::DELETE, bucket, Some(key)).query(&[("uploadId", &upload_id)]);
-            let _ = self.send(t, abort, None).await;
+            let _ = self.send_once(t, abort, None).await;
         }
         result
     }
@@ -827,13 +884,14 @@ impl Replicator {
             self.stats.unchanged.fetch_add(1, Relaxed);
             return Ok(());
         }
-        let req = if local.is_empty() {
+        let mut req = if local.is_empty() {
             Request::new(hyper::Method::DELETE, bucket, Some(key)).query(&[("tagging", "")])
         } else {
             Request::new(hyper::Method::PUT, bucket, Some(key))
                 .query(&[("tagging", "")])
                 .bytes(crate::access::tagging_xml(&meta.tags))
         };
+        req.headers.push(replica_header());
         let r = self.send(t, req, None).await?;
         if !matches!(r.status, 200 | 204) {
             return Err(format!("{}: tagging {bucket}/{key}: {}", t.id, r.describe()));
@@ -869,7 +927,7 @@ impl Replicator {
             Err(SendError::Connect(_)) => {
                 self.down.lock().unwrap().insert(t.id.clone(), Instant::now() + TARGET_DOWN);
             }
-            Ok(_) => self.recovered(&t.id),
+            Ok(_) => self.recovered(&t.id).await,
             _ => {}
         }
         r.map_err(|e| match e {
@@ -912,8 +970,9 @@ impl Replicator {
         }
         builder = builder.header("user-agent", concat!("s3rs/", env!("CARGO_PKG_VERSION"), " replication"));
         let request = builder.body(req.body).map_err(|e| SendError::Request(e.to_string()))?;
-        // Uploads get time to transfer at 1 MiB/s on top of a fixed allowance.
-        let timeout = Duration::from_secs(60 + len.unwrap_or(0) / (1 << 20));
+        // Uploads get time to transfer at 256 KiB/s on top of a fixed allowance (a stalled
+        // transfer is cut off sooner, after 120 s without progress, by the body reader).
+        let timeout = Duration::from_secs(300 + len.unwrap_or(0) / (256 << 10));
         let response = async {
             let resp = conn.send_request(request).await.map_err(|e| e.to_string())?;
             let status = resp.status().as_u16();
@@ -936,6 +995,11 @@ enum SendError {
     /// The target could not be reached.
     Connect(String),
     Request(String),
+}
+
+/// Marks writes made by replication, so the destination doesn't replicate them back.
+fn replica_header() -> (String, String) {
+    (crate::store::REPLICA_HEADER.to_string(), "REPLICA".to_string())
 }
 
 /// The stored headers that travel with an object.
@@ -965,7 +1029,9 @@ fn same_object(meta: &ObjectMeta, head: &Response) -> bool {
     {
         return false;
     }
-    let local = |name: &str| meta.headers.iter().find(|(k, _)| k == name).map(|(_, v)| v.as_str());
+    // Header values are compared as stored: decoded leniently (non-ASCII metadata included).
+    let local = |name: &str| meta.headers.iter().find(|(k, _)| k == name).map(|(_, v)| v.clone());
+    let remote = |name: &str| head.headers.get(name).map(|v| String::from_utf8_lossy(v.as_bytes()).into_owned());
     for name in [
         "content-disposition",
         "content-language",
@@ -974,21 +1040,20 @@ fn same_object(meta: &ObjectMeta, head: &Response) -> bool {
         "expires",
         "x-amz-website-redirect-location",
     ] {
-        if local(name) != head.header(name) {
+        if local(name) != remote(name) {
             return false;
         }
     }
     // Servers answer a default content type for objects stored without one.
-    if local("content-type").is_some_and(|c| Some(c) != head.header("content-type")) {
+    if local("content-type").is_some_and(|c| Some(c) != remote("content-type")) {
         return false;
     }
-    let mut mine: Vec<(&str, &str)> =
-        meta.headers.iter().filter(|(k, _)| k.starts_with("x-amz-meta-")).map(|(k, v)| (k.as_str(), v.as_str())).collect();
-    let mut theirs: Vec<(&str, &str)> = head
+    let mut mine: Vec<(String, String)> = meta.headers.iter().filter(|(k, _)| k.starts_with("x-amz-meta-")).cloned().collect();
+    let mut theirs: Vec<(String, String)> = head
         .headers
         .iter()
         .filter(|(k, _)| k.as_str().starts_with("x-amz-meta-"))
-        .filter_map(|(k, v)| Some((k.as_str(), v.to_str().ok()?)))
+        .map(|(k, v)| (k.as_str().to_string(), String::from_utf8_lossy(v.as_bytes()).into_owned()))
         .collect();
     mine.sort();
     theirs.sort();
@@ -1096,7 +1161,7 @@ mod tests {
         assert_eq!(ids("x", Some(&[])), ["all"]);
         assert_eq!(ids("logs/1", Some(&[])), ["logs", "other"]);
         assert_eq!(ids("logs/1", Some(&[("env".into(), "prod".into())])), ["tagged", "other"]);
-        assert_eq!(ids("logs/1", None), ["tagged", "other"]);
+        assert_eq!(ids("logs/1", None), ["logs", "other"]);
     }
 
     #[test]
@@ -1133,7 +1198,11 @@ mod tests {
         }]);
         let q = query(&[("uploadId", "a b/c"), ("partNumber", "3")]);
         let path = format!("/bkt/{}", uri_encode("dir/ä €+x", true));
-        let mut headers = vec![("host".to_string(), t.url.host_header()), ("x-amz-meta-a".to_string(), " v ".to_string())];
+        let mut headers = vec![
+            ("host".to_string(), t.url.host_header()),
+            ("x-amz-meta-a".to_string(), " v ".to_string()),
+            ("content-disposition".to_string(), "attachment;  filename=\"a   b\"".to_string()),
+        ];
         sign(&t, "PUT", &path, &q, &mut headers, "UNSIGNED-PAYLOAD", util::now_ms() / 1000);
         let mut req = hyper::Request::builder().method("PUT").uri(format!("{path}?{q}"));
         for (k, v) in &headers {

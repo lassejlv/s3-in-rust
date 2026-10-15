@@ -110,6 +110,9 @@ struct Req {
     auth_type: &'static str,
     /// Request id (also sent as `x-amz-request-id`).
     rid: String,
+    /// A write made by replication from another server (`x-amz-replication-status: REPLICA`,
+    /// authorized with the s3:Replicate* actions): not replicated again.
+    replica: bool,
 }
 
 /// Where a request came from.
@@ -307,7 +310,12 @@ fn stored_headers(h: &HeaderMap) -> S3Result<Vec<(String, String)>> {
             "content-type" | "content-disposition" | "content-language" | "cache-control" | "expires" | WEBSITE_REDIRECT
         ) || n.starts_with("x-amz-meta-");
         let v = String::from_utf8_lossy(value.as_bytes()).into_owned();
-        if keep {
+        if n == store::REPLICA_HEADER {
+            // Only accepted from replication (the router checks the permission).
+            if v.eq_ignore_ascii_case("REPLICA") {
+                out.push((n.to_string(), "REPLICA".to_string()));
+            }
+        } else if keep {
             out.push((n.to_string(), v));
         } else if n == "content-encoding" {
             let enc: Vec<&str> = v.split(',').map(str::trim).filter(|e| !e.is_empty() && *e != "aws-chunked").collect();
@@ -889,6 +897,7 @@ impl Server {
             client: Client { ip: ctx.source_ip, secure: ctx.secure },
             auth_type: "REST-HEADER",
             rid: String::new(),
+            replica: false,
         };
         let mut r = self.get_object(&req, bucket, key, head).await?;
         // Objects that need a customer key cannot be served to anonymous visitors anyway; and
@@ -1168,7 +1177,7 @@ impl Server {
         let body = BodyStream::new(body, &mut payload);
         let auth_type = if r_has_auth_header(&parts) { "REST-HEADER" } else { "REST-QUERY-STRING" };
         let client = self.client(&parts.headers, peer);
-        let mut r = Req { parts, query, payload, body, principal, client, auth_type, rid: rid.to_string() };
+        let mut r = Req { parts, query, payload, body, principal, client, auth_type, rid: rid.to_string(), replica: false };
         let m = r.parts.method.clone();
         // One classification decides both what is authorized and what runs.
         let op = match (&bucket, &key) {
@@ -1176,6 +1185,7 @@ impl Server {
             (Some(_), None) => Some(Err(ops::classify_bucket(&m, &r.query)?)),
             (Some(_), Some(_)) => Some(Ok(ops::classify_object(&m, &r.query, r.header("x-amz-copy-source").is_some())?)),
         };
+        let mut replica = false;
         {
             let ctx = self.req_ctx(&r);
             let (b, k) = (bucket.as_deref(), key.as_deref());
@@ -1195,6 +1205,29 @@ impl Server {
                 let read = if versioned { "s3:GetObjectVersion" } else { "s3:GetObject" };
                 self.authorize(&r.principal, read, b, k, &ctx)?;
             }
+            // Writes from replication (another server) need the replication permissions; they are
+            // marked so they are not replicated back.
+            if r.header(store::REPLICA_HEADER).is_some_and(|v| v.eq_ignore_ascii_case("REPLICA")) {
+                let action = match op {
+                    Some(Ok(o))
+                        if o.creates_object()
+                            || matches!(
+                                o,
+                                ObjectOp::UploadPart
+                                    | ObjectOp::UploadPartCopy
+                                    | ObjectOp::CompleteUpload
+                                    | ObjectOp::AbortUpload
+                            ) =>
+                    {
+                        "s3:ReplicateObject"
+                    }
+                    Some(Ok(ObjectOp::Delete)) => "s3:ReplicateDelete",
+                    Some(Ok(ObjectOp::PutTagging | ObjectOp::DeleteTagging)) => "s3:ReplicateTags",
+                    _ => return Err(err::InvalidRequest().with_message("x-amz-replication-status can't be set on this request")),
+                };
+                self.authorize(&r.principal, action, b, k, &ctx)?;
+                replica = true;
+            }
             // Uploads that set retention, a legal hold or tags also need those permissions.
             if matches!(op, Some(Ok(oop)) if oop.creates_object()) {
                 let h = &r.parts.headers;
@@ -1209,6 +1242,7 @@ impl Server {
                 }
             }
         }
+        r.replica = replica;
 
         let Some(bucket) = bucket else {
             return match m {
@@ -1612,7 +1646,13 @@ impl Server {
                 let doc = self.read_xml(r).await?;
                 let tags = access::parse_tagging_xml(&doc, 10)?;
                 self.store
-                    .submit(Op::SetObjectTags { bucket: bucket.into(), key: key.into(), version: version.clone(), tags })
+                    .submit(Op::SetObjectTags {
+                        bucket: bucket.into(),
+                        key: key.into(),
+                        version: version.clone(),
+                        tags,
+                        replica: r.replica,
+                    })
                     .await?;
                 let mut resp = Resp::ok();
                 if let Some(v) = &version {
@@ -1665,7 +1705,13 @@ impl Server {
             }
             ObjectOp::DeleteTagging => {
                 self.store
-                    .submit(Op::SetObjectTags { bucket: bucket.into(), key: key.into(), version: version.clone(), tags: vec![] })
+                    .submit(Op::SetObjectTags {
+                        bucket: bucket.into(),
+                        key: key.into(),
+                        version: version.clone(),
+                        tags: vec![],
+                        replica: r.replica,
+                    })
                     .await?;
                 Ok(Resp::new(StatusCode::NO_CONTENT))
             }
@@ -1676,6 +1722,7 @@ impl Server {
                         bucket: bucket.into(),
                         items: vec![(key.into(), version.clone())],
                         bypass: self.bypass_governance(r, bucket, key),
+                        replica: r.replica,
                     })
                     .await?
                 else {
@@ -2952,7 +2999,7 @@ impl Server {
                 .iter()
                 .all(|(k, _)| self.authorize(&r.principal, "s3:BypassGovernanceRetention", Some(bucket), Some(k), &ctx).is_ok());
         let OpOut::Deleted(results) =
-            self.store.submit(Op::DeleteObjects { bucket: bucket.into(), items: valid.clone(), bypass }).await?
+            self.store.submit(Op::DeleteObjects { bucket: bucket.into(), items: valid.clone(), bypass, replica: false }).await?
         else {
             return Err(S3Error::internal("unexpected writer reply"));
         };
@@ -3031,7 +3078,7 @@ fn etag_of(md5: [u8; 16], key: Option<&WrapKey>) -> String {
 
 /// Stored headers a copy takes over from its source (not encryption or Object Lock state).
 fn inheritable(h: &[(String, String)]) -> Vec<(String, String)> {
-    h.iter().filter(|(k, _)| !k.starts_with(SSE) && !lock::is_lock_header(k)).cloned().collect()
+    h.iter().filter(|(k, _)| !k.starts_with(SSE) && !lock::is_lock_header(k) && k != store::REPLICA_HEADER).cloned().collect()
 }
 
 fn r_has_auth_header(parts: &Parts) -> bool {

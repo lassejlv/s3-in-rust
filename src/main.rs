@@ -881,13 +881,16 @@ async fn serve(
         },
         None => Vec::new(),
     };
-    let repl_tls = if replication::Replicator::needs_tls(&repl_targets) || cfg.webhook_ca.is_some() {
+    // Also without https:// targets now: SIGHUP may add some.
+    let repl_tls = if cfg.replication_targets.is_some() {
         match tls::client_config(cfg.webhook_ca.as_deref()) {
             Ok(c) => Some(c),
-            Err(e) => {
+            Err(e) if replication::Replicator::needs_tls(&repl_targets) || cfg.webhook_ca.is_some() => {
                 elog!("error: replication targets: {e}");
                 std::process::exit(2);
             }
+            // A build without TLS: http:// targets only.
+            Err(_) => None,
         }
     } else {
         None
@@ -1020,11 +1023,12 @@ async fn serve(
                     }
                 }
                 if let Some(p) = &cfg.replication_targets {
-                    match replication::load_targets(p) {
-                        Ok(t) => {
-                            elog!("reloaded {} replication target(s)", t.len());
-                            server.replication.set_targets(t);
-                        }
+                    let n = replication::load_targets(p).and_then(|t| {
+                        let n = t.len();
+                        server.replication.replace_targets(t).map(|_| n)
+                    });
+                    match n {
+                        Ok(n) => elog!("reloaded {n} replication target(s)"),
                         Err(e) => elog!("REPLICATION TARGETS RELOAD FAILED, still using the previous ones: {e}"),
                     }
                 }

@@ -67,6 +67,7 @@ First release.
 
 **Testing**
 - Unit tests, including AWS SigV4 test vectors and parser fuzzing.
-- Compatibility suites: boto3, aws-cli, minio-go and a Playwright console test, all also over HTTPS.
+- Compatibility suites: boto3, aws-cli, minio-go, rclone and a Playwright console test (most
+  also over HTTPS).
 - A SIGKILL crash-consistency test, a disk-full test, a backup/restore test, an upgrade test
   (data written by older builds), a two-server replication test and HTTP-level fuzzing, all in CI.

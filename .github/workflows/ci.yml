@@ -169,6 +169,11 @@ jobs:
         run: python3 tests/publicblock.py ./target/release/s3rs
       - name: per-bucket metrics test
         run: python3 tests/metrics.py ./target/release/s3rs
+      - name: rclone compatibility
+        run: |
+          curl -fsSL -o /tmp/rclone.zip https://github.com/rclone/rclone/releases/download/v1.71.1/rclone-v1.71.1-linux-amd64.zip
+          unzip -q -o /tmp/rclone.zip -d /tmp
+          python3 tests/rclone.py ./target/release/s3rs /tmp/rclone-v1.71.1-linux-amd64/rclone
       - name: HTTP fuzzing (mutated requests; no 500s, no panics)
         run: python3 tests/fuzz_http.py ./target/release/s3rs 20000
       - name: disk full (100 MB tmpfs)

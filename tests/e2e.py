@@ -564,6 +564,27 @@ def t_public_access_block():
         s3.delete_bucket(Bucket=b)
 
 
+def t_policy_object_tags():
+    import json
+    tb = B + "-tags"
+    s3.create_bucket(Bucket=tb)
+    s3.put_object(Bucket=tb, Key="open", Body=b"o", Tagging="class=public")
+    s3.put_object(Bucket=tb, Key="closed", Body=b"c", Tagging="class=secret")
+    s3.put_bucket_policy(Bucket=tb, Policy=json.dumps({"Version": "2012-10-17", "Statement": [
+        {"Effect": "Deny", "Principal": "*", "Action": "s3:GetObject", "Resource": f"arn:aws:s3:::{tb}/*",
+         "Condition": {"StringEquals": {"s3:ExistingObjectTag/class": "secret"}}},
+        {"Effect": "Deny", "Principal": "*", "Action": "s3:PutObject", "Resource": f"arn:aws:s3:::{tb}/*",
+         "Condition": {"StringNotEquals": {"s3:RequestObjectTag/class": ["public", "secret"]}}}]}))
+    assert s3.get_object(Bucket=tb, Key="open")["Body"].read() == b"o"
+    expect_error("AccessDenied", lambda: s3.get_object(Bucket=tb, Key="closed"))
+    expect_error("AccessDenied", lambda: s3.put_object(Bucket=tb, Key="untagged", Body=b"x"))
+    s3.put_object(Bucket=tb, Key="tagged", Body=b"x", Tagging="class=public")
+    s3.delete_bucket_policy(Bucket=tb)
+    for k in ("open", "closed", "tagged"):
+        s3.delete_object(Bucket=tb, Key=k)
+    s3.delete_bucket(Bucket=tb)
+
+
 def t_bucket_policy():
     import json
     expect_error("NoSuchBucketPolicy", lambda: s3.get_bucket_policy(Bucket=B))

@@ -903,10 +903,14 @@ S3RS_ACCESS_KEY=testkey S3RS_SECRET_KEY=testsecret python3 tests/e2e.py
 
 # MinIO Go SDK (exercises signed aws-chunked uploads)
 cd tests/minio-go && S3RS_ACCESS_KEY=testkey S3RS_SECRET_KEY=testsecret go run .
+
+# AWS SDK for JavaScript v3 (default CRC32 checksums, lib-storage multipart, presigned URLs)
+npm install --no-save @aws-sdk/client-s3 @aws-sdk/lib-storage @aws-sdk/s3-request-presigner
+S3RS_ACCESS_KEY=testkey S3RS_SECRET_KEY=testsecret node tests/js-sdk.mjs
 ```
 
 CI (`.github/workflows/ci.yml`) runs fmt, clippy, the unit tests, the boto3 suite, an AWS CLI sync
-round-trip, the minio-go suite, an rclone suite (`tests/rclone.py`: sync, multipart, checks,
+round-trip, the minio-go suite, the AWS SDK for JavaScript (`tests/js-sdk.mjs`), an rclone suite (`tests/rclone.py`: sync, multipart, checks,
 server-side copies, versions), a restic backup/check/restore/prune cycle (`tests/restic.py`), a container registry storing
 images in s3rs (`tests/registry.py`) and a Playwright test of the web console (`tests/console.js`) on
 every push. It also runs two durability tests:

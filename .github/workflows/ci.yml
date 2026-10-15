@@ -126,6 +126,8 @@ jobs:
           kill -TERM "$(cat /tmp/s3rs.pid)"
           while kill -0 "$(cat /tmp/s3rs.pid)" 2>/dev/null; do sleep 0.2; done
           ./target/release/s3rs fsck -d /tmp/s3rs-data --deep --encryption-key-file /tmp/s3rs.key
+      - name: crash consistency (SIGKILL under concurrent writes)
+        run: python3 tests/crash.py ./target/release/s3rs 8
       - name: Server log
         if: always()
         run: cat /tmp/s3rs.log

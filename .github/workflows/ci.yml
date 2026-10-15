@@ -179,6 +179,11 @@ jobs:
           curl -fsSL https://github.com/restic/restic/releases/download/v0.18.1/restic_0.18.1_linux_amd64.bz2 | bunzip2 > /tmp/restic
           chmod +x /tmp/restic
           python3 tests/restic.py ./target/release/s3rs /tmp/restic
+      - name: container registry (distribution) on s3rs
+        run: |
+          curl -fsSL https://github.com/distribution/distribution/releases/download/v3.0.0/registry_3.0.0_linux_amd64.tar.gz | tar -xz -C /tmp registry
+          curl -fsSL https://github.com/google/go-containerregistry/releases/download/v0.20.6/go-containerregistry_Linux_x86_64.tar.gz | tar -xz -C /tmp crane
+          python3 tests/registry.py ./target/release/s3rs /tmp/registry /tmp/crane
       - name: HTTP fuzzing (mutated requests; no 500s, no panics)
         run: python3 tests/fuzz_http.py ./target/release/s3rs 20000
       - name: disk full (100 MB tmpfs)

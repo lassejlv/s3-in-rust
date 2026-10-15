@@ -904,7 +904,8 @@ cd tests/minio-go && S3RS_ACCESS_KEY=testkey S3RS_SECRET_KEY=testsecret go run .
 
 CI (`.github/workflows/ci.yml`) runs fmt, clippy, the unit tests, the boto3 suite, an AWS CLI sync
 round-trip, the minio-go suite, an rclone suite (`tests/rclone.py`: sync, multipart, checks,
-server-side copies, versions), a restic backup/check/restore/prune cycle (`tests/restic.py`) and a Playwright test of the web console (`tests/console.js`) on
+server-side copies, versions), a restic backup/check/restore/prune cycle (`tests/restic.py`), a container registry storing
+images in s3rs (`tests/registry.py`) and a Playwright test of the web console (`tests/console.js`) on
 every push. It also runs two durability tests:
 - `tests/crash.py` SIGKILLs the server repeatedly during concurrent writes. It checks that every
   acknowledged write survives and that `fsck --deep` passes afterwards.

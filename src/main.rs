@@ -10,6 +10,8 @@ mod console;
 mod crypt;
 mod error;
 mod events;
+#[cfg(test)]
+mod fuzz;
 mod iam;
 mod io;
 mod lifecycle;

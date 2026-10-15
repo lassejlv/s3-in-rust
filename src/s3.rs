@@ -121,7 +121,7 @@ fn header<'a>(h: &'a HeaderMap, name: &str) -> Option<&'a str> {
     h.get(name).and_then(|v| v.to_str().ok())
 }
 
-fn parse_query(raw: &str) -> Vec<(String, String)> {
+pub(crate) fn parse_query(raw: &str) -> Vec<(String, String)> {
     raw.split('&')
         .filter(|s| !s.is_empty())
         .map(|pair| {
@@ -236,7 +236,7 @@ fn check_copy_conditions(h: &HeaderMap, meta: &ObjectMeta) -> S3Result<()> {
 }
 
 /// Parse a single `bytes=` range. `None` means "ignore and serve everything".
-fn parse_range(spec: &str, size: u64) -> Option<S3Result<(u64, u64)>> {
+pub(crate) fn parse_range(spec: &str, size: u64) -> Option<S3Result<(u64, u64)>> {
     let spec = spec.trim().strip_prefix("bytes=")?;
     if spec.contains(',') {
         return None;

@@ -233,7 +233,8 @@ pub fn decrypt_range(wrap: &WrapKey, blob: &[u8], start: u64, len: u64, total: u
     let cipher = open_header(blob, wrap)?;
     let (first, off, span) = cipher_span(start, len, total);
     let mut buf = blob.get(off as usize..(off + span) as usize).ok_or_else(|| crypto_err("truncated object"))?.to_vec();
-    let mut out = Vec::with_capacity(len as usize);
+    // `len` comes from metadata; never reserve more than the blob could hold.
+    let mut out = Vec::with_capacity(len.min(blob.len() as u64) as usize);
     decrypt_span(&cipher, first, &mut buf, start, len, total, &mut out)?;
     Ok(out)
 }

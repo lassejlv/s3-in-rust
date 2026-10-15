@@ -233,7 +233,8 @@ impl ObjectMeta {
             0 => Storage::Inline(r.u128()?),
             1 => {
                 let n = r.u32()? as usize;
-                let mut segs = Vec::with_capacity(n);
+                // A corrupt count must not turn into a huge allocation: each entry is 24 bytes.
+                let mut segs = Vec::with_capacity(n.min(r.0.len() / 24));
                 for _ in 0..n {
                     segs.push((r.u128()?, r.u64()?));
                 }

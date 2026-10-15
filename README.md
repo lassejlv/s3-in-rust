@@ -716,6 +716,15 @@ every push. It also runs two durability tests:
   acknowledged write survives and that `fsck --deep` passes afterwards.
 - `tests/diskfull.py` fills a small filesystem through the server (see [Disk space](#disk-space)).
 
+Two fuzzers run as well:
+- `cargo test` mutates valid seed inputs for every parser that sees client input or on-disk
+  records: XML configurations, policies and JSON, POST policies, aws-chunked bodies, SigV4/SigV2
+  headers, ranges, dates, query strings and metadata records. None may panic or abort.
+  `S3RS_FUZZ_ITERS=1000000 cargo test --release fuzz` runs longer.
+- `tests/fuzz_http.py` sends mutated requests over raw sockets to a server running with
+  `--anonymous`, so they reach every handler. It covers odd methods, paths and encodings, every
+  subresource, hostile headers and mutated bodies, and fails on any 500 or panic.
+
 A second job builds with `--features tls` and runs the boto3 and minio-go suites over
 HTTPS, with an `https://` webhook, using a throwaway CA from `tests/tls/gen-certs.sh`.
 

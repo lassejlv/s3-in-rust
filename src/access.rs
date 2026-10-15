@@ -737,6 +737,7 @@ mod tests {
             query: &[],
             auth_type: "REST-HEADER",
             now: 0,
+            object_tags: None,
         };
         let mut a = BucketAccess { acl: CannedAcl::PublicRead, ..Default::default() };
         assert!(a.allows_anonymous("s3:GetObject", "arn:aws:s3:::b/x", &ctx));

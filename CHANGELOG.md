@@ -38,7 +38,8 @@ First release.
 - Conditional deletes (`If-Match`, size and last-modified conditions, also per key in
   DeleteObjects), `If-None-Match` with an ETag on writes, and paginated ListBuckets.
 - Bucket policies accept the ARN condition operators (`ArnLike`, `ArnEquals`, ...), so the
-  policies S3 documents for log delivery can be used as they are.
+  policies S3 documents for log delivery can be used as they are, and the object tag condition
+  keys `s3:ExistingObjectTag/<tag>` and `s3:RequestObjectTag/<tag>`.
 - Authentication: SigV4 (headers, presigned URLs, streaming and trailers) and SigV2.
 
 **Access control**

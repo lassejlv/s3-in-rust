@@ -253,6 +253,20 @@ pub struct Ctx<'a> {
     pub auth_type: &'static str,
     /// Unix seconds.
     pub now: u64,
+    /// Loads the tags of the object the request is about, for `s3:ExistingObjectTag/<key>`
+    /// (only called when a policy uses that key).
+    pub object_tags: Option<&'a TagLoader<'a>>,
+}
+
+/// Reads an object's tags (`None` if it doesn't exist).
+pub type TagLoader<'a> = dyn Fn() -> Option<Vec<(String, String)>> + Send + Sync + 'a;
+
+/// Condition key prefixes followed by a tag key.
+const TAG_KEY_PREFIXES: [&str; 2] = ["s3:existingobjecttag/", "s3:requestobjecttag/"];
+
+fn known_key(key: &str) -> bool {
+    let k = key.to_ascii_lowercase();
+    KNOWN_KEYS.contains(&k.as_str()) || TAG_KEY_PREFIXES.iter().any(|p| k.len() > p.len() && k.starts_with(p))
 }
 
 /// Condition keys (lowercase) that requests can provide; policies using others are rejected,
@@ -278,6 +292,7 @@ const KNOWN_KEYS: &[&str] = &[
     "s3:versionid",
     "s3:x-amz-acl",
     "s3:x-amz-server-side-encryption",
+    "s3:x-amz-server-side-encryption-customer-algorithm",
     "s3:x-amz-copy-source",
     "s3:x-amz-metadata-directive",
     "s3:x-amz-storage-class",
@@ -310,6 +325,17 @@ impl Ctx<'_> {
             "s3:x-amz-acl" => header("x-amz-acl"),
             "s3:x-amz-server-side-encryption" => header("x-amz-server-side-encryption"),
             "s3:x-amz-copy-source" => header("x-amz-copy-source"),
+            "s3:x-amz-server-side-encryption-customer-algorithm" => header("x-amz-server-side-encryption-customer-algorithm"),
+            _ if k.starts_with("s3:existingobjecttag/") => {
+                let tag = &key["s3:ExistingObjectTag/".len()..];
+                let tags = (self.object_tags?)()?;
+                tags.into_iter().find(|(t, _)| t == tag).map(|(_, v)| vec![v])
+            }
+            _ if k.starts_with("s3:requestobjecttag/") => {
+                let tag = &key["s3:RequestObjectTag/".len()..];
+                let header = self.headers.get("x-amz-tagging").and_then(|v| v.to_str().ok())?;
+                crate::access::parse_tagging_header(header).ok()?.into_iter().find(|(t, _)| t == tag).map(|(_, v)| vec![v])
+            }
             "s3:x-amz-metadata-directive" => header("x-amz-metadata-directive"),
             "s3:x-amz-storage-class" => header("x-amz-storage-class"),
             "s3:object-lock-mode" => header("x-amz-object-lock-mode"),
@@ -554,7 +580,7 @@ fn parse_conditions(c: &Json) -> S3Result<Vec<Condition>> {
         let op = Op::parse(base).ok_or_else(|| malformed(format!("Unknown condition operator {name}")))?;
         let Json::Obj(keys) = body else { return Err(malformed(format!("Invalid condition block {name}"))) };
         for (key, vals) in keys {
-            if !KNOWN_KEYS.contains(&key.to_ascii_lowercase().as_str()) {
+            if !known_key(key) {
                 return Err(malformed(format!("Unsupported condition key {key}")));
             }
             let values = strings(vals).filter(|v| !v.is_empty()).ok_or_else(|| malformed(format!("Invalid values for {key}")))?;
@@ -650,6 +676,7 @@ mod tests {
             query,
             auth_type: "REST-HEADER",
             now: 1_800_000_000,
+            object_tags: None,
         }
     }
 
@@ -780,7 +807,8 @@ mod tests {
         let c = ctx(Some("u"), "1.2.3.4", &h, &[]);
         let bucket = |doc: &str| Policy::parse(doc, Kind::Bucket, Some("b"));
         // Unknown condition keys and malformed CIDRs are rejected, not silently ignored.
-        assert!(bucket(r#"{"Statement":{"Effect":"Deny","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::b/*","Condition":{"StringEquals":{"s3:ExistingObjectTag/class":"secret"}}}}"#).is_err());
+        assert!(bucket(r#"{"Statement":{"Effect":"Deny","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::b/*","Condition":{"StringEquals":{"s3:NoSuchKey":"secret"}}}}"#).is_err());
+        assert!(bucket(r#"{"Statement":{"Effect":"Deny","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::b/*","Condition":{"StringEquals":{"s3:ExistingObjectTag/":"x"}}}}"#).is_err());
         assert!(bucket(r#"{"Statement":{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::b/*","Condition":{"IpAddress":{"aws:SourceIp":"10.0.0.0/abc"}}}}"#).is_err());
         assert!(bucket(r#"{"Statement":{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::b/*","Condition":{"IpAddress":{"aws:SourceIp":"10.0.0.0/33"}}}}"#).is_err());
         // ${*} is a literal '*', and substituted values never act as wildcards.
@@ -837,6 +865,33 @@ mod tests {
             Decision::NotApplicable
         );
         assert_eq!(arn("ArnEquals", "arn:aws:s3:::site").evaluate("s3:GetObject", "arn:aws:s3:::b/x", &c), Decision::Allow);
+    }
+
+    #[test]
+    fn object_tag_conditions() {
+        let p = Policy::parse(
+            r#"{"Statement":[
+                {"Effect":"Deny","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::b/*",
+                 "Condition":{"StringEquals":{"s3:ExistingObjectTag/class":"secret"}}},
+                {"Effect":"Deny","Principal":"*","Action":"s3:PutObject","Resource":"arn:aws:s3:::b/*",
+                 "Condition":{"StringNotEquals":{"s3:RequestObjectTag/team":"a"}}}]}"#,
+            Kind::Bucket,
+            Some("b"),
+        )
+        .unwrap();
+        let mut h = HeaderMap::new();
+        let mut c = ctx(Some("u"), "1.2.3.4", &h, &[]);
+        let secret = || Some(vec![("class".to_string(), "secret".to_string())]);
+        let public = || Some(vec![("class".to_string(), "public".to_string())]);
+        c.object_tags = Some(&secret);
+        assert_eq!(p.evaluate("s3:GetObject", "arn:aws:s3:::b/x", &c), Decision::Deny);
+        c.object_tags = Some(&public);
+        assert_eq!(p.evaluate("s3:GetObject", "arn:aws:s3:::b/x", &c), Decision::NotApplicable);
+        // A PUT without the right tag is refused; with it, it isn't.
+        assert_eq!(p.evaluate("s3:PutObject", "arn:aws:s3:::b/x", &c), Decision::Deny);
+        h.insert("x-amz-tagging", "team=a&x=1".parse().unwrap());
+        let c = ctx(Some("u"), "1.2.3.4", &h, &[]);
+        assert_eq!(p.evaluate("s3:PutObject", "arn:aws:s3:::b/x", &c), Decision::NotApplicable);
     }
 
     #[test]

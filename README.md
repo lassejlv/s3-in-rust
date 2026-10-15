@@ -365,13 +365,16 @@ Every request is checked against its IAM action, such as `s3:GetObject`, `s3:Get
 Supported policy elements:
 - `Effect`, `Principal` / `NotPrincipal` (bucket policies), `Action` / `NotAction`,
   `Resource` / `NotResource`, and `Condition`.
-- Condition operators: `String*` (including `Like` and `IgnoreCase`), `Numeric*`, `Date*`, `Bool`,
-  `IpAddress` / `NotIpAddress` and `Null`, plus `...IfExists` and `ForAnyValue:` / `ForAllValues:`.
+- Condition operators: `String*` (including `Like` and `IgnoreCase`), `Arn*`, `Numeric*`, `Date*`,
+  `Bool`, `IpAddress` / `NotIpAddress` and `Null`, plus `...IfExists` and `ForAnyValue:` /
+  `ForAllValues:`.
 - Condition keys: `aws:SourceIp`, `aws:SecureTransport`, `aws:username`, `aws:userid`,
   `aws:PrincipalType`, `aws:UserAgent`, `aws:Referer`, `aws:CurrentTime`, `aws:EpochTime`,
   `s3:prefix`, `s3:delimiter`, `s3:max-keys`, `s3:VersionId`, `s3:authType`, `s3:x-amz-acl`,
-  `s3:x-amz-server-side-encryption`, `s3:x-amz-copy-source`, `s3:x-amz-metadata-directive`,
-  `s3:object-lock-*` and `s3:RequestObjectTagKeys`.
+  `s3:x-amz-server-side-encryption`, `s3:x-amz-server-side-encryption-customer-algorithm`,
+  `s3:x-amz-copy-source`, `s3:x-amz-metadata-directive`, `s3:object-lock-*`,
+  `s3:RequestObjectTagKeys`, `s3:RequestObjectTag/<tag>` and `s3:ExistingObjectTag/<tag>` (the
+  object's tags are only read when a policy uses this key).
 - Policy variables such as `${aws:username}` work in resources and condition values.
 - Unknown operators and condition keys, and malformed CIDR blocks, are rejected with
   `MalformedPolicy`, so a policy never silently means less than it says. If a stored policy stops

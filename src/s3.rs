@@ -651,6 +651,7 @@ impl Server {
             query,
             auth_type,
             now: now_ms() / 1000,
+            object_tags: None,
         }
     }
 
@@ -1310,9 +1311,15 @@ impl Server {
         };
         let mut replica = false;
         {
-            let ctx = self.req_ctx(&r);
+            let mut ctx = self.req_ctx(&r);
             let (b, k) = (bucket.as_deref(), key.as_deref());
             let versioned = r.q("versionId").is_some_and(|v| !v.is_empty());
+            // s3:ExistingObjectTag conditions look at the object's tags (read only if needed).
+            let version = r.q("versionId").filter(|v| !v.is_empty());
+            let object_tags = || self.lookup(b?, k?, version).ok().map(|(m, _)| m.tags);
+            if k.is_some() {
+                ctx.object_tags = Some(&object_tags);
+            }
             let action = match op {
                 None if r.q("events").is_some() => Some("s3:ListenNotification"),
                 None => Some("s3:ListAllMyBuckets"),

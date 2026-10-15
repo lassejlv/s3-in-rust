@@ -11,6 +11,7 @@ import json
 import os
 import sys
 import time
+import urllib.parse
 import urllib.request
 import uuid
 
@@ -312,6 +313,15 @@ def t_bad_credentials():
         raise AssertionError("anonymous request accepted")
     except urllib.error.HTTPError as e:
         assert e.code == 403
+
+
+def _conn(url):
+    """An http.client connection to the scheme://host:port of `url` (HTTPS when s3rs serves TLS)."""
+    import http.client
+    u = urllib.parse.urlparse(url)
+    if u.scheme == "https":
+        return http.client.HTTPSConnection(u.hostname, u.port, timeout=10)
+    return http.client.HTTPConnection(u.hostname, u.port, timeout=10)
 
 
 def http(method, path, headers=None, data=None):
@@ -985,6 +995,8 @@ def t_object_lock():
 
 WEBSITE = os.environ.get("S3RS_WEBSITE_ENDPOINT")  # e.g. http://127.0.0.1:9001
 WEBSITE_DOMAIN = os.environ.get("S3RS_WEBSITE_DOMAIN")
+# Redirects use the scheme the endpoint is served with.
+WEB_SCHEME = urllib.parse.urlparse(WEBSITE).scheme if WEBSITE else "http"
 
 
 def web(host, path, method="GET", headers=None):
@@ -992,8 +1004,7 @@ def web(host, path, method="GET", headers=None):
     import http.client
     import urllib.parse
 
-    u = urllib.parse.urlparse(WEBSITE)
-    conn = http.client.HTTPConnection(u.hostname, u.port, timeout=10)
+    conn = _conn(WEBSITE)
     conn.request(method, path, headers={"Host": host, **(headers or {})})
     r = conn.getresponse()
     body = r.read()
@@ -1031,12 +1042,12 @@ def t_website():
     st, h, body = web(host, "/")
     assert (st, body, h["Content-Type"]) == (200, b"<h1>home</h1>", "text/html"), (st, body)
     st, h, _ = web(host, "/about")
-    assert st == 302 and h["Location"] == f"http://{host}/about/", (st, h["Location"])
+    assert st == 302 and h["Location"] == f"{WEB_SCHEME}://{host}/about/", (st, h["Location"])
     assert web(host, "/about/")[2] == b"about"
     st, _, body = web(host, "/nope.html")
     assert (st, body) == (404, b"custom not found"), (st, body)
     st, h, _ = web(host, "/old/page.html")
-    assert st == 301 and h["Location"] == f"http://{host}/new/page.html", h["Location"]
+    assert st == 301 and h["Location"] == f"{WEB_SCHEME}://{host}/new/page.html", h["Location"]
     st, h, _ = web(host, "/moved")
     assert st == 301 and h["Location"] == "/about/", (st, h["Location"])
     expect_error(
@@ -1045,7 +1056,7 @@ def t_website():
     # A key starting with "/" must not turn the directory redirect into a protocol-relative URL.
     s3.put_object(Bucket=wb, Key="/evil.example/index.html", Body=b"x")
     st, h, _ = web(host, "//evil.example")
-    assert st == 302 and h["Location"] == f"http://{host}//evil.example/", (st, h["Location"])
+    assert st == 302 and h["Location"] == f"{WEB_SCHEME}://{host}//evil.example/", (st, h["Location"])
     s3.delete_object(Bucket=wb, Key="/evil.example/index.html")
     st, h, body = web(host, "/", method="HEAD")
     assert st == 200 and body == b"" and h["Content-Length"] == "13", (st, h)
@@ -1236,6 +1247,11 @@ def t_notifications():
             pass
 
     srv = http.server.ThreadingHTTPServer(("127.0.0.1", int(port)), Hook)
+    if os.environ.get("S3RS_WEBHOOK_TLS_CERT"):  # the server was given an https:// webhook
+        import ssl
+        tls = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        tls.load_cert_chain(os.environ["S3RS_WEBHOOK_TLS_CERT"], os.environ["S3RS_WEBHOOK_TLS_KEY"])
+        srv.socket = tls.wrap_socket(srv.socket, server_side=True)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     nb = B + "-notify"
     s3.create_bucket(Bucket=nb)
@@ -1291,9 +1307,8 @@ def t_notifications():
         # Live stream (MinIO ListenBucketNotification): signed GET ?events=..., JSON lines.
         import http.client
         req = _signed_request(s3, "GET", f"/{nb}?events=s3%3AObjectCreated%3A%2A&prefix=live%2F")
-        u = req.url.split("://", 1)[1]
-        hostport, path = u.split("/", 1)
-        conn = http.client.HTTPConnection(*hostport.split(":"), timeout=10)
+        path = req.url.split("://", 1)[1].split("/", 1)[1]
+        conn = _conn(ENDPOINT)
         conn.request("GET", "/" + path, headers=dict(req.headers.items()))
         resp = conn.getresponse()
         assert resp.status == 200, resp.status
@@ -1311,7 +1326,7 @@ def t_notifications():
                               config=Config(s3={"addressing_style": "path"}, retries={"max_attempts": 1}))
             s3.create_bucket(Bucket="scoped-events")
             req = _signed_request(sc, "GET", "/?events=s3%3AObjectCreated%3A%2A")
-            conn = http.client.HTTPConnection(*hostport.split(":"), timeout=10)
+            conn = _conn(ENDPOINT)
             conn.request("GET", "/?events=s3%3AObjectCreated%3A%2A", headers=dict(req.headers.items()))
             resp = conn.getresponse()
             assert resp.status == 200, resp.status
@@ -1445,6 +1460,27 @@ def t_object_attributes():
         s3.delete_bucket(Bucket=ab)
     s3.delete_object(Bucket=B, Key="attrs.txt")
     s3.delete_object(Bucket=B, Key="attrs-mp")
+
+
+
+def t_secure_transport():
+    """aws:SecureTransport is true exactly when s3rs serves the request over TLS."""
+    tls = ENDPOINT.startswith("https://")
+    sb = B + "-tls"
+    s3.create_bucket(Bucket=sb)
+    try:
+        s3.put_object(Bucket=sb, Key="k", Body=b"v")
+        s3.put_bucket_policy(Bucket=sb, Policy=json.dumps({"Version": "2012-10-17", "Statement": [
+            {"Effect": "Deny", "Principal": "*", "Action": "s3:GetObject", "Resource": f"arn:aws:s3:::{sb}/*",
+             "Condition": {"Bool": {"aws:SecureTransport": "false"}}}]}))
+        if tls:
+            assert s3.get_object(Bucket=sb, Key="k")["Body"].read() == b"v"
+        else:
+            expect_error("AccessDenied", lambda: s3.get_object(Bucket=sb, Key="k"))
+    finally:
+        s3.delete_bucket_policy(Bucket=sb)
+        s3.delete_object(Bucket=sb, Key="k")
+        s3.delete_bucket(Bucket=sb)
 
 
 def t_overwrite():

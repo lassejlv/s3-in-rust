@@ -11,7 +11,12 @@ const out = process.argv[2];
 const shot = (page, name) => (out ? page.screenshot({ path: `${out}/${name}.png` }) : null);
 (async () => {
   const browser = await chromium.launch();
-  const ctx = await browser.newContext({ viewport: { width: 1280, height: 800 }, acceptDownloads: true });
+  // HTTPS test servers use a throwaway CA the browser doesn't know.
+  const ctx = await browser.newContext({
+    viewport: { width: 1280, height: 800 },
+    acceptDownloads: true,
+    ignoreHTTPSErrors: BASE.startsWith('https:'),
+  });
   await ctx.grantPermissions(['clipboard-read', 'clipboard-write']);
   const page = await ctx.newPage();
   const problems = [];

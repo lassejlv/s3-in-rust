@@ -3,7 +3,9 @@ FROM rust:1-slim-trixie AS build
 WORKDIR /src
 COPY Cargo.toml Cargo.lock rustfmt.toml ./
 COPY src ./src
-RUN cargo build --release
+# Optional cargo features, e.g. `docker build --build-arg FEATURES=tls .` for native HTTPS.
+ARG FEATURES=""
+RUN cargo build --release ${FEATURES:+--features $FEATURES}
 
 FROM debian:trixie-slim
 COPY --from=build /src/target/release/s3rs /usr/local/bin/s3rs

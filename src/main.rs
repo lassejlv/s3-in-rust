@@ -17,6 +17,7 @@ mod ops;
 mod post;
 mod s3;
 mod store;
+mod tls;
 mod util;
 mod website;
 mod xml;
@@ -61,11 +62,16 @@ OPTIONS (each also settable through the environment variable shown):
         --encrypt-by-default     Encrypt every new object with the master key
                                                                  [S3RS_ENCRYPT_BY_DEFAULT=1]
         --webhook <ID=URL>       Event notification target (repeatable), e.g.
-                                 `thumbnails=http://worker.internal:8080/s3-events`; buckets
+                                 `thumbnails=https://worker.internal/s3-events`; buckets
                                  refer to it as arn:s3rs:webhook::<ID>
                                                                  [S3RS_WEBHOOKS, comma-separated]
         --webhook-secret <S>     Sign webhook bodies (X-S3rs-Signature: sha256=<hmac>)
                                                                  [S3RS_WEBHOOK_SECRET]
+        --tls-cert <PATH>        Serve HTTPS: PEM certificate chain (reloaded on SIGHUP)
+                                                                 [S3RS_TLS_CERT]
+        --tls-key <PATH>         PEM private key for --tls-cert  [S3RS_TLS_KEY]
+        --webhook-ca <PATH>      Extra PEM CA certificates trusted for https:// webhooks
+                                                                 [S3RS_WEBHOOK_CA]
         --behind-proxy           Trust X-Forwarded-For / X-Forwarded-Proto from a reverse proxy
                                  (client IP and HTTPS for policy conditions and redirects)
                                                                  [S3RS_BEHIND_PROXY=1]
@@ -105,6 +111,9 @@ struct Config {
     behind_proxy: bool,
     webhooks: Vec<(String, events::Url)>,
     webhook_secret: Option<String>,
+    webhook_ca: Option<PathBuf>,
+    tls_cert: Option<PathBuf>,
+    tls_key: Option<PathBuf>,
     encryption_key: Option<[u8; 32]>,
     encrypt_by_default: bool,
     region: String,
@@ -147,6 +156,9 @@ fn parse_args() -> Result<Config, String> {
         behind_proxy: env_flag("S3RS_BEHIND_PROXY")?,
         webhooks: env("S3RS_WEBHOOKS").map(|v| parse_webhooks(&v)).transpose()?.unwrap_or_default(),
         webhook_secret: env("S3RS_WEBHOOK_SECRET"),
+        webhook_ca: env("S3RS_WEBHOOK_CA").map(PathBuf::from),
+        tls_cert: env("S3RS_TLS_CERT").map(PathBuf::from),
+        tls_key: env("S3RS_TLS_KEY").map(PathBuf::from),
         encryption_key: env("S3RS_ENCRYPTION_KEY")
             .map(|k| parse_key(&k))
             .transpose()
@@ -198,6 +210,9 @@ fn parse_args() -> Result<Config, String> {
                 c.webhooks.push(w);
             }
             "--webhook-secret" => c.webhook_secret = Some(val()?),
+            "--webhook-ca" => c.webhook_ca = Some(val()?.into()),
+            "--tls-cert" => c.tls_cert = Some(val()?.into()),
+            "--tls-key" => c.tls_key = Some(val()?.into()),
             "--encryption-key" => c.encryption_key = Some(parse_key(&val()?).map_err(|e| format!("--encryption-key: {e}"))?),
             "--encryption-key-file" => {
                 let path = val()?;
@@ -449,6 +464,31 @@ fn main() {
         eprintln!("error: --encrypt-by-default requires --encryption-key");
         std::process::exit(2);
     }
+    let tls = match (&cfg.tls_cert, &cfg.tls_key) {
+        (None, None) => None,
+        (Some(cert), Some(key)) => match tls::Server::load(cert.clone(), key.clone()) {
+            Ok(t) => Some(Arc::new(t)),
+            Err(e) => {
+                eprintln!("error: TLS: {e}");
+                std::process::exit(2);
+            }
+        },
+        _ => {
+            eprintln!("error: --tls-cert and --tls-key must be given together");
+            std::process::exit(2);
+        }
+    };
+    let webhook_tls = if cfg.webhooks.iter().any(|(_, u)| u.tls) || cfg.webhook_ca.is_some() {
+        match tls::client_config(cfg.webhook_ca.as_deref()) {
+            Ok(c) => Some(c),
+            Err(e) => {
+                eprintln!("error: https:// webhooks: {e}");
+                std::process::exit(2);
+            }
+        }
+    } else {
+        None
+    };
 
     let store = match store::Store::open(store::StoreConfig {
         root: cfg.data_dir.clone(),
@@ -464,7 +504,7 @@ fn main() {
     };
 
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().expect("tokio runtime");
-    rt.block_on(serve(cfg, store, auth));
+    rt.block_on(serve(cfg, store, auth, tls, webhook_tls));
 }
 
 async fn bind(addr: SocketAddr) -> TcpListener {
@@ -485,7 +525,13 @@ async fn accept_opt(l: &Option<TcpListener>) -> std::io::Result<(tokio::net::Tcp
     }
 }
 
-async fn serve(cfg: Config, store: Arc<store::Store>, auth: Option<auth::Auth>) {
+async fn serve(
+    cfg: Config,
+    store: Arc<store::Store>,
+    auth: Option<auth::Auth>,
+    tls: Option<Arc<tls::Server>>,
+    webhook_tls: Option<Arc<tls::ClientConfig>>,
+) {
     let listener = bind(cfg.listen).await;
     let website_listener = match cfg.website_listen {
         Some(a) => Some(bind(a).await),
@@ -503,7 +549,14 @@ async fn serve(cfg: Config, store: Arc<store::Store>, auth: Option<auth::Auth>) 
         website_domain: cfg.website_domain.clone(),
         console: cfg.console,
         behind_proxy: cfg.behind_proxy,
-        events: events::Bus::new(store.clone(), cfg.region.clone(), cfg.webhooks.clone(), cfg.webhook_secret.clone()),
+        tls: tls.is_some(),
+        events: events::Bus::new(
+            store.clone(),
+            cfg.region.clone(),
+            cfg.webhooks.clone(),
+            cfg.webhook_secret.clone(),
+            webhook_tls,
+        ),
     };
     let server = Arc::new(s3::Server::new(store.clone(), auth, opts));
     server.set_self();
@@ -516,8 +569,9 @@ async fn serve(cfg: Config, store: Arc<store::Store>, auth: Option<auth::Auth>) 
             server.events.clone(),
         ));
     }
+    let scheme = if tls.is_some() { "https" } else { "http" };
     eprintln!(
-        "s3rs listening on http://{} (data: {}, region: {}, auth: {}, fsync: {}, encryption: {})",
+        "s3rs listening on {scheme}://{} (data: {}, region: {}, auth: {}, fsync: {}, encryption: {})",
         cfg.listen,
         cfg.data_dir.display(),
         cfg.region,
@@ -530,13 +584,14 @@ async fn serve(cfg: Config, store: Arc<store::Store>, auth: Option<auth::Auth>) 
         }
     );
     if cfg.console {
-        eprintln!("s3rs web console on http://{}/_console/", cfg.listen);
+        eprintln!("s3rs web console on {scheme}://{}/_console/", cfg.listen);
     }
     for (id, url) in &cfg.webhooks {
-        eprintln!("webhook target {id}: http://{}:{}{} (arn:s3rs:webhook::{id})", url.host, url.port, url.path);
+        let s = if url.tls { "https" } else { "http" };
+        eprintln!("webhook target {id}: {s}://{}:{}{} (arn:s3rs:webhook::{id})", url.host, url.port, url.path);
     }
     if let Some(a) = cfg.website_listen {
-        eprintln!("s3rs website endpoint on http://{a}");
+        eprintln!("s3rs website endpoint on {scheme}://{a}");
     }
 
     let mut builder = auto::Builder::new(TokioExecutor::new());
@@ -550,12 +605,22 @@ async fn serve(cfg: Config, store: Arc<store::Store>, auth: Option<auth::Auth>) 
     let graceful = hyper_util::server::graceful::GracefulShutdown::new();
 
     #[cfg(unix)]
-    if server.auth.is_some() {
+    if server.auth.is_some() || tls.is_some() {
         let server = server.clone();
         let cfg = cfg.clone();
+        let tls = tls.clone();
         tokio::spawn(async move {
             let Ok(mut hup) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()) else { return };
             while hup.recv().await.is_some() {
+                if let Some(t) = &tls {
+                    match t.reload() {
+                        Ok(()) => eprintln!("reloaded the TLS certificate"),
+                        Err(e) => eprintln!("TLS RELOAD FAILED, still using the previous certificate: {e}"),
+                    }
+                }
+                if server.auth.is_none() {
+                    continue;
+                }
                 match collect_credentials(&cfg) {
                     Ok(creds) => {
                         let n = creds.len();
@@ -597,6 +662,7 @@ async fn serve(cfg: Config, store: Arc<store::Store>, auth: Option<auth::Auth>) 
         let server = server.clone();
         let builder = builder.clone();
         let watcher = graceful.watcher();
+        let acceptor = tls.as_ref().map(|t| t.acceptor());
         tokio::spawn(async move {
             let svc = service_fn(move |req| {
                 let server = server.clone();
@@ -608,8 +674,21 @@ async fn serve(cfg: Config, store: Arc<store::Store>, auth: Option<auth::Auth>) 
                     })
                 }
             });
-            let conn = builder.serve_connection(TokioIo::new(stream), svc).into_owned();
-            let _ = watcher.watch(conn).await;
+            match acceptor {
+                None => {
+                    let conn = builder.serve_connection(TokioIo::new(stream), svc).into_owned();
+                    let _ = watcher.watch(conn).await;
+                }
+                Some(acceptor) => {
+                    // Failed handshakes (scanners, plain HTTP, expired client trust) are routine
+                    // on a public port, so they are not logged.
+                    let Ok(Ok(stream)) = tokio::time::timeout(tls::HANDSHAKE_TIMEOUT, acceptor.accept(stream)).await else {
+                        return;
+                    };
+                    let conn = builder.serve_connection(TokioIo::new(stream), svc).into_owned();
+                    let _ = watcher.watch(conn).await;
+                }
+            }
         });
     }
     drop(listener);

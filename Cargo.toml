@@ -21,9 +21,18 @@ md-5 = "0.11.0"
 memchr = "2.8.3"
 percent-encoding = "2.3.2"
 redb = "4.4.0"
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"], optional = true }
+rustls-pki-types = { version = "1.15.1", features = ["std"], optional = true }
 sha1 = "0.11.0"
 sha2 = "0.11.1"
 tokio = { version = "1.53.3", features = ["rt-multi-thread", "net", "sync", "macros", "signal", "time", "fs", "io-util"] }
+tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring", "tls12"], optional = true }
+webpki-roots = { version = "1.0.9", optional = true }
+
+[features]
+# Native HTTPS listeners and https:// webhooks (rustls with the ring provider, which contains C
+# and assembly; the default build is pure Rust).
+tls = ["dep:rustls", "dep:rustls-pki-types", "dep:tokio-rustls", "dep:webpki-roots"]
 
 [profile.release]
 opt-level = 3

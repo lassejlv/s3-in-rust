@@ -280,13 +280,21 @@ pub struct Bus {
 }
 
 impl Bus {
-    /// `targets` are (id, http URL); a delivery task is started for each.
-    pub fn new(store: Arc<Store>, region: String, targets: Vec<(String, Url)>, secret: Option<String>) -> Arc<Bus> {
+    /// `targets` are (id, URL); a delivery task is started for each. `tls` is needed for
+    /// `https://` targets.
+    pub fn new(
+        store: Arc<Store>,
+        region: String,
+        targets: Vec<(String, Url)>,
+        secret: Option<String>,
+        tls: Option<Arc<crate::tls::ClientConfig>>,
+    ) -> Arc<Bus> {
         let stats = Arc::new(Stats::default());
         let mut senders = HashMap::new();
         for (id, url) in targets {
             let (tx, rx) = mpsc::channel(QUEUE);
-            tokio::spawn(deliver(id.clone(), url, rx, region.clone(), secret.clone(), stats.clone()));
+            let tls = if url.tls { tls.clone() } else { None };
+            tokio::spawn(deliver(id.clone(), url, tls, rx, region.clone(), secret.clone(), stats.clone()));
             senders.insert(id, tx);
         }
         Arc::new(Bus {
@@ -374,9 +382,10 @@ impl Bus {
 
 // ------------------------------------------------------------------ webhook delivery
 
-/// A parsed `http://host[:port]/path` URL.
+/// A parsed `http[s]://host[:port]/path` URL.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Url {
+    pub tls: bool,
     pub host: String,
     pub port: u16,
     /// Path and query, starting with '/'.
@@ -385,12 +394,12 @@ pub struct Url {
 
 impl Url {
     pub fn parse(s: &str) -> Result<Url, String> {
-        if s.starts_with("https://") {
-            return Err(format!(
-                "{s}: only http:// webhooks are supported (s3rs has no TLS client); use an internal address or a local relay"
-            ));
-        }
-        let rest = s.strip_prefix("http://").ok_or_else(|| format!("{s}: webhook URLs must start with http://"))?;
+        let (tls, rest) = match (s.strip_prefix("https://"), s.strip_prefix("http://")) {
+            (Some(rest), _) => (true, rest),
+            (None, Some(rest)) => (false, rest),
+            _ => return Err(format!("{s}: webhook URLs must start with http:// or https://")),
+        };
+        let default_port = if tls { 443 } else { 80 };
         let (authority, path) = match rest.find('/') {
             Some(i) => (&rest[..i], &rest[i..]),
             None => (rest, "/"),
@@ -401,14 +410,14 @@ impl Url {
             let (addr, after) = rest.split_once(']').ok_or_else(|| bad("host"))?;
             addr.parse::<std::net::Ipv6Addr>().map_err(|_| bad("IPv6 address"))?;
             let port = match after {
-                "" => 80,
+                "" => default_port,
                 p => p.strip_prefix(':').and_then(|p| p.parse::<u16>().ok()).ok_or_else(|| bad("port"))?,
             };
             (format!("[{addr}]"), port)
         } else {
             let (h, p) = match authority.split_once(':') {
                 Some((h, p)) => (h, p.parse::<u16>().map_err(|_| bad("port"))?),
-                None => (authority, 80),
+                None => (authority, default_port),
             };
             if h.is_empty() || !h.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-') {
                 return Err(bad("host"));
@@ -421,33 +430,49 @@ impl Url {
         if path.contains('#') || path.parse::<hyper::http::uri::PathAndQuery>().is_err() {
             return Err(bad("path"));
         }
-        Ok(Url { host, port, path: path.to_string() })
+        Ok(Url { tls, host, port, path: path.to_string() })
     }
 
     fn host_header(&self) -> String {
-        if self.port == 80 { self.host.clone() } else { format!("{}:{}", self.host, self.port) }
+        if self.port == if self.tls { 443 } else { 80 } { self.host.clone() } else { format!("{}:{}", self.host, self.port) }
     }
 }
 
 type Sender = hyper::client::conn::http1::SendRequest<Full<Bytes>>;
 
-async fn connect(url: &Url) -> Result<Sender, String> {
+async fn connect(url: &Url, tls: Option<&Arc<crate::tls::ClientConfig>>) -> Result<Sender, String> {
     let host = url.host.trim_start_matches('[').trim_end_matches(']');
     let stream = tokio::time::timeout(TIMEOUT, tokio::net::TcpStream::connect((host, url.port)))
         .await
         .map_err(|_| "connect timed out".to_string())?
         .map_err(|e| e.to_string())?;
     let _ = stream.set_nodelay(true);
-    let (sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(stream)).await.map_err(|e| e.to_string())?;
-    tokio::spawn(async move {
-        let _ = conn.await;
-    });
+    let sender = if url.tls {
+        let stream = crate::tls::connect(tls.ok_or("no TLS client configuration")?, host, stream).await?;
+        let (sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(stream)).await.map_err(|e| e.to_string())?;
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+        sender
+    } else {
+        let (sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(stream)).await.map_err(|e| e.to_string())?;
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+        sender
+    };
     Ok(sender)
 }
 
-async fn post(sender: &mut Option<Sender>, url: &Url, body: &Bytes, signature: Option<&str>) -> Result<u16, String> {
+async fn post(
+    sender: &mut Option<Sender>,
+    url: &Url,
+    tls: Option<&Arc<crate::tls::ClientConfig>>,
+    body: &Bytes,
+    signature: Option<&str>,
+) -> Result<u16, String> {
     if sender.as_ref().is_none_or(|s| s.is_closed()) {
-        *sender = Some(connect(url).await?);
+        *sender = Some(connect(url, tls).await?);
     }
     let s = sender.as_mut().unwrap();
     s.ready().await.map_err(|e| e.to_string())?;
@@ -476,6 +501,7 @@ async fn post(sender: &mut Option<Sender>, url: &Url, body: &Bytes, signature: O
 async fn deliver(
     id: String,
     url: Url,
+    tls: Option<Arc<crate::tls::ClientConfig>>,
     mut rx: mpsc::Receiver<(Arc<Event>, String)>,
     region: String,
     secret: Option<String>,
@@ -494,7 +520,7 @@ async fn deliver(
         let mut ok = false;
         let attempts = if down { 1 } else { ATTEMPTS };
         for attempt in 0..attempts {
-            match post(&mut sender, &url, &body, signature.as_deref()).await {
+            match post(&mut sender, &url, tls.as_ref(), &body, signature.as_deref()).await {
                 Ok(status) if (200..300).contains(&status) => {
                     ok = true;
                     break;
@@ -530,11 +556,13 @@ mod tests {
     fn urls() {
         assert_eq!(
             Url::parse("http://hooks.internal:8080/s3?x=1").unwrap(),
-            Url { host: "hooks.internal".into(), port: 8080, path: "/s3?x=1".into() }
+            Url { tls: false, host: "hooks.internal".into(), port: 8080, path: "/s3?x=1".into() }
         );
+        let u = Url::parse("https://hooks.example.com/s3").unwrap();
+        assert!(u.tls && u.port == 443 && u.host_header() == "hooks.example.com");
+        assert_eq!(Url::parse("https://h:8443/").unwrap().host_header(), "h:8443");
         assert_eq!(Url::parse("http://h").unwrap().path, "/");
         assert_eq!(Url::parse("http://[::1]:9/").unwrap().host, "[::1]");
-        assert!(Url::parse("https://h/").is_err());
         assert!(Url::parse("ftp://h/").is_err());
         assert!(Url::parse("http://user@h/").is_err());
         for bad in [

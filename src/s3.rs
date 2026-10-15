@@ -49,6 +49,8 @@ pub struct Options {
     pub console: bool,
     /// Trust X-Forwarded-For / X-Forwarded-Proto (client IP and HTTPS for policies).
     pub behind_proxy: bool,
+    /// The listeners serve HTTPS.
+    pub tls: bool,
     /// Event notifications (webhooks and live listeners).
     pub events: Arc<events::Bus>,
 }
@@ -72,6 +74,7 @@ pub struct Server {
     website_domain: Option<String>,
     console: bool,
     behind_proxy: bool,
+    tls: bool,
     pub events: Arc<events::Bus>,
     /// Weak self-reference, for background tasks that must re-check permissions.
     me: std::sync::OnceLock<std::sync::Weak<Server>>,
@@ -366,6 +369,7 @@ impl Server {
             website_domain: opts.website_domain,
             console: opts.console,
             behind_proxy: opts.behind_proxy,
+            tls: opts.tls,
             events: opts.events,
             me: std::sync::OnceLock::new(),
             req_counter: AtomicU64::new(1),
@@ -509,10 +513,10 @@ impl Server {
     }
 
     /// The client's address and whether it connected over HTTPS (as reported by a trusted
-    /// reverse proxy with `--behind-proxy`).
+    /// reverse proxy with `--behind-proxy`, or because s3rs serves TLS itself).
     fn client(&self, headers: &HeaderMap, peer: SocketAddr) -> Client {
         if !self.behind_proxy {
-            return Client { ip: peer.ip(), secure: false };
+            return Client { ip: peer.ip(), secure: self.tls };
         }
         // The proxy appends what it saw, so the last entry (across all header lines) is the one
         // it vouches for; anything before it came from the client.
@@ -526,7 +530,7 @@ impl Server {
                 .map(str::trim)
         };
         let ip = last("x-forwarded-for").and_then(|v| v.parse::<IpAddr>().ok()).unwrap_or(peer.ip());
-        let secure = last("x-forwarded-proto").is_some_and(|p| p.eq_ignore_ascii_case("https"));
+        let secure = last("x-forwarded-proto").map_or(self.tls, |p| p.eq_ignore_ascii_case("https"));
         Client { ip, secure }
     }
 
@@ -733,7 +737,7 @@ impl Server {
             .and_then(|p| p.split(',').next())
             .map(str::trim)
             .filter(|p| *p == "https" || *p == "http")
-            .unwrap_or("http");
+            .unwrap_or(if self.tls { "https" } else { "http" });
         let redirect = |code: u16, location: &str| {
             let mut r = Resp::new(StatusCode::from_u16(code).unwrap_or(StatusCode::MOVED_PERMANENTLY));
             r.set("location", location);

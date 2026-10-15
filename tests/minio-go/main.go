@@ -36,7 +36,7 @@ func main() {
 	endpoint := env("S3RS_ENDPOINT", "127.0.0.1:9000")
 	c, err := minio.New(endpoint, &minio.Options{
 		Creds:  credentials.NewStaticV4(env("S3RS_ACCESS_KEY", "testkey"), env("S3RS_SECRET_KEY", "testsecret"), ""),
-		Secure: false,
+		Secure: os.Getenv("S3RS_TLS") == "1",
 	})
 	must(err, "client")
 	_ = c.MakeBucket(ctx, "gotest", minio.MakeBucketOptions{})

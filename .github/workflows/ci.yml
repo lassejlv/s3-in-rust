@@ -20,7 +20,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo clippy --all-targets --features tls -- -D warnings
       - run: cargo test
+      - run: cargo test --features tls
+      - name: the default build has no C code
+        run: "! cargo tree -e normal,build | grep -E ' (cc|ring|aws-lc-sys|cmake) v'"
 
   e2e:
     name: end-to-end (boto3, aws-cli, minio-go)
@@ -113,6 +117,94 @@ jobs:
           npm install --no-save --no-package-lock playwright@1.56.1
           npx playwright install --with-deps chromium
           node tests/console.js
+      - name: fsck after a graceful shutdown
+        run: |
+          kill -TERM "$(cat /tmp/s3rs.pid)"
+          while kill -0 "$(cat /tmp/s3rs.pid)" 2>/dev/null; do sleep 0.2; done
+          ./target/release/s3rs fsck -d /tmp/s3rs-data --deep --encryption-key-file /tmp/s3rs.key
+      - name: Server log
+        if: always()
+        run: cat /tmp/s3rs.log
+
+  tls:
+    name: end-to-end over HTTPS (--features tls)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache-dependency-path: tests/minio-go/go.sum
+      - run: pip install boto3
+      - run: cargo build --release --features tls
+      - name: Start s3rs with TLS and an https:// webhook
+        run: |
+          mkdir -p /tmp/tls && tests/tls/gen-certs.sh /tmp/tls
+          cp tests/policies/home.json /tmp/home.json
+          openssl rand -hex 32 > /tmp/s3rs.key
+          printf 'rokey:rosecret:ro\nscoped:scopedsecret:rw:scoped-*,shared-scope\nalice:alicesecret:policy=home.json\n' > /tmp/creds
+          S3RS_LIFECYCLE_DAY_SECS=2 ./target/release/s3rs -d /tmp/s3rs-data -l 127.0.0.1:9000 \
+            --access-key testkey --secret-key testsecret --credentials-file /tmp/creds \
+            --lifecycle-interval 1 --encryption-key-file /tmp/s3rs.key \
+            --website-listen 127.0.0.1:9001 --website-domain web.localhost \
+            --tls-cert /tmp/tls/leaf.pem --tls-key /tmp/tls/leaf.key \
+            --webhook test=https://localhost:9399/hook --webhook-ca /tmp/tls/ca.pem \
+            --webhook-secret hooksecret > /tmp/s3rs.log 2>&1 &
+          echo $! > /tmp/s3rs.pid
+          for i in $(seq 50); do curl -sf --cacert /tmp/tls/ca.pem https://localhost:9000/_health && break; sleep 0.1; done
+      - name: boto3 suite over HTTPS
+        env:
+          S3RS_ENDPOINT: https://localhost:9000
+          SSL_CERT_FILE: /tmp/tls/ca.pem
+          AWS_CA_BUNDLE: /tmp/tls/ca.pem
+          S3RS_RO_ACCESS_KEY: rokey
+          S3RS_RO_SECRET_KEY: rosecret
+          S3RS_SCOPED_ACCESS_KEY: scoped
+          S3RS_SCOPED_SECRET_KEY: scopedsecret
+          S3RS_POLICY_ACCESS_KEY: alice
+          S3RS_POLICY_SECRET_KEY: alicesecret
+          S3RS_WEBHOOK_PORT: "9399"
+          S3RS_WEBHOOK_SECRET: hooksecret
+          S3RS_WEBHOOK_TLS_CERT: /tmp/tls/leaf.pem
+          S3RS_WEBHOOK_TLS_KEY: /tmp/tls/leaf.key
+          S3RS_FAST_LIFECYCLE: "1"
+          S3RS_ENCRYPTION: "1"
+          S3RS_DATA_DIR: /tmp/s3rs-data
+          S3RS_WEBSITE_ENDPOINT: https://localhost:9001
+          S3RS_WEBSITE_DOMAIN: web.localhost
+        run: python3 tests/e2e.py
+      - name: minio-go suite over HTTPS
+        working-directory: tests/minio-go
+        env:
+          S3RS_TLS: "1"
+          S3RS_ENDPOINT: localhost:9000
+          SSL_CERT_FILE: /tmp/tls/ca.pem
+        run: go run .
+      - name: web console over HTTPS (Playwright)
+        env:
+          S3RS_CONSOLE_URL: https://localhost:9000
+          NODE_EXTRA_CA_CERTS: /tmp/tls/ca.pem
+          LANG: C.UTF-8
+          S3RS_ACCESS_KEY: testkey
+          S3RS_SECRET_KEY: testsecret
+        run: |
+          npm install --no-save --no-package-lock playwright@1.56.1
+          npx playwright install --with-deps chromium
+          node tests/console.js
+      - name: HTTP/2 over ALPN, and certificate reload on SIGHUP
+        run: |
+          test "$(curl -s -o /dev/null -w '%{http_version}' --http2 --cacert /tmp/tls/ca.pem https://localhost:9000/_health)" = 2
+          serial() { echo | openssl s_client -connect 127.0.0.1:9000 2>/dev/null | openssl x509 -noout -serial; }
+          test "$(serial)" = "$(openssl x509 -in /tmp/tls/leaf.pem -noout -serial)"
+          cp /tmp/tls/leaf2.pem /tmp/tls/leaf.pem && cp /tmp/tls/leaf2.key /tmp/tls/leaf.key
+          kill -HUP "$(cat /tmp/s3rs.pid)"
+          for i in $(seq 50); do grep -q 'reloaded the TLS certificate' /tmp/s3rs.log && break; sleep 0.1; done
+          test "$(serial)" = "$(openssl x509 -in /tmp/tls/leaf2.pem -noout -serial)"
       - name: fsck after a graceful shutdown
         run: |
           kill -TERM "$(cat /tmp/s3rs.pid)"

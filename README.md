@@ -2,7 +2,8 @@
 
 A fast, lightweight, S3-compatible object storage server written in pure Rust.
 
-- **Single static binary** (~3.5 MB), no runtime dependencies, no C code in the dependency tree.
+- **Single static binary** (~4.5 MB), no runtime dependencies, no C code in the dependency tree.
+  Native HTTPS is an optional build feature (see [HTTPS](#https-tls)).
 - **Works with standard S3 clients**: AWS CLI, boto3, and other SDKs (SigV4 and SigV2 auth, presigned
   URLs, streaming/chunked uploads, multipart uploads, checksums).
 - **Fast**: about 110k small GETs/s, about 35k durable small PUTs/s, and multiple GB/s of large-object reads on a
@@ -42,6 +43,8 @@ docker build -t s3rs .
 docker run -p 9000:9000 -v $PWD/data:/data -e S3RS_ACCESS_KEY=mykey -e S3RS_SECRET_KEY=mysecret s3rs
 ```
 
+Add `--build-arg FEATURES=tls` for an image with [native HTTPS](#https-tls).
+
 ## Web console
 
 Open the server's address in a browser (it redirects to `/_console/`) and sign in with an access
@@ -80,9 +83,11 @@ Each flag can also be set with the environment variable shown (switches take `1`
 | `--cors-origins` | `S3RS_CORS_ORIGINS` | | Comma-separated origins (e.g. `*`) allowed for buckets that have no CORS configuration of their own |
 | `--metrics-token` | `S3RS_METRICS_TOKEN` | | Requires `Authorization: Bearer <token>` on `/_metrics` |
 | `--no-console` | `S3RS_NO_CONSOLE` | off | Turns off the web console at `/_console/` |
+| `--tls-cert`, `--tls-key` | `S3RS_TLS_CERT`, `S3RS_TLS_KEY` | | Serves HTTPS with this PEM certificate chain and key (needs a `--features tls` build; see [HTTPS](#https-tls)) |
 | `--behind-proxy` | `S3RS_BEHIND_PROXY` | off | Trusts `X-Forwarded-For` / `X-Forwarded-Proto` for policy conditions |
 | `--webhook ID=URL` | `S3RS_WEBHOOKS` (comma-separated) | | Event notification target (repeatable); see [Event notifications](#event-notifications) |
 | `--webhook-secret` | `S3RS_WEBHOOK_SECRET` | | Signs webhook bodies with HMAC-SHA256 |
+| `--webhook-ca` | `S3RS_WEBHOOK_CA` | | Extra PEM CA certificates trusted for `https://` webhooks |
 | `--lifecycle-interval` | `S3RS_LIFECYCLE_INTERVAL` | `3600` | Seconds between lifecycle sweeps. `0` turns lifecycle off. |
 | `--encryption-key` | `S3RS_ENCRYPTION_KEY` | | Master key for SSE-S3, as 64 hex characters or base64 (e.g. `openssl rand -hex 32`) |
 | `--encryption-key-file` | | | Reads the master key from a file |
@@ -106,6 +111,33 @@ series (which name every bucket) are included only when `/_metrics` is protected
 On `SIGTERM` or Ctrl-C the server stops accepting connections and waits up to 30 seconds for
 in-flight requests to finish. It then flushes metadata and records a clean shutdown. If a run
 crashes, the next start scans the store before serving and removes orphaned data files.
+
+## HTTPS (TLS)
+
+s3rs can serve HTTPS itself, without a reverse proxy. TLS uses [rustls](https://github.com/rustls/rustls)
+with the ring crypto provider. ring contains C and assembly, so TLS is an optional build feature,
+and the default build stays pure Rust:
+
+```bash
+cargo build --release --features tls
+./target/release/s3rs --data-dir ./data --access-key mykey --secret-key mysecret \
+  --tls-cert /etc/s3rs/fullchain.pem --tls-key /etc/s3rs/privkey.pem
+# s3rs listening on https://0.0.0.0:9000 ...
+```
+
+- The certificate file holds the PEM chain (leaf first). The key is PKCS#8, PKCS#1 or SEC1 PEM. The
+  server refuses to start if the key doesn't match the certificate.
+- The same certificate serves the S3 API, the console and the `--website-listen` endpoint. Use one
+  with names (or a wildcard) for each of them.
+- TLS 1.2 and 1.3 are supported. ALPN offers HTTP/2 and HTTP/1.1.
+- `SIGHUP` re-reads the certificate and key (for example after a Let's Encrypt renewal), together
+  with the access keys. Open connections keep the old certificate. New ones get the new certificate.
+  If the new files can't be loaded, the old certificate stays in use and the log says so.
+- Clients get 10 seconds to complete the handshake.
+- Policies see `aws:SecureTransport` as `true`, and website redirects use `https://`.
+
+A default build refuses to start when given `--tls-cert`. Behind a TLS-terminating proxy (or on
+platforms such as Railway that terminate TLS for you) you don't need the feature: use `--behind-proxy`.
 
 ## Access control
 
@@ -324,8 +356,8 @@ Supported: index documents (`/` and `/dir/`, and `/dir` redirects to `/dir/`), e
 `HttpErrorCodeReturnedEquals` conditions; `ReplaceKeyPrefixWith`, `ReplaceKeyWith`, `HostName`,
 `Protocol` and `HttpRedirectCode` redirects), `RedirectAllRequestsTo`, per-object
 `x-amz-website-redirect-location`, ranges and conditional GETs. Errors are HTML pages. The endpoint
-accepts only anonymous GET and HEAD, and never lists buckets. Behind a TLS-terminating proxy,
-redirects use the scheme from `X-Forwarded-Proto`.
+accepts only anonymous GET and HEAD, and never lists buckets. Redirects use `https://` when s3rs
+serves TLS, and behind a TLS-terminating proxy they use the scheme from `X-Forwarded-Proto`.
 
 ## Usage and quotas
 
@@ -426,8 +458,10 @@ How delivery works:
 - **Monitoring:** `s3rs_notifications_total{result="delivered|failed|dropped"}` in `/_metrics`
   counts outcomes.
 
-Webhooks are plain `http://`, because s3rs has no TLS client. Point them at services on a private
-network (such as `*.railway.internal`), or at a local relay.
+With a `--features tls` build, webhook URLs can be `https://`. Receivers' certificates are verified
+against the Mozilla root certificates, plus any CA certificates in `--webhook-ca` (for receivers with
+certificates from a private CA). The default build supports `http://` only: point those at services
+on a private network (such as `*.railway.internal`).
 
 Supported events:
 - `s3:ObjectCreated:*`: `Put`, `Post`, `Copy`, `CompleteMultipartUpload`.
@@ -553,7 +587,8 @@ cd tests/minio-go && S3RS_ACCESS_KEY=testkey S3RS_SECRET_KEY=testsecret go run .
 
 CI (`.github/workflows/ci.yml`) runs fmt, clippy, the unit tests, the boto3 suite, an AWS CLI sync
 round-trip, the minio-go suite and a Playwright test of the web console (`tests/console.js`) on
-every push.
+every push. A second job builds with `--features tls` and runs the boto3 and minio-go suites over
+HTTPS, with an `https://` webhook, using a throwaway CA from `tests/tls/gen-certs.sh`.
 
 ## Limitations and notes
 

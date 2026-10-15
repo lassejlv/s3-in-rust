@@ -69,7 +69,9 @@ impl Metrics {
         self.bytes_out.fetch_add(n, Relaxed);
     }
 
-    pub fn render(&self, store: &Store) -> String {
+    /// `per_bucket` adds series labelled with bucket names and sizes; they are only served when
+    /// the endpoint is protected by a token, since anonymous callers cannot list buckets.
+    pub fn render(&self, store: &Store, per_bucket: bool) -> String {
         let mut o = String::with_capacity(4096);
         let uptime = self.started.get().map_or(0.0, |s| s.elapsed().as_secs_f64());
         let _ = writeln!(o, "# TYPE s3rs_uptime_seconds gauge\ns3rs_uptime_seconds {uptime:.3}");
@@ -111,7 +113,7 @@ impl Metrics {
         {
             let _ = writeln!(o, "s3rs_notifications_total{{result=\"{name}\"}} {}", v.load(Relaxed));
         }
-        if let Ok(usage) = store.all_usage() {
+        if per_bucket && let Ok(usage) = store.all_usage() {
             let _ = writeln!(o, "# TYPE s3rs_bucket_objects gauge");
             for (b, n, _) in &usage {
                 let _ = writeln!(o, "s3rs_bucket_objects{{bucket=\"{b}\"}} {n}");

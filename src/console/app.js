@@ -374,6 +374,8 @@ async function refreshUsage() {
     const maxBytes = xmlText(doc, "MaxBytes");
     let text = `${n.toLocaleString()} object${n === 1 ? "" : "s"} · ${formatSize(xmlText(doc, "Bytes") || 0)}`;
     if (maxBytes) text += ` of ${formatSize(maxBytes)}`;
+    const pending = Number(xmlText(doc, "MultipartBytes") || 0);
+    if (pending > 0) text += ` (+ ${formatSize(pending)} in unfinished uploads)`;
     $("usage").textContent = text;
   } catch (_) { /* usage needs s3:GetBucketUsage; just leave it out */ }
 }

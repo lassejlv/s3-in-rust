@@ -865,7 +865,7 @@ impl Server {
             }
             let mut r = Resp::ok();
             r.set("content-type", "text/plain; version=0.0.4");
-            r.body = Body::full(self.metrics.render(&self.store));
+            r.body = Body::full(self.metrics.render(&self.store, self.metrics_token.is_some()));
             return Ok(r);
         }
         if !vhost && self.console && (parts.uri.path() == "/_console" || parts.uri.path().starts_with("/_console/")) {
@@ -926,6 +926,12 @@ impl Server {
             };
             if let Some(action) = action {
                 self.authorize(&r.principal, action, b, k, &ctx)?;
+            }
+            // As in S3, reading an object's attributes also needs permission to read the object
+            // (the ETag is usually the content's MD5).
+            if matches!(op, Some(Ok(ObjectOp::GetAttributes))) {
+                let read = if versioned { "s3:GetObjectVersion" } else { "s3:GetObject" };
+                self.authorize(&r.principal, read, b, k, &ctx)?;
             }
             // Uploads that set retention, a legal hold or tags also need those permissions.
             if matches!(op, Some(Ok(oop)) if oop.creates_object()) {
@@ -1037,6 +1043,8 @@ impl Server {
                         if sub == "usage" {
                             let (objects, bytes) = self.store.bucket_usage(bucket)?;
                             x.elem("Objects", objects.to_string()).elem("Bytes", bytes.to_string());
+                            // Unfinished multipart uploads count towards the byte quota too.
+                            x.elem("MultipartBytes", self.store.bucket_part_bytes(bucket)?.to_string());
                         }
                         if q.max_objects > 0 {
                             x.elem("MaxObjects", q.max_objects.to_string());
@@ -1685,13 +1693,23 @@ impl Server {
             && let Storage::Segments(segs) = &meta.storage
             && meta.etag.contains('-')
         {
-            let max = r.header("x-amz-max-parts").and_then(|v| v.trim().parse::<usize>().ok()).unwrap_or(1000).clamp(1, 1000);
-            let marker = r.header("x-amz-part-number-marker").and_then(|v| v.trim().parse::<usize>().ok()).unwrap_or(0);
+            // Parts are numbered 1..N in their order in the object (as for GET ?partNumber=).
+            let num = |name: &str| -> S3Result<Option<usize>> {
+                r.header(name)
+                    .map(|v| {
+                        v.trim()
+                            .parse::<usize>()
+                            .map_err(|_| err::InvalidArgument().with_message(format!("{name} must be a non-negative integer")))
+                    })
+                    .transpose()
+            };
+            let max = num("x-amz-max-parts")?.unwrap_or(1000).clamp(1, 1000);
+            let marker = num("x-amz-part-number-marker")?.unwrap_or(0);
             let parts: Vec<(usize, u64)> =
                 segs.iter().enumerate().map(|(i, (_, len))| (i + 1, *len)).skip(marker).take(max).collect();
             let truncated = marker + parts.len() < segs.len();
             x.open("ObjectParts").elem("PartsCount", segs.len().to_string()).elem("PartNumberMarker", marker.to_string());
-            if let Some((last, _)) = parts.last() {
+            if truncated && let Some((last, _)) = parts.last() {
                 x.elem("NextPartNumberMarker", last.to_string());
             }
             x.elem("MaxParts", max.to_string()).elem("IsTruncated", truncated.to_string());
@@ -1969,9 +1987,13 @@ impl Server {
         let enc = self.write_encryption(&r.parts.headers, bucket, None)?;
         let mut expect = self.expect(r, MAX_OBJECT_SIZE, !versioned)?;
         expect.encrypt = enc.as_ref().map(|(k, _)| k.clone());
-        // Refuse uploads that cannot fit before receiving them.
-        if let Some(len) = expect.len {
-            self.store.quota_allows(bucket, key, len)?;
+        // Refuse uploads that cannot fit before receiving them. Conditional writes skip this, so
+        // a failed precondition is reported as such (the writer still enforces the quota).
+        let conditional = r.header("if-match").is_some() || r.header("if-none-match").is_some();
+        if let Some(len) = expect.len
+            && !conditional
+        {
+            self.store.quota_allows(bucket, store::Incoming::Object(key), len)?;
         }
         let body = std::mem::replace(&mut r.body, BodyStream::empty());
         let ing = io::ingest(&self.store, body, expect).await?;
@@ -2286,6 +2308,9 @@ impl Server {
             return self.upload_part_copy(r, bucket, key, upload, part, part_key, &u.headers).await;
         }
         let mut expect = self.expect(r, MAX_PART_SIZE, false)?;
+        if let Some(len) = expect.len {
+            self.store.quota_allows(bucket, store::Incoming::Part { upload, part }, len)?;
+        }
         let expect_key = part_key.clone();
         expect.encrypt = part_key;
         let body = std::mem::replace(&mut r.body, BodyStream::empty());

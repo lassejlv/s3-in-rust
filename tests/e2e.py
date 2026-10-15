@@ -1204,11 +1204,11 @@ def t_authz_regressions():
     s3.delete_bucket(Bucket=rb)
 
 
-def _signed_request(c, method, path, data=b""):
+def _signed_request(c, method, path, data=b"", headers=None):
     """A botocore-signed raw request (for URLs boto3 has no operation for)."""
     from botocore.auth import S3SigV4Auth
     from botocore.awsrequest import AWSRequest
-    req = AWSRequest(method=method, url=f"{ENDPOINT}{path}", data=data)
+    req = AWSRequest(method=method, url=f"{ENDPOINT}{path}", data=data, headers=headers or {})
     S3SigV4Auth(c._request_signer._credentials.get_frozen_credentials(), "s3", "us-east-1").add_auth(req)
     return req
 
@@ -1349,9 +1349,9 @@ def t_notifications():
         srv.shutdown()
 
 
-def _raw(method, path, data=b""):
+def _raw(method, path, data=b"", headers=None):
     """Signed request with the main key: (status, body)."""
-    r = s3._endpoint.http_session.send(_signed_request(s3, method, path, data).prepare())
+    r = s3._endpoint.http_session.send(_signed_request(s3, method, path, data, headers).prepare())
     return r.status_code, r.content
 
 
@@ -1372,18 +1372,31 @@ def t_usage_and_quota():
         expect_error("QuotaExceeded", lambda: s3.put_object(Bucket=qb, Key="d", Body=b"d"))  # 4th object
         expect_error("QuotaExceeded", lambda: s3.put_object(Bucket=qb, Key="c", Body=b"c" * 401))  # 1001 bytes
         s3.put_object(Bucket=qb, Key="c", Body=b"c" * 400)  # exactly 1000 bytes: fits
-        # Multipart uploads are checked when they complete.
+        # Parts of unfinished multipart uploads count towards the byte quota.
         up = s3.create_multipart_upload(Bucket=qb, Key="m")
-        e = s3.upload_part(Bucket=qb, Key="m", UploadId=up["UploadId"], PartNumber=1, Body=b"m")["ETag"]
-        expect_error("QuotaExceeded", lambda: s3.complete_multipart_upload(
-            Bucket=qb, Key="m", UploadId=up["UploadId"], MultipartUpload={"Parts": [{"PartNumber": 1, "ETag": e}]}))
-        s3.abort_multipart_upload(Bucket=qb, Key="m", UploadId=up["UploadId"])
+        mp = dict(Bucket=qb, Key="m", UploadId=up["UploadId"], PartNumber=1)
+        expect_error("QuotaExceeded", lambda: s3.upload_part(**mp, Body=b"m"))  # bucket is full
+        s3.delete_object(Bucket=qb, Key="c")  # 600 bytes, 2 objects
+        e = s3.upload_part(**mp, Body=b"m" * 300)["ETag"]
+        st, body = _raw("GET", f"/{qb}?usage")
+        assert b"<Bytes>600</Bytes>" in body and b"<MultipartBytes>300</MultipartBytes>" in body, body
+        expect_error("QuotaExceeded", lambda: s3.put_object(Bucket=qb, Key="e", Body=b"e" * 101))  # 600 + 300 + 101
+        expect_error("QuotaExceeded", lambda: s3.upload_part(**{**mp, "PartNumber": 2}, Body=b"m" * 101))
+        e = s3.upload_part(**mp, Body=b"m" * 400)["ETag"]  # replaces part 1: 600 + 400
+        s3.complete_multipart_upload(Bucket=qb, Key="m", UploadId=up["UploadId"],
+                                     MultipartUpload={"Parts": [{"PartNumber": 1, "ETag": e}]})
+        st, body = _raw("GET", f"/{qb}?usage")
+        assert b"<Objects>3</Objects>" in body and b"<Bytes>1000</Bytes>" in body and b"<MultipartBytes>0<" in body, body
+        # A conditional write that fails its precondition reports that, not the quota.
+        st, _ = _raw("PUT", f"/{qb}/a", b"q" * 2000, headers={"If-Match": '"nope"'})
+        assert st == 412, st
         assert _raw("DELETE", f"/{qb}?quota")[0] == 204
         s3.put_object(Bucket=qb, Key="d", Body=b"d" * 5000)
         st, body = _raw("GET", f"/{qb}?usage")
         assert b"<Objects>4</Objects>" in body and b"<Bytes>6000</Bytes>" in body and b"MaxBytes" not in body, body
+        # Bucket names and sizes are only in /_metrics when it is protected by a token.
         metrics = urllib.request.urlopen(f"{ENDPOINT}/_metrics").read().decode()
-        assert f's3rs_bucket_bytes{{bucket="{qb}"}} 6000' in metrics, [l for l in metrics.splitlines() if qb in l]
+        assert "s3rs_bucket_bytes" not in metrics, [l for l in metrics.splitlines() if "bucket_" in l]
         # Read-only keys may see usage but not change quotas.
         if RO_AK:
             ro = boto3.client("s3", endpoint_url=ENDPOINT, aws_access_key_id=RO_AK, aws_secret_access_key=RO_SK, region_name="us-east-1",
@@ -1412,7 +1425,24 @@ def t_object_attributes():
     assert op["TotalPartsCount"] == 2 and op["IsTruncated"] and op["Parts"][0]["Size"] == 5 << 20, op
     a = s3.get_object_attributes(Bucket=B, Key="attrs-mp", ObjectAttributes=["ObjectParts"], PartNumberMarker=1)
     assert [p["PartNumber"] for p in a["ObjectParts"]["Parts"]] == [2], a
+    a = s3.get_object_attributes(Bucket=B, Key="attrs-mp", ObjectAttributes=["ObjectParts"])
+    assert not a["ObjectParts"]["IsTruncated"] and "NextPartNumberMarker" not in a["ObjectParts"], a
+    expect_error("InvalidArgument", lambda: s3.get_object_attributes(Bucket=B, Key="attrs-mp", ObjectAttributes=["ObjectParts"],
+                                                                    PartNumberMarker=-1))
     expect_error("NoSuchKey", lambda: s3.get_object_attributes(Bucket=B, Key="nope", ObjectAttributes=["ETag"]))
+    # Attributes need permission to read the object too (the ETag is usually the content's MD5).
+    ab = B + "-attrs"
+    s3.create_bucket(Bucket=ab)
+    try:
+        s3.put_object(Bucket=ab, Key="secret", Body=b"password123")
+        s3.put_bucket_policy(Bucket=ab, Policy=json.dumps({"Version": "2012-10-17", "Statement": [
+            {"Effect": "Deny", "Principal": "*", "Action": "s3:GetObject", "Resource": f"arn:aws:s3:::{ab}/secret"}]}))
+        expect_error("AccessDenied", lambda: s3.get_object_attributes(Bucket=ab, Key="secret", ObjectAttributes=["ETag"]))
+        s3.delete_bucket_policy(Bucket=ab)
+        assert s3.get_object_attributes(Bucket=ab, Key="secret", ObjectAttributes=["ETag"])["ETag"]
+    finally:
+        s3.delete_object(Bucket=ab, Key="secret")
+        s3.delete_bucket(Bucket=ab)
     s3.delete_object(Bucket=B, Key="attrs.txt")
     s3.delete_object(Bucket=B, Key="attrs-mp")
 

@@ -100,7 +100,8 @@ The server refuses to start without credentials unless you pass `--anonymous`.
 
 `GET /_health` returns `200 ok`. `GET /_metrics` serves Prometheus metrics: request counts by method
 and status, a latency histogram, bytes in and out, lifecycle activity, and the bucket count. Both
-endpoints are public unless you set `--metrics-token`, which applies to `/_metrics` only.
+endpoints are public unless you set `--metrics-token`, which applies to `/_metrics` only. Per-bucket
+series (which name every bucket) are included only when `/_metrics` is protected by a token.
 
 On `SIGTERM` or Ctrl-C the server stops accepting connections and waits up to 30 seconds for
 in-flight requests to finish. It then flushes metadata and records a clean shutdown. If a run
@@ -330,20 +331,26 @@ redirects use the scheme from `X-Forwarded-Proto`.
 
 The server keeps a running count of each bucket's stored object versions and bytes. It is updated
 in the same transaction as every write, so it is always exact and costs no scans. Delete markers
-don't count, and noncurrent versions do. `/_metrics` exports these counts as
-`s3rs_bucket_objects{bucket=...}` and `s3rs_bucket_bytes{bucket=...}`, and the console shows
-them.
+don't count, and noncurrent versions do. Parts of unfinished multipart uploads are counted
+separately. With `--metrics-token` set, `/_metrics` exports the counts as
+`s3rs_bucket_objects{bucket=...}` and `s3rs_bucket_bytes{bucket=...}`. The console shows them too.
+
+The counters are recomputed at startup after a crash, or after the data directory was used by a
+release without usage tracking. `s3rs fsck --repair` also rebuilds them.
 
 Quotas cap a bucket's size and/or object count. Writes that would exceed them fail with
 `403 QuotaExceeded`:
-- Plain uploads with a known length are refused before any data is received.
-- Multipart uploads are checked when they complete.
-- An unversioned overwrite counts only the size difference.
+- Uploads and parts with a known length are refused before any data is received.
+- Bytes in unfinished multipart uploads count towards the byte quota until the upload completes
+  or is aborted.
+- An overwrite that replaces a stored version (unversioned, or versioning suspended) counts only
+  the size difference.
 
 These are s3rs extensions (bucket subresources, signed like any S3 request):
 
 ```bash
-# usage: <BucketUsage><Objects>…</Objects><Bytes>…</Bytes>[<MaxObjects/MaxBytes>]</BucketUsage>
+# usage: <BucketUsage><Objects>…</Objects><Bytes>…</Bytes><MultipartBytes>…</MultipartBytes>
+#        [<MaxObjects/MaxBytes>]</BucketUsage>
 GET    /photos?usage
 # set a quota (0 or a missing element = unlimited)
 PUT    /photos?quota      <BucketQuota><MaxBytes>10737418240</MaxBytes><MaxObjects>100000</MaxObjects></BucketQuota>
@@ -368,9 +375,12 @@ s3rs fsck --data-dir /data --repair                 # remove orphans, rebuild us
 
 The fast check confirms:
 - Every object version's data (files or inline blobs) exists with exactly the expected size.
-- Multipart parts exist.
-- There are no orphaned data files.
-- Usage counters match the stored objects.
+- Multipart upload parts exist with the expected size.
+- There are no orphaned data files or inline blobs.
+- Usage counters match the stored objects and parts.
+
+It also works on a data directory from a release before usage tracking. Its counters are then
+reported as missing, and the server computes them on its next start.
 
 `--deep` also reads all data back:
 - Each ETag is verified: the MD5 for single-part objects, and the composite `md5-of-part-md5s-N`
@@ -378,8 +388,9 @@ The fast check confirms:
 - SSE-S3 objects are decrypted with the given key, which authenticates every 64 KiB chunk.
 - SSE-C objects can't be verified without their customer keys and are counted as skipped.
 
-`--repair` only removes orphaned files and rebuilds usage counters. It never modifies or deletes
-object data. The exit status is 0 when everything is consistent, and 1 when it found problems.
+`--repair` only removes orphaned files and inline blobs and rebuilds usage counters. It never
+modifies or deletes object data. If some metadata records can't be read, it removes nothing: the
+files those records refer to are unknown. The exit status is 0 when everything is consistent, and 1 when it found problems.
 CI runs `fsck --deep` on the data left by the full test suite after a graceful shutdown.
 
 ## Event notifications
@@ -551,3 +562,8 @@ every push.
 - Each object can be at most 5 GiB on a single PUT. A multipart upload can have up to 10,000 parts of
   5 GiB each, the same limits as S3.
 - Only one `s3rs` process can use a data directory at a time.
+- Parts of a completed multipart object are numbered 1..N in order, for `GET ?partNumber=` and
+  GetObjectAttributes, even if the upload used non-consecutive part numbers (S3 keeps the
+  original numbers). Clients and SDKs that upload consecutive parts see no difference.
+- GetObjectAttributes needs `s3:GetObject` (or `s3:GetObjectVersion`) as well as
+  `s3:GetObjectAttributes`, as in S3.

@@ -49,7 +49,12 @@ pub const CONFIG_KINDS: &[&str] = &[
 const USAGE: TableDefinition<&str, (u64, u64)> = TableDefinition::new("usage");
 /// Small server-wide state values (e.g. the usage bookkeeping version).
 const STATE: TableDefinition<&str, u64> = TableDefinition::new("state");
-const USAGE_VERSION: u64 = 1;
+/// Per-bucket bytes held by multipart upload parts that are not part of an object yet.
+const PART_BYTES: TableDefinition<&str, u64> = TableDefinition::new("part_bytes");
+const USAGE_VERSION: u64 = 2;
+/// Contents of the clean-shutdown marker. Older releases wrote an empty marker without
+/// maintaining usage, so any other content (or none) makes the next start recompute usage.
+const CLEAN_TAG: &[u8] = b"usage-v2\n";
 
 /// A bucket quota; 0 means unlimited.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -188,7 +193,20 @@ pub struct Store {
     pub inline_threshold: usize,
     db: Arc<Database>,
     writer: mpsc::Sender<Job>,
-    deleter: mpsc::Sender<Vec<u128>>,
+    deleter: mpsc::Sender<Gc>,
+}
+
+/// What an upload is for (see `Store::quota_allows`).
+pub enum Incoming<'a> {
+    Object(&'a str),
+    Part { upload: u128, part: u32 },
+}
+
+/// Work for the file deletion thread.
+enum Gc {
+    Remove(Vec<u128>),
+    /// Reply once every earlier removal is done.
+    Sync(mpsc::Sender<()>),
 }
 
 #[derive(Debug, Clone)]
@@ -384,7 +402,9 @@ impl Store {
         // The marker exists only between a clean shutdown and the next start. If the database
         // exists but the marker does not, the last run crashed and may have left orphaned files.
         let marker = root.join(CLEAN_MARKER);
-        let unclean = root.join("meta.redb").exists() && !marker.exists();
+        let existed = root.join("meta.redb").exists();
+        let unclean = existed && !marker.exists();
+        let tagged = std::fs::read(&marker).is_ok_and(|m| m == CLEAN_TAG);
         let _ = std::fs::remove_file(&marker);
 
         let db = Database::builder().set_cache_size(cfg.cache_bytes).create(root.join("meta.redb"))?;
@@ -399,9 +419,11 @@ impl Store {
             txn.open_table(VERSIONS)?;
             txn.open_table(USAGE)?;
             txn.open_table(STATE)?;
+            txn.open_table(PART_BYTES)?;
             txn.commit()?;
         }
-        rebuild_usage_if_needed(&db)?;
+        // After a crash or a run of an older release, the counters may not match the data.
+        rebuild_usage_if_needed(&db, existed && !tagged)?;
         if unclean {
             let started = std::time::Instant::now();
             match collect_orphans(&db, &root) {
@@ -414,10 +436,17 @@ impl Store {
         }
         let db = Arc::new(db);
 
-        let (del_tx, del_rx) = mpsc::channel::<Vec<u128>>();
+        let (del_tx, del_rx) = mpsc::channel::<Gc>();
         let del_root = root.clone();
         std::thread::Builder::new().name("s3rs-gc".into()).spawn(move || {
-            for ids in del_rx {
+            for msg in del_rx {
+                let ids = match msg {
+                    Gc::Remove(ids) => ids,
+                    Gc::Sync(done) => {
+                        let _ = done.send(());
+                        continue;
+                    }
+                };
                 for id in ids {
                     if let Err(e) = std::fs::remove_file(data_path(&del_root, id))
                         && e.kind() != std::io::ErrorKind::NotFound
@@ -437,9 +466,16 @@ impl Store {
         Ok(Arc::new(Store { root, fsync: cfg.fsync, inline_threshold: cfg.inline_threshold, db, writer: tx, deleter: del_tx }))
     }
 
-    /// Record that the store shut down cleanly (all metadata flushed, nothing in flight).
+    /// Record that the store shut down cleanly (all metadata flushed, nothing in flight). Waits
+    /// for pending file deletions first, so the data directory has no orphans; if they don't
+    /// finish in time, no marker is written and the next start runs the recovery scan.
     pub fn mark_clean_shutdown(&self) {
-        let _ = std::fs::write(self.root.join(CLEAN_MARKER), b"");
+        let (done, wait) = mpsc::channel();
+        if self.deleter.send(Gc::Sync(done)).is_ok() && wait.recv_timeout(Duration::from_secs(60)).is_ok() {
+            let _ = std::fs::write(self.root.join(CLEAN_MARKER), CLEAN_TAG);
+        } else {
+            eprintln!("shutdown: file deletions did not finish; the next start will run a recovery scan");
+        }
     }
 
     pub fn data_path(&self, id: u128) -> PathBuf {
@@ -453,7 +489,7 @@ impl Store {
     /// Schedule data files for deletion (used to clean up after failed writes).
     pub fn discard(&self, ids: Vec<u128>) {
         if !ids.is_empty() {
-            let _ = self.deleter.send(ids);
+            let _ = self.deleter.send(Gc::Remove(ids));
         }
     }
 
@@ -623,39 +659,52 @@ impl Store {
         Ok(res)
     }
 
-    /// A bucket configuration document, if set. Errors with NoSuchBucket.
     /// (object versions, bytes) stored in a bucket.
     pub fn bucket_usage(&self, bucket: &str) -> S3Result<(u64, u64)> {
         Ok(self.db.begin_read()?.open_table(USAGE)?.get(bucket)?.map(|v| v.value()).unwrap_or((0, 0)))
     }
 
-    /// Early quota check before receiving an upload of `size` bytes to `key` (the writer
-    /// checks again atomically when the upload is committed).
-    pub fn quota_allows(&self, bucket: &str, key: &str, size: u64) -> S3Result<()> {
+    /// Early quota check before receiving `size` bytes for `target`. The writer checks again
+    /// atomically when the data is committed.
+    pub fn quota_allows(&self, bucket: &str, target: Incoming, size: u64) -> S3Result<()> {
         let txn = self.db.begin_read()?;
         let Some(q) = txn.open_table(CONFIG)?.get((bucket, "quota"))?.and_then(|v| Quota::decode(v.value())) else {
             return Ok(());
         };
-        let (n, b) = txn.open_table(USAGE)?.get(bucket)?.map(|v| v.value()).unwrap_or((0, 0));
-        let versioned = Versioning::parse(txn.open_table(CONFIG)?.get((bucket, "versioning"))?.as_ref().map(|v| v.value()))
-            == Versioning::Enabled;
-        let replaced = if versioned {
-            None
-        } else {
-            txn.open_table(OBJECTS)?
-                .get(obj_key(bucket, key).as_slice())?
-                .map(|v| ObjectMeta::decode_summary(v.value()))
-                .transpose()?
-                .map(|m| m.size)
+        let usage = txn.open_table(USAGE)?.get(bucket)?.map(|v| v.value()).unwrap_or((0, 0));
+        let parts = txn.open_table(PART_BYTES)?.get(bucket)?.map(|v| v.value()).unwrap_or(0);
+        let delta = match target {
+            Incoming::Part { upload, part } => {
+                let old = txn.open_table(PARTS)?.get((upload, part))?.map(|v| PartMeta::decode(v.value())).transpose()?;
+                QuotaDelta { add: size, freed_parts: old.map_or(0, |p| p.size), ..Default::default() }
+            }
+            Incoming::Object(key) => {
+                let versioned =
+                    Versioning::parse(txn.open_table(CONFIG)?.get((bucket, "versioning"))?.as_ref().map(|v| v.value()))
+                        == Versioning::Enabled;
+                // Approximate (the writer's check is exact): assume an overwrite frees the
+                // current object unless the bucket keeps every version.
+                let replaced = if versioned {
+                    None
+                } else {
+                    txn.open_table(OBJECTS)?
+                        .get(obj_key(bucket, key).as_slice())?
+                        .map(|v| ObjectMeta::decode_summary(v.value()))
+                        .transpose()?
+                        .map(|m| m.size)
+                };
+                QuotaDelta::object(size, replaced)
+            }
         };
-        let (n_after, b_after) = match replaced {
-            Some(old) => (n, b.saturating_sub(old).saturating_add(size)),
-            None => (n + 1, b.saturating_add(size)),
-        };
-        if (q.max_objects > 0 && n_after > q.max_objects) || (q.max_bytes > 0 && b_after > q.max_bytes) {
+        if !delta.allowed(&q, usage, parts) {
             return Err(quota_exceeded());
         }
         Ok(())
+    }
+
+    /// Bytes held by unfinished multipart uploads in a bucket.
+    pub fn bucket_part_bytes(&self, bucket: &str) -> S3Result<u64> {
+        Ok(self.db.begin_read()?.open_table(PART_BYTES)?.get(bucket)?.map(|v| v.value()).unwrap_or(0))
     }
 
     /// Usage of every bucket (for metrics).
@@ -670,6 +719,7 @@ impl Store {
         Ok(out)
     }
 
+    /// A bucket configuration document, if set. Errors with NoSuchBucket.
     pub fn bucket_config(&self, bucket: &str, kind: &str) -> S3Result<Option<Vec<u8>>> {
         let txn = self.db.begin_read()?;
         if txn.open_table(BUCKETS)?.get(bucket)?.is_none() {
@@ -1075,7 +1125,7 @@ pub fn data_path(root: &Path, id: u128) -> PathBuf {
 
 // -------------------------------------------------------------------- writer
 
-fn writer_loop(db: Arc<Database>, rx: mpsc::Receiver<Job>, deleter: mpsc::Sender<Vec<u128>>, durable: bool) {
+fn writer_loop(db: Arc<Database>, rx: mpsc::Receiver<Job>, deleter: mpsc::Sender<Gc>, durable: bool) {
     // In non-durable mode redb can only recycle pages freed by earlier commits once a durable
     // commit happens, so make one at least this often even under constant load.
     const DURABLE_EVERY: Duration = Duration::from_secs(1);
@@ -1129,6 +1179,7 @@ fn writer_loop(db: Arc<Database>, rx: mpsc::Receiver<Job>, deleter: mpsc::Sender
                     config: txn.open_table(CONFIG)?,
                     versions: txn.open_table(VERSIONS)?,
                     usage: txn.open_table(USAGE)?,
+                    part_bytes: txn.open_table(PART_BYTES)?,
                 };
                 for job in batch.iter_mut() {
                     let mut garbage = Vec::new();
@@ -1156,7 +1207,7 @@ fn writer_loop(db: Arc<Database>, rx: mpsc::Receiver<Job>, deleter: mpsc::Sender
                     last_durable = Instant::now();
                 }
                 if !obsolete.is_empty() {
-                    let _ = deleter.send(obsolete);
+                    let _ = deleter.send(Gc::Remove(obsolete));
                 }
                 for (job, r) in batch.into_iter().zip(results) {
                     let _ = job.reply.send(r);
@@ -1190,6 +1241,7 @@ struct Tables<'t> {
     config: redb::Table<'t, (&'static str, &'static str), &'static [u8]>,
     versions: redb::Table<'t, &'static [u8], &'static [u8]>,
     usage: redb::Table<'t, &'static str, (u64, u64)>,
+    part_bytes: redb::Table<'t, &'static str, u64>,
 }
 
 fn usage_add(tx: &mut Tables, bucket: &str, objects: i64, bytes: i64) -> S3Result<()> {
@@ -1200,60 +1252,122 @@ fn usage_add(tx: &mut Tables, bucket: &str, objects: i64, bytes: i64) -> S3Resul
     Ok(())
 }
 
-/// Refuse a write that would take the bucket over its quota. `freed` is what the write
-/// replaces (an unversioned overwrite discards the old object).
-fn check_quota(tx: &Tables, bucket: &str, add_bytes: u64, freed: Option<u64>) -> S3Result<()> {
+fn part_bytes_add(tx: &mut Tables, bucket: &str, bytes: i64) -> S3Result<()> {
+    let b = tx.part_bytes.get(bucket)?.map(|v| v.value()).unwrap_or(0).saturating_add_signed(bytes);
+    if b == 0 {
+        tx.part_bytes.remove(bucket)?;
+    } else {
+        tx.part_bytes.insert(bucket, b)?;
+    }
+    Ok(())
+}
+
+/// What a write changes, for the quota check.
+#[derive(Default)]
+struct QuotaDelta {
+    /// Bytes added.
+    add: u64,
+    /// Adds an object version (false for parts and for overwrites that replace one).
+    new_object: bool,
+    /// Bytes of objects the write discards.
+    freed: u64,
+    /// Bytes of multipart parts the write releases.
+    freed_parts: u64,
+}
+
+impl QuotaDelta {
+    /// An upload of `size` bytes replacing `replaced` (see `replaced_size`).
+    fn object(size: u64, replaced: Option<u64>) -> Self {
+        QuotaDelta { add: size, new_object: replaced.is_none(), freed: replaced.unwrap_or(0), freed_parts: 0 }
+    }
+
+    /// Whether `q` allows the write, given the bucket's `usage` and bytes in pending `parts`.
+    fn allowed(&self, q: &Quota, (n, b): (u64, u64), parts: u64) -> bool {
+        let n_after = n + self.new_object as u64;
+        let b_after = (b + parts).saturating_sub(self.freed + self.freed_parts).saturating_add(self.add);
+        !((q.max_objects > 0 && self.new_object && n_after > q.max_objects) || (q.max_bytes > 0 && b_after > q.max_bytes))
+    }
+}
+
+/// Refuse a write that would take the bucket over its quota. Bytes in multipart parts count
+/// towards the byte quota until the upload is completed or aborted.
+fn check_quota(tx: &Tables, bucket: &str, d: QuotaDelta) -> S3Result<()> {
     let Some(q) = tx.config.get((bucket, "quota"))?.and_then(|v| Quota::decode(v.value())) else { return Ok(()) };
-    let (n, b) = tx.usage.get(bucket)?.map(|v| v.value()).unwrap_or((0, 0));
-    let (n_after, b_after) = match freed {
-        Some(old) => (n, b.saturating_sub(old).saturating_add(add_bytes)),
-        None => (n + 1, b.saturating_add(add_bytes)),
-    };
-    if (q.max_objects > 0 && n_after > q.max_objects) || (q.max_bytes > 0 && b_after > q.max_bytes) {
+    let usage = tx.usage.get(bucket)?.map(|v| v.value()).unwrap_or((0, 0));
+    let parts = tx.part_bytes.get(bucket)?.map(|v| v.value()).unwrap_or(0);
+    if !d.allowed(&q, usage, parts) {
         return Err(quota_exceeded());
     }
     Ok(())
 }
 
-/// Bytes an upload of `key` would free: the current object, if the bucket keeps no history of it.
+/// Bytes an upload of `key` would free by replacing a stored object version: the current
+/// object if the bucket keeps no history of it, or (versioning suspended) the "null" version.
 fn replaced_size(tx: &Tables, bucket: &str, key: &str) -> S3Result<Option<u64>> {
     let state = versioning_state(tx, bucket)?;
-    Ok(match get_meta(tx, &obj_key(bucket, key))? {
-        Some(cur) if state == Versioning::Unversioned || (state == Versioning::Suspended && cur.version.is_none()) => {
-            Some(cur.size)
+    let cur = get_meta(tx, &obj_key(bucket, key))?;
+    Ok(match (state, cur) {
+        (Versioning::Unversioned, Some(cur)) => Some(cur.size),
+        (Versioning::Suspended, Some(cur)) if cur.version.is_none() => (!cur.delete_marker).then_some(cur.size),
+        (Versioning::Suspended, _) => {
+            // The new null version replaces a noncurrent null version (a delete marker frees nothing).
+            let p = ver_prefix(bucket, key);
+            let end = prefix_successor(&p).expect("prefix ends with 0");
+            let mut found = None;
+            for e in tx.versions.range::<&[u8]>(p.as_slice()..end.as_slice())? {
+                let m = ObjectMeta::decode(e?.1.value())?;
+                if m.version.is_none() && !m.delete_marker {
+                    found = Some(m.size);
+                }
+            }
+            found
         }
         _ => None,
     })
 }
 
-/// Compute per-bucket usage from scratch (first start with usage tracking).
-fn rebuild_usage_if_needed(db: &Database) -> S3Result<()> {
+/// Compute per-bucket usage from scratch (first start with usage tracking, or `force`).
+fn rebuild_usage_if_needed(db: &Database, force: bool) -> S3Result<()> {
     let txn = db.begin_write()?;
-    if txn.open_table(STATE)?.get("usage_version")?.map(|v| v.value()) == Some(USAGE_VERSION) {
+    if !force && txn.open_table(STATE)?.get("usage_version")?.map(|v| v.value()) == Some(USAGE_VERSION) {
         return Ok(());
     }
     let started = Instant::now();
     let mut usage: std::collections::HashMap<String, (u64, u64)> = std::collections::HashMap::new();
     let bucket_of = |k: &[u8]| String::from_utf8_lossy(&k[..k.iter().position(|b| *b == 0).unwrap_or(k.len())]).into_owned();
+    // Unreadable records are skipped (s3rs fsck reports them) rather than failing the start.
+    let mut skipped = 0u64;
     for e in txn.open_table(OBJECTS)?.iter()? {
         let (k, v) = e?;
-        let m = ObjectMeta::decode_summary(v.value())?;
+        let Ok(m) = ObjectMeta::decode_summary(v.value()) else {
+            skipped += 1;
+            continue;
+        };
         let u = usage.entry(bucket_of(k.value())).or_default();
         *u = (u.0 + 1, u.1 + m.size);
     }
     for e in txn.open_table(VERSIONS)?.iter()? {
         let (k, v) = e?;
-        let m = ObjectMeta::decode(v.value())?;
+        let Ok(m) = ObjectMeta::decode(v.value()) else {
+            skipped += 1;
+            continue;
+        };
         if !m.delete_marker {
             let u = usage.entry(bucket_of(k.value())).or_default();
             *u = (u.0 + 1, u.1 + m.size);
         }
     }
+    let parts = pending_part_bytes(&txn)?;
     {
         let mut t = txn.open_table(USAGE)?;
         t.retain(|_, _| false)?;
         for (b, u) in &usage {
             t.insert(b.as_str(), *u)?;
+        }
+        let mut t = txn.open_table(PART_BYTES)?;
+        t.retain(|_, _| false)?;
+        for (b, n) in &parts {
+            t.insert(b.as_str(), *n)?;
         }
         txn.open_table(STATE)?.insert("usage_version", USAGE_VERSION)?;
     }
@@ -1261,7 +1375,29 @@ fn rebuild_usage_if_needed(db: &Database) -> S3Result<()> {
     if !usage.is_empty() {
         eprintln!("usage: computed for {} bucket(s) in {:.1}s", usage.len(), started.elapsed().as_secs_f64());
     }
+    if skipped > 0 {
+        eprintln!("usage: skipped {skipped} unreadable object record(s); run s3rs fsck");
+    }
     Ok(())
+}
+
+/// Bytes in multipart upload parts per bucket.
+fn pending_part_bytes(txn: &redb::WriteTransaction) -> S3Result<std::collections::HashMap<String, u64>> {
+    let uploads = txn.open_table(UPLOADS)?;
+    let mut out: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+    let mut bucket_of: std::collections::HashMap<u128, Option<String>> = std::collections::HashMap::new();
+    for e in txn.open_table(PARTS)?.iter()? {
+        let (k, v) = e?;
+        let upload = k.value().0;
+        if let std::collections::hash_map::Entry::Vacant(slot) = bucket_of.entry(upload) {
+            slot.insert(uploads.get(upload)?.and_then(|u| UploadMeta::decode(u.value()).ok()).map(|u| u.bucket));
+        }
+        if let Some(Some(b)) = bucket_of.get(&upload) {
+            *out.entry(b.clone()).or_default() += PartMeta::decode(v.value()).map_or(0, |p| p.size);
+        }
+    }
+    out.retain(|_, n| *n > 0);
+    Ok(out)
 }
 
 fn check_cond(existing: Option<&ObjectMeta>, cond: &Option<WriteCond>) -> S3Result<()> {
@@ -1288,17 +1424,32 @@ fn get_meta(tx: &Tables, k: &[u8]) -> S3Result<Option<ObjectMeta>> {
 }
 
 fn drop_upload(tx: &mut Tables, upload: u128, garbage: &mut Vec<u128>) -> S3Result<()> {
-    tx.uploads.remove(upload)?;
+    let bucket = tx.uploads.remove(upload)?.map(|u| UploadMeta::decode(u.value())).transpose()?.map(|u| u.bucket);
     let mut keys = Vec::new();
+    let mut bytes = 0u64;
     for e in tx.parts.range((upload, 0)..=(upload, u32::MAX))? {
         let (k, v) = e?;
         keys.push(k.value().1);
-        garbage.push(PartMeta::decode(v.value())?.file);
+        let p = PartMeta::decode(v.value())?;
+        bytes += p.size;
+        garbage.push(p.file);
     }
     for p in keys {
         tx.parts.remove((upload, p))?;
     }
+    if let Some(b) = bucket {
+        part_bytes_add(tx, &b, -(bytes as i64))?;
+    }
     Ok(())
+}
+
+/// Bytes held by the parts of one upload.
+fn upload_part_bytes(tx: &Tables, upload: u128) -> S3Result<u64> {
+    let mut bytes = 0;
+    for e in tx.parts.range((upload, 0)..=(upload, u32::MAX))? {
+        bytes += PartMeta::decode(e?.1.value())?.size;
+    }
+    Ok(bytes)
 }
 
 // -------------------------------------------------------------------- versioning (writer side)
@@ -1601,6 +1752,7 @@ fn apply(tx: &mut Tables, op: Op, garbage: &mut Vec<u128>, last_seq: &mut u64) -
                 tx.config.remove((name.as_str(), *kind))?;
             }
             tx.usage.remove(name.as_str())?;
+            tx.part_bytes.remove(name.as_str())?;
             tx.buckets.remove(name.as_str())?;
             Ok(OpOut::Done)
         }
@@ -1613,7 +1765,7 @@ fn apply(tx: &mut Tables, op: Op, garbage: &mut Vec<u128>, last_seq: &mut u64) -
             if cond.is_some() {
                 check_cond(get_meta(tx, &k)?.as_ref(), &cond)?;
             }
-            check_quota(tx, &bucket, meta.size, replaced_size(tx, &bucket, &key)?)?;
+            check_quota(tx, &bucket, QuotaDelta::object(meta.size, replaced_size(tx, &bucket, &key)?))?;
             if let (Storage::Inline(id), Some(data)) = (&meta.storage, &inline) {
                 tx.inline.insert(*id, data.as_ref())?;
             }
@@ -1672,9 +1824,14 @@ fn apply(tx: &mut Tables, op: Op, garbage: &mut Vec<u128>, last_seq: &mut u64) -
             if u.bucket != bucket || u.key != key {
                 return Err(err::NoSuchUpload());
             }
-            if let Some(old) = tx.parts.insert((upload, part), meta.encode().as_slice())? {
-                garbage.push(PartMeta::decode(old.value())?.file);
+            let old = tx.parts.get((upload, part))?.map(|v| PartMeta::decode(v.value())).transpose()?;
+            let old_size = old.as_ref().map_or(0, |o| o.size);
+            check_quota(tx, &bucket, QuotaDelta { add: meta.size, freed_parts: old_size, ..Default::default() })?;
+            tx.parts.insert((upload, part), meta.encode().as_slice())?;
+            if let Some(old) = old {
+                garbage.push(old.file);
             }
+            part_bytes_add(tx, &bucket, meta.size as i64 - old_size as i64)?;
             Ok(OpOut::Done)
         }
         Op::Abort { bucket, key, upload } => {
@@ -1818,7 +1975,9 @@ fn apply(tx: &mut Tables, op: Op, garbage: &mut Vec<u128>, last_seq: &mut u64) -
             }
             let k = obj_key(&bucket, &key);
             check_cond(get_meta(tx, &k)?.as_ref(), &cond)?;
-            check_quota(tx, &bucket, size, replaced_size(tx, &bucket, &key)?)?;
+            let mut delta = QuotaDelta::object(size, replaced_size(tx, &bucket, &key)?);
+            delta.freed_parts = upload_part_bytes(tx, upload)?;
+            check_quota(tx, &bucket, delta)?;
 
             use md5::Digest;
             let etag = format!("\"{}-{}\"", util::hex(&md5::Md5::digest(&md5s)), parts.len());
@@ -2014,6 +2173,78 @@ mod tests {
             })
             .expect("store reopens");
         assert_eq!(store.bucket_usage("b").unwrap(), (2, 10));
+        drop(store);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn multipart_parts_count_towards_quotas() {
+        let (store, dir) = temp_store();
+        store.submit(Op::CreateBucket("b".into())).await.unwrap();
+        let quota = Quota { max_objects: 0, max_bytes: 100 };
+        store.submit(Op::SetBucketConfig { bucket: "b".into(), kind: "quota", value: Some(quota.encode()) }).await.unwrap();
+        let upload = util::new_id();
+        let u = UploadMeta { bucket: "b".into(), key: "k".into(), initiated_ms: 0, headers: vec![], tags: vec![] };
+        store.submit(Op::CreateUpload { id: upload, meta: u }).await.unwrap();
+        let part = |n: u32, size: u64| Op::PutPart {
+            upload,
+            bucket: "b".into(),
+            key: "k".into(),
+            part: n,
+            meta: PartMeta { size, md5: [n as u8; 16], mtime_ms: 0, file: util::new_id() },
+        };
+        store.submit(part(1, 60)).await.unwrap();
+        assert_eq!(store.bucket_part_bytes("b").unwrap(), 60);
+        // Parts count towards the byte quota, and a re-uploaded part replaces the old one.
+        assert_eq!(store.submit(part(2, 50)).await.err().unwrap().code, "QuotaExceeded");
+        assert!(store.quota_allows("b", Incoming::Part { upload, part: 2 }, 50).is_err());
+        assert!(store.quota_allows("b", Incoming::Part { upload, part: 1 }, 90).is_ok());
+        store.submit(part(1, 90)).await.unwrap();
+        assert_eq!(store.bucket_part_bytes("b").unwrap(), 90);
+        // Completing moves the bytes from parts to the object (no double counting).
+        let etag = util::hex(&[1u8; 16]);
+        store
+            .submit(Op::Complete { bucket: "b".into(), key: "k".into(), upload, parts: vec![(1, etag)], cond: None })
+            .await
+            .unwrap();
+        assert_eq!((store.bucket_usage("b").unwrap(), store.bucket_part_bytes("b").unwrap()), ((1, 90), 0));
+        // Aborting releases them.
+        let upload2 = util::new_id();
+        let u = UploadMeta { bucket: "b".into(), key: "k2".into(), initiated_ms: 0, headers: vec![], tags: vec![] };
+        store.submit(Op::CreateUpload { id: upload2, meta: u }).await.unwrap();
+        store
+            .submit(Op::PutPart {
+                upload: upload2,
+                bucket: "b".into(),
+                key: "k2".into(),
+                part: 1,
+                meta: PartMeta { size: 10, md5: [0; 16], mtime_ms: 0, file: util::new_id() },
+            })
+            .await
+            .unwrap();
+        assert_eq!(store.bucket_part_bytes("b").unwrap(), 10);
+        store.submit(Op::Abort { bucket: "b".into(), key: "k2".into(), upload: upload2 }).await.unwrap();
+        assert_eq!(store.bucket_part_bytes("b").unwrap(), 0);
+        drop(store);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn suspended_overwrite_frees_the_null_version() {
+        let (store, dir) = temp_store();
+        store.submit(Op::CreateBucket("b".into())).await.unwrap();
+        put(&store, "k", "12345").await; // null version
+        let versioning =
+            |v: &'static [u8]| Op::SetBucketConfig { bucket: "b".into(), kind: "versioning", value: Some(v.to_vec()) };
+        store.submit(versioning(b"Enabled")).await.unwrap();
+        put(&store, "k", "1234").await; // versioned current, null version is noncurrent
+        store.submit(versioning(b"Suspended")).await.unwrap();
+        assert_eq!(store.bucket_usage("b").unwrap(), (2, 9));
+        // At the limit, a new null version that replaces the old one still fits.
+        let quota = Quota { max_objects: 2, max_bytes: 9 };
+        store.submit(Op::SetBucketConfig { bucket: "b".into(), kind: "quota", value: Some(quota.encode()) }).await.unwrap();
+        put(&store, "k", "12345").await;
+        assert_eq!(store.bucket_usage("b").unwrap(), (2, 9));
         drop(store);
         let _ = std::fs::remove_dir_all(dir);
     }

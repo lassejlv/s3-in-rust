@@ -390,15 +390,28 @@ Checks a data directory while the server is stopped:
     for m in &r.usage_mismatches {
         println!("USAGE {m}{}", if repair { " (rebuilt)" } else { "" });
     }
+    let removed = if !repair {
+        ""
+    } else if r.orphans_kept {
+        " (kept: unreadable metadata may refer to them)"
+    } else {
+        " (removed)"
+    };
     if r.orphans > 0 {
-        println!("orphans: {} data file(s), {} bytes{}", r.orphans, r.orphan_bytes, if repair { " (removed)" } else { "" });
+        println!("orphans: {} data file(s), {} bytes{removed}", r.orphans, r.orphan_bytes);
+    }
+    if r.orphan_inline > 0 {
+        println!("orphans: {} inline data row(s){removed}", r.orphan_inline);
     }
     let fixed = repair && r.problems.is_empty();
     if r.ok() || fixed {
         println!("{}", if r.ok() { "OK" } else { "REPAIRED" });
         std::process::exit(0);
     }
-    println!("{} problem(s) found", r.problems.len() + r.usage_mismatches.len() + usize::from(r.orphans > 0));
+    println!(
+        "{} problem(s) found",
+        r.problems.len() + r.usage_mismatches.len() + usize::from(r.orphans > 0) + usize::from(r.orphan_inline > 0)
+    );
     std::process::exit(1);
 }
 

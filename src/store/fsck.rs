@@ -4,13 +4,14 @@
 //! data files and usage counters that disagree with the stored objects, and with `--deep`
 //! re-reads every object and verifies its ETag (MD5, or the multipart composite ETag), which
 //! also authenticates encrypted data. `--repair` removes orphaned files and rebuilds the usage
-//! counters; it never touches object data.
+//! counters; it never touches object data. Data directories written by releases before usage
+//! tracking can be checked too (their counters are reported as missing).
 
-use super::meta::{ObjectMeta, PartMeta, Storage};
-use super::{INLINE, OBJECTS, PARTS, STATE, USAGE, VERSIONS, data_path};
+use super::meta::{ObjectMeta, PartMeta, Storage, UploadMeta};
+use super::{INLINE, OBJECTS, PART_BYTES, PARTS, UPLOADS, USAGE, VERSIONS, data_path};
 use crate::crypt::{self, KeyKind, WrapKey};
 use crate::util;
-use redb::{Database, ReadableDatabase, ReadableTable};
+use redb::{Database, Key, ReadOnlyTable, ReadTransaction, ReadableDatabase, ReadableTable, TableDefinition, Value};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
@@ -24,13 +25,33 @@ pub struct Report {
     pub problems: Vec<String>,
     pub orphans: u64,
     pub orphan_bytes: u64,
+    /// Inline data rows no object refers to.
+    pub orphan_inline: u64,
+    /// Orphans were found but kept, because unreadable metadata may still refer to them.
+    pub orphans_kept: bool,
     pub usage_mismatches: Vec<String>,
 }
 
 impl Report {
     pub fn ok(&self) -> bool {
-        self.problems.is_empty() && self.orphans == 0 && self.usage_mismatches.is_empty()
+        self.problems.is_empty() && self.orphans == 0 && self.orphan_inline == 0 && self.usage_mismatches.is_empty()
     }
+}
+
+/// A table, or None if this database predates it.
+fn table<K: Key + 'static, V: Value + 'static>(
+    txn: &ReadTransaction,
+    def: TableDefinition<K, V>,
+) -> Result<Option<ReadOnlyTable<K, V>>, String> {
+    match txn.open_table(def) {
+        Ok(t) => Ok(Some(t)),
+        Err(redb::TableError::TableDoesNotExist(_)) => Ok(None),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+fn is_encrypted(headers: &[(String, String)]) -> bool {
+    headers.iter().any(|(k, _)| k == "x-amz-server-side-encryption" || k == "x-amz-server-side-encryption-customer-algorithm")
 }
 
 enum Enc {
@@ -63,12 +84,17 @@ pub fn run(root: &Path, deep: bool, master: Option<[u8; 32]>, repair: bool) -> R
     let master = master.map(|k| WrapKey::new(KeyKind::Master, k));
     let mut report = Report::default();
     let mut live: HashSet<u128> = HashSet::new();
+    let mut live_inline: HashSet<u128> = HashSet::new();
+    let mut orphan_inline: Vec<u128> = Vec::new();
+    // Set when a record cannot be decoded: the files it refers to are unknown, so nothing may
+    // be removed as an orphan.
+    let mut unreadable = false;
     let mut usage: HashMap<String, (u64, u64)> = HashMap::new();
     {
         let txn = db.begin_read().map_err(|e| e.to_string())?;
-        let inline = txn.open_table(INLINE).map_err(|e| e.to_string())?;
-        for table in [OBJECTS, VERSIONS] {
-            let t = txn.open_table(table).map_err(|e| e.to_string())?;
+        let inline = table(&txn, INLINE)?;
+        for def in [OBJECTS, VERSIONS] {
+            let Some(t) = table(&txn, def)? else { continue };
             for e in t.iter().map_err(|e| e.to_string())? {
                 let (k, v) = e.map_err(|e| e.to_string())?;
                 let raw = k.value();
@@ -81,6 +107,7 @@ pub fn run(root: &Path, deep: bool, master: Option<[u8; 32]>, repair: bool) -> R
                     Ok(m) => m,
                     Err(_) => {
                         report.problems.push(format!("{bucket}/{key}: unreadable metadata record"));
+                        unreadable = true;
                         continue;
                     }
                 };
@@ -102,39 +129,44 @@ pub fn run(root: &Path, deep: bool, master: Option<[u8; 32]>, repair: bool) -> R
                 };
                 let mut intact = true;
                 let mut digests: Vec<[u8; 16]> = Vec::new();
+                if let Storage::Inline(id) = &meta.storage {
+                    live_inline.insert(*id);
+                }
                 match &meta.storage {
-                    Storage::Inline(id) => match inline.get(*id).map_err(|e| e.to_string())? {
-                        None => {
-                            report.problems.push(format!("{label}: inline data is missing"));
-                            intact = false;
-                        }
-                        Some(data) => {
-                            let data = data.value();
-                            if data.len() as u64 != stored_len(meta.size) {
-                                report.problems.push(format!(
-                                    "{label}: inline data has {} bytes, expected {}",
-                                    data.len(),
-                                    stored_len(meta.size)
-                                ));
+                    Storage::Inline(id) => {
+                        match inline.as_ref().map(|t| t.get(*id)).transpose().map_err(|e| e.to_string())?.flatten() {
+                            None => {
+                                report.problems.push(format!("{label}: inline data is missing"));
                                 intact = false;
-                            } else if deep && let Some(k) = &key_for_deep {
-                                let plain = match k {
-                                    Some(k) => crypt::decrypt_range(k, data, 0, meta.size, meta.size).map_err(|e| e.message),
-                                    None => Ok(data.to_vec()),
-                                };
-                                match plain {
-                                    Ok(p) => {
-                                        use md5::Digest;
-                                        digests.push(md5::Md5::digest(&p).into());
-                                    }
-                                    Err(e) => {
-                                        report.problems.push(format!("{label}: cannot decrypt: {e}"));
-                                        intact = false;
+                            }
+                            Some(data) => {
+                                let data = data.value();
+                                if data.len() as u64 != stored_len(meta.size) {
+                                    report.problems.push(format!(
+                                        "{label}: inline data has {} bytes, expected {}",
+                                        data.len(),
+                                        stored_len(meta.size)
+                                    ));
+                                    intact = false;
+                                } else if deep && let Some(k) = &key_for_deep {
+                                    let plain = match k {
+                                        Some(k) => crypt::decrypt_range(k, data, 0, meta.size, meta.size).map_err(|e| e.message),
+                                        None => Ok(data.to_vec()),
+                                    };
+                                    match plain {
+                                        Ok(p) => {
+                                            use md5::Digest;
+                                            digests.push(md5::Md5::digest(&p).into());
+                                        }
+                                        Err(e) => {
+                                            report.problems.push(format!("{label}: cannot decrypt: {e}"));
+                                            intact = false;
+                                        }
                                     }
                                 }
                             }
                         }
-                    },
+                    }
                     Storage::Segments(segs) => {
                         for (id, len) in segs {
                             live.insert(*id);
@@ -199,22 +231,95 @@ pub fn run(root: &Path, deep: bool, master: Option<[u8; 32]>, repair: bool) -> R
                 }
             }
         }
-        for e in txn.open_table(PARTS).map_err(|e| e.to_string())?.iter().map_err(|e| e.to_string())? {
-            let (_, v) = e.map_err(|e| e.to_string())?;
-            let p = PartMeta::decode(v.value()).map_err(|e| e.message)?;
-            live.insert(p.file);
-            if !data_path(root, p.file).exists() {
-                report.problems.push(format!("multipart upload part file {} is missing", data_path(root, p.file).display()));
+        if let Some(t) = &inline {
+            for e in t.iter().map_err(|e| e.to_string())? {
+                let id = e.map_err(|e| e.to_string())?.0.value();
+                if !live_inline.contains(&id) {
+                    orphan_inline.push(id);
+                }
             }
         }
-        let stored: HashMap<String, (u64, u64)> = txn
-            .open_table(USAGE)
-            .map_err(|e| e.to_string())?
-            .iter()
-            .map_err(|e| e.to_string())?
-            .filter_map(|e| e.ok().map(|(k, v)| (k.value().to_string(), v.value())))
-            .filter(|(_, v)| *v != (0, 0))
-            .collect();
+        report.orphan_inline = orphan_inline.len() as u64;
+
+        // Multipart upload parts: files exist with the right size; bytes per bucket.
+        let uploads = table(&txn, UPLOADS)?;
+        let mut upload_info: HashMap<u128, Option<(String, bool)>> = HashMap::new();
+        let mut part_bytes: HashMap<String, u64> = HashMap::new();
+        if let Some(parts) = table(&txn, PARTS)? {
+            for e in parts.iter().map_err(|e| e.to_string())? {
+                let (k, v) = e.map_err(|e| e.to_string())?;
+                let (upload, num) = k.value();
+                let p = match PartMeta::decode(v.value()) {
+                    Ok(p) => p,
+                    Err(_) => {
+                        report.problems.push(format!("upload {}: part {num}: unreadable record", util::id_hex(upload)));
+                        unreadable = true;
+                        continue;
+                    }
+                };
+                live.insert(p.file);
+                if let std::collections::hash_map::Entry::Vacant(slot) = upload_info.entry(upload) {
+                    let u = match &uploads {
+                        Some(t) => t.get(upload).map_err(|e| e.to_string())?.map(|u| UploadMeta::decode(u.value())),
+                        None => None,
+                    };
+                    let info = match u {
+                        Some(Ok(u)) => Some((u.bucket, is_encrypted(&u.headers))),
+                        Some(Err(_)) => {
+                            report.problems.push(format!("upload {}: unreadable record", util::id_hex(upload)));
+                            None
+                        }
+                        None => {
+                            report.problems.push(format!("upload {}: parts without an upload record", util::id_hex(upload)));
+                            None
+                        }
+                    };
+                    slot.insert(info);
+                }
+                let path = data_path(root, p.file);
+                match (std::fs::metadata(&path), upload_info.get(&upload).cloned().flatten()) {
+                    (Err(_), _) => report.problems.push(format!("multipart upload part file {} is missing", path.display())),
+                    (Ok(m), Some((bucket, encrypted))) => {
+                        let want = if encrypted { crypt::encrypted_len(p.size) } else { p.size };
+                        if m.len() != want {
+                            report.problems.push(format!(
+                                "multipart upload part file {} has {} bytes, expected {want}",
+                                path.display(),
+                                m.len()
+                            ));
+                        }
+                        *part_bytes.entry(bucket).or_default() += p.size;
+                    }
+                    (Ok(_), None) => {}
+                }
+            }
+        }
+        part_bytes.retain(|_, n| *n > 0);
+        let stored_parts: HashMap<String, u64> = match table(&txn, PART_BYTES)? {
+            Some(t) => t
+                .iter()
+                .map_err(|e| e.to_string())?
+                .filter_map(|e| e.ok().map(|(k, v)| (k.value().to_string(), v.value())))
+                .filter(|(_, v)| *v != 0)
+                .collect(),
+            None => HashMap::new(),
+        };
+        for b in part_bytes.keys().chain(stored_parts.keys()).collect::<HashSet<_>>() {
+            let (got, want) = (stored_parts.get(b).copied().unwrap_or(0), part_bytes.get(b).copied().unwrap_or(0));
+            if got != want {
+                report.usage_mismatches.push(format!("{b}: recorded {got} bytes in multipart parts, actual {want}"));
+            }
+        }
+
+        let stored: HashMap<String, (u64, u64)> = match table(&txn, USAGE)? {
+            Some(t) => t
+                .iter()
+                .map_err(|e| e.to_string())?
+                .filter_map(|e| e.ok().map(|(k, v)| (k.value().to_string(), v.value())))
+                .filter(|(_, v)| *v != (0, 0))
+                .collect(),
+            None => HashMap::new(),
+        };
         let computed: HashMap<String, (u64, u64)> =
             usage.iter().filter(|(_, v)| **v != (0, 0)).map(|(k, v)| (k.clone(), *v)).collect();
         for (b, want) in &computed {
@@ -247,15 +352,25 @@ pub fn run(root: &Path, deep: bool, master: Option<[u8; 32]>, repair: bool) -> R
             }
         }
     }
+    report.orphans_kept = unreadable && (report.orphans > 0 || report.orphan_inline > 0);
     if repair {
-        for p in &orphan_paths {
-            let _ = std::fs::remove_file(p);
+        if !unreadable {
+            for p in &orphan_paths {
+                let _ = std::fs::remove_file(p);
+            }
+            if !orphan_inline.is_empty() {
+                let txn = db.begin_write().map_err(|e| e.to_string())?;
+                {
+                    let mut t = txn.open_table(INLINE).map_err(|e| e.to_string())?;
+                    for id in &orphan_inline {
+                        t.remove(*id).map_err(|e| e.to_string())?;
+                    }
+                }
+                txn.commit().map_err(|e| e.to_string())?;
+            }
         }
-        if !report.usage_mismatches.is_empty() {
-            let txn = db.begin_write().map_err(|e| e.to_string())?;
-            txn.open_table(STATE).map_err(|e| e.to_string())?.remove("usage_version").map_err(|e| e.to_string())?;
-            txn.commit().map_err(|e| e.to_string())?;
-            super::rebuild_usage_if_needed(&db).map_err(|e| e.message)?;
+        if !report.usage_mismatches.is_empty() && !unreadable {
+            super::rebuild_usage_if_needed(&db, true).map_err(|e| e.message)?;
         }
     }
     Ok(report)

@@ -2739,7 +2739,12 @@ fn apply(tx: &mut Tables, op: Op, garbage: &mut Vec<u128>, last_seq: &mut u64) -
                         let target = match &version {
                             Some(v) if valid_version_id(v) => find_version(tx, &bucket, &key, v)?.map(|(_, _, m)| m),
                             Some(_) => None,
-                            None => get_meta(tx, &obj_key(&bucket, &key))?.filter(|m| !m.delete_marker),
+                            // A delete marker as the latest version still exists for the
+                            // condition (its ETag is empty), as on S3-compatible servers.
+                            None => match get_meta(tx, &obj_key(&bucket, &key))? {
+                                Some(m) => Some(m),
+                                None => newest_noncurrent(tx, &bucket, &key)?.map(|(_, m)| m).filter(|m| m.delete_marker),
+                            },
                         };
                         if let Some(m) = target {
                             c.check(&m)?;

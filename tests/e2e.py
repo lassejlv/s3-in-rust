@@ -324,6 +324,18 @@ def t_conditional_deletes():
     expect_error("404", lambda: s3.head_object(Bucket=B, Key="cdel"))
     # Deleting what isn't there still succeeds.
     s3.delete_object(Bucket=B, Key="cdel", IfMatch='"nope"')
+    # In a versioned bucket, a delete marker as the latest version is what conditions see.
+    vb = "cdel-versioned-" + uuid.uuid4().hex[:6]
+    s3.create_bucket(Bucket=vb)
+    s3.put_bucket_versioning(Bucket=vb, VersioningConfiguration={"Status": "Enabled"})
+    s3.delete_object(Bucket=vb, Key="k", IfMatch='"nope"')  # nothing there
+    v = s3.put_object(Bucket=vb, Key="k", Body=b"v")["VersionId"]
+    assert s3.delete_object(Bucket=vb, Key="k")["DeleteMarker"]
+    expect_error("PreconditionFailed", lambda: s3.delete_object(Bucket=vb, Key="k", IfMatch='"nope"'))
+    s3.delete_object(Bucket=vb, Key="k", IfMatch="*")
+    for x in s3.list_object_versions(Bucket=vb).get("Versions", []) + s3.list_object_versions(Bucket=vb).get("DeleteMarkers", []):
+        s3.delete_object(Bucket=vb, Key=x["Key"], VersionId=x["VersionId"])
+    s3.delete_bucket(Bucket=vb)
     # If-None-Match with an ETag on writes.
     etag = s3.put_object(Bucket=B, Key="cdel", Body=b"1")["ETag"]
     expect_error("PreconditionFailed", lambda: s3.put_object(Bucket=B, Key="cdel", Body=b"2", IfNoneMatch=etag))

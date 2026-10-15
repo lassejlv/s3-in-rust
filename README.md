@@ -75,8 +75,9 @@ key. From the console you can:
 - Rename or move objects (in buckets without versioning; only metadata changes, so it is
   instant whatever the size).
 - Make single objects public (readable by anyone with their link) or private again.
-- Delete objects and whole folders, and change a bucket's versioning, public access and website
-  settings.
+- Delete objects and whole folders, and change a bucket's versioning, public access, website,
+  quota and lifecycle settings (delete objects or old versions after some days, clean up
+  unfinished uploads; rules set by other tools are kept).
 
 The console is three static files compiled into the binary. Every request is signed with SigV4
 inside the browser tab, so the server keeps no sessions and the console can do nothing an S3

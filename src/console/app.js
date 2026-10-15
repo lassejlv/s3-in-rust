@@ -756,6 +756,7 @@ async function renderPreview(key, h) {
 async function bucketSettings() {
   const b = state.bucket;
   let versioning = "Off", publicRead = false, lock = false, website = null, quota = { bytes: "", objects: "" };
+  let life = { expire: "", abort: "", noncurrent: "", others: [] };
   try {
     const v = await S3.xml("GET", `/${b}`, { query: { versioning: "" } });
     versioning = xmlText(v, "Status") || "Off";
@@ -763,6 +764,7 @@ async function bucketSettings() {
     publicRead = [...acl.getElementsByTagName("Grant")].some((g) => (xmlText(g, "URI") || "").endsWith("/AllUsers") && xmlText(g, "Permission") === "READ");
     try { await S3.request("GET", `/${b}`, { query: { "object-lock": "" } }); lock = true; } catch (_) { /* not enabled */ }
     try { const w = await S3.xml("GET", `/${b}`, { query: { website: "" } }); website = { index: xmlText(w, "Suffix"), error: xmlText(w, "Key") }; } catch (_) { /* none */ }
+    try { life = parseLifecycle(await S3.xml("GET", `/${b}`, { query: { lifecycle: "" } })); } catch (_) { /* none */ }
     try {
       const q = await S3.xml("GET", `/${b}`, { query: { quota: "" } });
       const mb = xmlText(q, "MaxBytes");
@@ -786,11 +788,16 @@ async function bucketSettings() {
     el("p", { class: "muted" }, "Websites are served on the server's website endpoint (--website-listen) and need public read access."),
     el("label", {}, "Quota: maximum size in GiB (empty = unlimited)", el("input", { id: "f-qbytes", type: "number", min: "0", step: "any", value: quota.bytes })),
     el("label", {}, "Quota: maximum number of objects (empty = unlimited)", el("input", { id: "f-qobjects", type: "number", min: "0", step: "1", value: quota.objects })),
+    el("label", {}, "Delete objects after (days; empty = never)", el("input", { id: "f-expire", type: "number", min: "1", step: "1", value: life.expire })),
+    el("label", {}, "Delete old versions after they're replaced (days)", el("input", { id: "f-noncurrent", type: "number", min: "1", step: "1", value: life.noncurrent })),
+    el("label", {}, "Clean up unfinished uploads after (days)", el("input", { id: "f-abort", type: "number", min: "1", step: "1", value: life.abort })),
+    life.others.length ? el("p", { class: "muted" }, `This bucket also has ${life.others.length} lifecycle rule(s) set by other tools; they are kept.`) : null,
     el("hr"),
     el("button", { type: "button", class: "danger", onclick: () => { wantsDelete = true; $("modal").close("cancel"); } }, "Delete bucket…"),
   ], "Save", () => ({
     ver: $("f-ver").value, acl: $("f-acl").value, web: $("f-web").checked, index: $("f-index").value.trim(), error: $("f-error").value.trim(),
     qbytes: $("f-qbytes").value.trim(), qobjects: $("f-qobjects").value.trim(),
+    expire: $("f-expire").value.trim(), noncurrent: $("f-noncurrent").value.trim(), abort: $("f-abort").value.trim(),
   }));
   if (wantsDelete) return deleteBucket(b);
   if (!choice) return;
@@ -818,9 +825,43 @@ async function bucketSettings() {
         await S3.request("DELETE", `/${b}`, { query: { quota: "" } });
       }
     }
+    if (choice.expire !== life.expire || choice.noncurrent !== life.noncurrent || choice.abort !== life.abort) {
+      const doc = lifecycleDoc(choice, life.others);
+      if (doc) {
+        await S3.request("PUT", `/${b}`, { query: { lifecycle: "" }, body: doc, headers: { "content-type": "application/xml" } });
+      } else {
+        await S3.request("DELETE", `/${b}`, { query: { lifecycle: "" } });
+      }
+    }
     toast("Settings saved");
     refreshUsage();
   } catch (e) { toast(e.message, true); }
+}
+
+// The console manages three whole-bucket lifecycle rules (by id); other rules are kept as they are.
+const LIFE_IDS = { expire: "console-expire", noncurrent: "console-noncurrent", abort: "console-abort" };
+
+function parseLifecycle(doc) {
+  const out = { expire: "", abort: "", noncurrent: "", others: [] };
+  for (const rule of doc.getElementsByTagName("Rule")) {
+    const id = xmlText(rule, "ID");
+    const enabled = xmlText(rule, "Status") === "Enabled";
+    if (id === LIFE_IDS.expire && enabled) out.expire = xmlText(rule, "Days") || "";
+    else if (id === LIFE_IDS.noncurrent && enabled) out.noncurrent = xmlText(rule, "NoncurrentDays") || "";
+    else if (id === LIFE_IDS.abort && enabled) out.abort = xmlText(rule, "DaysAfterInitiation") || "";
+    else out.others.push(new XMLSerializer().serializeToString(rule).replace(/ xmlns="[^"]*"/g, ""));
+  }
+  return out;
+}
+
+function lifecycleDoc(choice, others) {
+  const days = (v) => Math.max(1, Math.round(Number(v)));
+  const rule = (id, action) => `<Rule><ID>${id}</ID><Filter><Prefix></Prefix></Filter><Status>Enabled</Status>${action}</Rule>`;
+  const rules = [...others];
+  if (choice.expire) rules.push(rule(LIFE_IDS.expire, `<Expiration><Days>${days(choice.expire)}</Days></Expiration>`));
+  if (choice.noncurrent) rules.push(rule(LIFE_IDS.noncurrent, `<NoncurrentVersionExpiration><NoncurrentDays>${days(choice.noncurrent)}</NoncurrentDays></NoncurrentVersionExpiration>`));
+  if (choice.abort) rules.push(rule(LIFE_IDS.abort, `<AbortIncompleteMultipartUpload><DaysAfterInitiation>${days(choice.abort)}</DaysAfterInitiation></AbortIncompleteMultipartUpload>`));
+  return rules.length ? `<LifecycleConfiguration>${rules.join("")}</LifecycleConfiguration>` : null;
 }
 
 async function deleteBucket(b) {

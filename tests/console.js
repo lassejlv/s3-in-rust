@@ -164,6 +164,21 @@ const shot = (page, name) => (out ? page.screenshot({ path: `${out}/${name}.png`
   console.log('  usage with quota:', await page.textContent('#usage'));
   if (anon.status !== 200) throw new Error('public read not applied');
 
+  step('settings: lifecycle rules');
+  await page.click('#settings');
+  await page.waitForSelector('#f-expire');
+  await page.fill('#f-expire', '30');
+  await page.fill('#f-abort', '7');
+  await page.click('#modal-ok');
+  await page.waitForSelector('.toast:has-text("Settings saved")');
+  await page.click('#settings');
+  await page.waitForSelector('#f-expire');
+  if (await page.inputValue('#f-expire') !== '30' || await page.inputValue('#f-abort') !== '7') throw new Error('lifecycle not saved');
+  await page.fill('#f-expire', '');
+  await page.fill('#f-abort', '');
+  await page.click('#modal-ok');
+  await page.waitForSelector('.toast:has-text("Settings saved") >> nth=-1');
+
   step('delete selected (folder + files)');
   if (await page.isVisible('#details')) await page.click('#details-close');
   await page.check('#select-all');

@@ -93,6 +93,9 @@ const REPL: TableDefinition<&[u8], (u64, u64)> = TableDefinition::new("replicati
 /// -> (sequence number, time of the oldest change not yet replicated). They go back to REPL when
 /// their time comes (Op::ReplRequeue).
 const REPL_WAIT: TableDefinition<&[u8], (u64, u64)> = TableDefinition::new("replication_wait");
+/// Event notifications waiting to be delivered: webhook target id \0 sequence number (u64,
+/// big-endian, so each target's events are in order) -> the request body (see crate::events).
+const EVENTS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("event_queue");
 /// Access keys created through the admin API: access key -> record (see crate::keys).
 const KEYS: TableDefinition<&str, &[u8]> = TableDefinition::new("access_keys");
 const USAGE_VERSION: u64 = 2;
@@ -252,6 +255,8 @@ pub struct Store {
     gc_paused: Arc<std::sync::atomic::AtomicUsize>,
     /// Signalled when a commit added keys to the replication queue.
     pub repl_wake: Arc<tokio::sync::Notify>,
+    /// Counts commits that queued event notifications (delivery tasks watch it).
+    pub events_committed: tokio::sync::watch::Sender<u64>,
 }
 
 /// A key waiting to be replicated (see crate::replication).
@@ -483,6 +488,10 @@ pub enum Op {
         bucket: String,
         limit: usize,
     },
+    /// Queue event notifications: (queue key, body); see `Store::events`.
+    QueueEvents(Vec<(Vec<u8>, Vec<u8>)>),
+    /// Remove delivered (or abandoned) event notifications.
+    DeleteEvents(Vec<Vec<u8>>),
     /// Store an access key created through the admin API (refused if it exists).
     CreateKey {
         access_key: String,
@@ -634,6 +643,7 @@ impl Store {
             txn.open_table(PART_BYTES)?;
             txn.open_table(REPL)?;
             txn.open_table(REPL_WAIT)?;
+            txn.open_table(EVENTS)?;
             txn.open_table(KEYS)?;
             txn.commit()?;
         }
@@ -697,10 +707,12 @@ impl Store {
         let wdel = del_tx.clone();
         let durable = cfg.fsync;
         let repl_wake = Arc::new(tokio::sync::Notify::new());
+        let events_committed = tokio::sync::watch::Sender::new(0u64);
         std::thread::Builder::new().name("s3rs-writer".into()).spawn({
             let space = space.clone();
             let wake = repl_wake.clone();
-            move || writer_loop(wdb, rx, wdel, durable, space, wake)
+            let events = events_committed.clone();
+            move || writer_loop(wdb, rx, wdel, durable, space, wake, events)
         })?;
 
         Ok(Arc::new(Store {
@@ -713,6 +725,7 @@ impl Store {
             space,
             gc_paused,
             repl_wake,
+            events_committed,
         }))
     }
 
@@ -814,6 +827,45 @@ impl Store {
             });
         }
         Ok(out)
+    }
+
+    /// Queue an operation without waiting for it (event notifications are recorded this way, so
+    /// requests don't wait for them).
+    pub fn submit_detached(&self, op: Op) {
+        let (reply, _) = oneshot::channel();
+        let _ = self.writer.send(Job { op, reply });
+    }
+
+    /// Up to `limit` queued event notifications for a webhook target, oldest first: (queue key,
+    /// body).
+    pub fn events(&self, target: &str, limit: usize) -> S3Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        let txn = self.db.get()?.begin_read()?;
+        let lo = obj_key(target, "");
+        let hi = prefix_successor(&lo).expect("prefix ends with 0");
+        let mut out = Vec::new();
+        for e in txn.open_table(EVENTS)?.range::<&[u8]>(lo.as_slice()..hi.as_slice())?.take(limit) {
+            let (k, v) = e?;
+            out.push((k.value().to_vec(), v.value().to_vec()));
+        }
+        Ok(out)
+    }
+
+    /// Queued event notifications per webhook target.
+    pub fn event_counts(&self) -> S3Result<HashMap<String, u64>> {
+        let txn = self.db.get()?.begin_read()?;
+        let mut out: HashMap<String, u64> = HashMap::new();
+        for e in txn.open_table(EVENTS)?.iter()? {
+            let (k, _) = e?;
+            let k = k.value();
+            let target = String::from_utf8_lossy(&k[..k.iter().position(|b| *b == 0).unwrap_or(k.len())]).into_owned();
+            *out.entry(target).or_default() += 1;
+        }
+        Ok(out)
+    }
+
+    /// The queue keys of all event notifications for `target` (to drop a removed target's).
+    pub fn event_keys(&self, target: &str) -> S3Result<Vec<Vec<u8>>> {
+        Ok(self.events(target, usize::MAX)?.into_iter().map(|(k, _)| k).collect())
     }
 
     /// Access keys created through the admin API: (access key, record).
@@ -1489,6 +1541,7 @@ fn writer_loop(
     durable: bool,
     space: Arc<space::Space>,
     repl_wake: Arc<tokio::sync::Notify>,
+    events_committed: tokio::sync::watch::Sender<u64>,
 ) {
     let ballast = &space.ballast;
     // In non-durable mode redb can only recycle pages freed by earlier commits once a durable
@@ -1551,6 +1604,7 @@ fn writer_loop(
             continue;
         }
         let force_durable = batch.iter().any(|j| matches!(j.op, Op::Flush));
+        let events = batch.iter().any(|j| matches!(j.op, Op::QueueEvents(_)));
         let immediate = durable || force_durable || last_durable.elapsed() >= DURABLE_EVERY;
 
         // While the ballast can still be given up, keep the batch so a commit that fails on a
@@ -1592,6 +1646,9 @@ fn writer_loop(
             Ok(()) => {
                 if queued {
                     repl_wake.notify_one();
+                }
+                if events {
+                    events_committed.send_modify(|n| *n += 1);
                 }
                 if immediate {
                     // Durable: everything held back so far is now safe to delete.
@@ -1649,6 +1706,7 @@ fn run_batch(
             part_bytes: txn.open_table(PART_BYTES)?,
             repl: txn.open_table(REPL)?,
             repl_wait: txn.open_table(REPL_WAIT)?,
+            events: txn.open_table(EVENTS)?,
             keys: txn.open_table(KEYS)?,
         };
         // Replication rule prefixes per bucket, looked up once per batch.
@@ -1718,6 +1776,7 @@ struct Tables<'t> {
     part_bytes: redb::Table<'t, &'static str, u64>,
     repl: redb::Table<'t, &'static [u8], (u64, u64)>,
     repl_wait: redb::Table<'t, &'static [u8], (u64, u64)>,
+    events: redb::Table<'t, &'static [u8], &'static [u8]>,
     keys: redb::Table<'t, &'static str, &'static [u8]>,
 }
 
@@ -2263,6 +2322,18 @@ fn repl_enqueue(tx: &mut Tables, bucket: &str, keys: &[String]) -> S3Result<bool
 fn apply(tx: &mut Tables, op: Op, garbage: &mut Vec<u128>, last_seq: &mut u64) -> S3Result<OpOut> {
     match op {
         Op::Flush | Op::Ping => Ok(OpOut::Done),
+        Op::QueueEvents(items) => {
+            for (k, v) in items {
+                tx.events.insert(k.as_slice(), v.as_slice())?;
+            }
+            Ok(OpOut::Done)
+        }
+        Op::DeleteEvents(keys) => {
+            for k in keys {
+                tx.events.remove(k.as_slice())?;
+            }
+            Ok(OpOut::Done)
+        }
         Op::CreateKey { access_key, record } => {
             if tx.keys.get(access_key.as_str())?.is_some() {
                 return Err(S3Error::new("KeyAlreadyExists", hyper::StatusCode::CONFLICT, "The access key already exists."));

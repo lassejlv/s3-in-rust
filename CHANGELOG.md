@@ -41,7 +41,8 @@ First release.
 
 **Operations**
 - Web console at `/_console/`.
-- Prometheus metrics, JSON access logs, event notifications (webhooks and live streams).
+- Prometheus metrics, JSON access logs, event notifications (webhooks and live streams). Webhook
+  events are queued on disk and delivered in order, at least once, across outages and restarts.
 - `/_health` checks that the metadata database and its writer respond. `s3rs healthcheck` and a
   Docker `HEALTHCHECK` use it.
 - Native HTTPS with certificate reload, as the optional `tls` build feature.

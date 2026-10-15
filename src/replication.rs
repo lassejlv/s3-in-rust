@@ -334,7 +334,11 @@ impl Response {
 
 /// Connections to one target, reused between requests.
 #[derive(Default)]
-struct Pool(Mutex<Vec<SendRequest<Body>>>);
+struct Pool(Mutex<Vec<(SendRequest<Body>, Instant)>>);
+
+/// Idle connections older than this are not reused: servers close idle keep-alive connections
+/// (s3rs after 30 s), and a request on one that was just closed fails.
+const POOL_IDLE: Duration = Duration::from_secs(20);
 
 struct Request<'a> {
     method: hyper::Method,
@@ -652,7 +656,15 @@ impl Replicator {
                             tokio::time::timeout(PROBE_TIMEOUT, crate::events::connect::<Body>(&t.url, this.tls.as_ref())).await;
                         match conn {
                             Ok(Ok(c)) => {
-                                this.pools.lock().unwrap().entry(id.clone()).or_default().0.lock().unwrap().push(c);
+                                this.pools
+                                    .lock()
+                                    .unwrap()
+                                    .entry(id.clone())
+                                    .or_default()
+                                    .0
+                                    .lock()
+                                    .unwrap()
+                                    .push((c, Instant::now()));
                                 this.recovered(&id).await;
                             }
                             _ => {
@@ -939,8 +951,8 @@ impl Replicator {
         let pool = self.pools.lock().unwrap().entry(t.id.clone()).or_default().clone();
         let idle = {
             let mut conns = pool.0.lock().unwrap();
-            conns.retain(|c| !c.is_closed());
-            conns.pop()
+            conns.retain(|(c, idle)| !c.is_closed() && idle.elapsed() < POOL_IDLE);
+            conns.pop().map(|(c, _)| c)
         };
         let mut conn = match idle {
             Some(c) => c,
@@ -985,7 +997,7 @@ impl Replicator {
             .map_err(|_| SendError::Request(format!("{}: {} {path}: timed out", t.id, req.method)))?
             .map_err(|e| SendError::Request(format!("{}: {} {path}: {e}", t.id, req.method)))?;
         if !conn.is_closed() {
-            pool.0.lock().unwrap().push(conn);
+            pool.0.lock().unwrap().push((conn, Instant::now()));
         }
         Ok(r)
     }

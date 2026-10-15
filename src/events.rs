@@ -17,10 +17,13 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
-use tokio::sync::{broadcast, mpsc, watch};
+use tokio::sync::{broadcast, watch};
 
-const QUEUE: usize = 10_000;
-const ATTEMPTS: u32 = 5;
+/// Events kept per webhook target while it is unreachable; beyond that, new events are dropped.
+const MAX_QUEUED: u64 = 100_000;
+/// Events read from the queue at a time.
+const BATCH: usize = 100;
+const MAX_BACKOFF: Duration = Duration::from_secs(60);
 const TIMEOUT: Duration = Duration::from_secs(10);
 
 /// ARN of a webhook target in notification configurations.
@@ -265,12 +268,20 @@ pub struct Stats {
     pub delivered: AtomicU64,
     pub failed: AtomicU64,
     pub dropped: AtomicU64,
+    /// Events waiting to be delivered.
+    pub pending: AtomicU64,
+}
+
+/// A webhook target's queue (the events themselves are in the store).
+struct Queue {
+    len: AtomicU64,
 }
 
 pub struct Bus {
     store: Arc<Store>,
     live: broadcast::Sender<Arc<Event>>,
-    targets: HashMap<String, mpsc::Sender<(Arc<Event>, String)>>,
+    targets: HashMap<String, Arc<Queue>>,
+    region: String,
     /// Parsed notification rules per bucket; `None` cached for buckets without rules.
     rules: RwLock<HashMap<String, Option<Arc<Vec<Rule>>>>>,
     seq: AtomicU64,
@@ -290,17 +301,38 @@ impl Bus {
         tls: Option<Arc<crate::tls::ClientConfig>>,
     ) -> Arc<Bus> {
         let stats = Arc::new(Stats::default());
-        let mut senders = HashMap::new();
+        // Events queued before a restart are delivered; those for targets that were removed
+        // from the configuration are dropped.
+        let mut counts = store.event_counts().unwrap_or_else(|e| {
+            elog!("warning: cannot read the event queue: {}", e.message);
+            HashMap::new()
+        });
+        for (target, n) in counts.clone() {
+            if !targets.iter().any(|(id, _)| *id == target) {
+                elog!("webhook {target} is no longer configured: dropping its {n} queued event(s)");
+                if let Ok(keys) = store.event_keys(&target) {
+                    store.submit_detached(crate::store::Op::DeleteEvents(keys));
+                }
+                counts.remove(&target);
+            }
+        }
+        let mut queues = HashMap::new();
         for (id, url) in targets {
-            let (tx, rx) = mpsc::channel(QUEUE);
+            let n = counts.get(&id).copied().unwrap_or(0);
+            if n > 0 {
+                elog!("webhook {id}: {n} queued event(s) from before the restart");
+            }
+            stats.pending.fetch_add(n, Ordering::Relaxed);
+            let queue = Arc::new(Queue { len: AtomicU64::new(n) });
             let tls = if url.tls { tls.clone() } else { None };
-            tokio::spawn(deliver(id.clone(), url, tls, rx, region.clone(), secret.clone(), stats.clone()));
-            senders.insert(id, tx);
+            tokio::spawn(deliver(id.clone(), url, tls, store.clone(), queue.clone(), secret.clone(), stats.clone()));
+            queues.insert(id, queue);
         }
         Arc::new(Bus {
             store,
             live: broadcast::channel(4096).0,
-            targets: senders,
+            targets: queues,
+            region,
             rules: RwLock::new(HashMap::new()),
             seq: AtomicU64::new(now_ms() << 20),
             stats,
@@ -369,13 +401,25 @@ impl Bus {
         if listeners {
             let _ = self.live.send(ev.clone());
         }
+        let mut queued = Vec::new();
         for rule in rules.iter().flat_map(|r| r.iter()).filter(|r| r.matches(&ev)) {
-            if let Some(tx) = self.targets.get(&rule.target)
-                && tx.try_send((ev.clone(), rule.id.clone())).is_err()
-            {
-                // Full queue: the target is down or too slow. Count it rather than block writes.
+            let Some(queue) = self.targets.get(&rule.target) else { continue };
+            if queue.len.load(Ordering::Relaxed) >= MAX_QUEUED {
+                // The target has been down for a long time. Count it rather than fill the disk.
                 self.stats.dropped.fetch_add(1, Ordering::Relaxed);
+                continue;
             }
+            queue.len.fetch_add(1, Ordering::Relaxed);
+            self.stats.pending.fetch_add(1, Ordering::Relaxed);
+            let mut key = rule.target.as_bytes().to_vec();
+            key.push(0);
+            key.extend_from_slice(&self.seq.fetch_add(1, Ordering::Relaxed).to_be_bytes());
+            queued.push((key, ev.to_json(&self.region, &rule.id).into_bytes(), queue.clone()));
+        }
+        if !queued.is_empty() {
+            // Recorded by the writer without making the request wait; delivery starts once it
+            // is committed.
+            self.store.submit_detached(crate::store::Op::QueueEvents(queued.into_iter().map(|(k, b, _)| (k, b)).collect()));
         }
     }
 }
@@ -484,11 +528,29 @@ async fn post(
     body: &Bytes,
     signature: Option<&str>,
 ) -> Result<u16, String> {
+    let reused = sender.as_ref().is_some_and(|s| !s.is_closed());
+    match post_once(sender, url, tls, body, signature).await {
+        // A kept-alive connection the receiver had already closed: try a fresh one at once.
+        Err(_) if reused => post_once(sender, url, tls, body, signature).await,
+        r => r,
+    }
+}
+
+async fn post_once(
+    sender: &mut Option<Sender>,
+    url: &Url,
+    tls: Option<&Arc<crate::tls::ClientConfig>>,
+    body: &Bytes,
+    signature: Option<&str>,
+) -> Result<u16, String> {
     if sender.as_ref().is_none_or(|s| s.is_closed()) {
         *sender = Some(connect(url, tls).await?);
     }
     let s = sender.as_mut().unwrap();
-    s.ready().await.map_err(|e| e.to_string())?;
+    if let Err(e) = s.ready().await {
+        *sender = None;
+        return Err(e.to_string());
+    }
     let mut req = hyper::Request::post(url.path.as_str())
         .header("host", url.host_header())
         .header("content-type", "application/json")
@@ -510,52 +572,87 @@ async fn post(
     }
 }
 
-/// Deliver events to one webhook, in order, retrying with backoff.
+/// Deliver one webhook target's queued events, in order, at least once: an event is removed
+/// from the queue only after the target accepted it (2xx); until then it is retried with
+/// backoff, and the events behind it wait.
 async fn deliver(
     id: String,
     url: Url,
     tls: Option<Arc<crate::tls::ClientConfig>>,
-    mut rx: mpsc::Receiver<(Arc<Event>, String)>,
-    region: String,
+    store: Arc<Store>,
+    queue: Arc<Queue>,
     secret: Option<String>,
     stats: Arc<Stats>,
 ) {
     let mut sender: Option<Sender> = None;
     let mut warned_at = 0u64;
-    // After a delivery gives up, later events get a single attempt until the target answers
-    // again, so an outage doesn't make every queued event wait out the full backoff.
-    let mut down = false;
-    while let Some((ev, config_id)) = rx.recv().await {
-        let body = Bytes::from(ev.to_json(&region, &config_id));
-        let signature = secret.as_ref().map(|k| format!("sha256={}", util::hex(&crate::auth::hmac(k.as_bytes(), &body))));
-        let mut delay = Duration::from_millis(500);
-        let mut last_err = String::new();
-        let mut ok = false;
-        let attempts = if down { 1 } else { ATTEMPTS };
-        for attempt in 0..attempts {
+    let mut backoff = Duration::from_millis(500);
+    let mut failing = false;
+    let mut committed = store.events_committed.subscribe();
+    loop {
+        let st = store.clone();
+        let target = id.clone();
+        let batch = match tokio::task::spawn_blocking(move || st.events(&target, BATCH)).await {
+            Ok(Ok(b)) => b,
+            _ => Vec::new(),
+        };
+        if batch.is_empty() {
+            // New events are visible once the writer commits them.
+            tokio::select! {
+                _ = committed.changed() => {}
+                _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+            }
+            continue;
+        }
+        let mut done = Vec::new();
+        let mut error = None;
+        for (key, body) in batch {
+            let body = Bytes::from(body);
+            let signature = secret.as_ref().map(|k| format!("sha256={}", util::hex(&crate::auth::hmac(k.as_bytes(), &body))));
             match post(&mut sender, &url, tls.as_ref(), &body, signature.as_deref()).await {
-                Ok(status) if (200..300).contains(&status) => {
-                    ok = true;
+                Ok(status) if (200..300).contains(&status) => done.push(key),
+                Ok(status) => {
+                    error = Some(format!("HTTP {status}"));
                     break;
                 }
-                Ok(status) => last_err = format!("HTTP {status}"),
-                Err(e) => last_err = e,
-            }
-            if attempt + 1 < attempts {
-                tokio::time::sleep(delay).await;
-                delay *= 2;
+                Err(e) => {
+                    error = Some(e);
+                    break;
+                }
             }
         }
-        down = !ok;
-        if ok {
-            stats.delivered.fetch_add(1, Ordering::Relaxed);
-        } else {
-            stats.failed.fetch_add(1, Ordering::Relaxed);
-            // At most one log line per minute per target.
-            let now = now_ms() / 60_000;
-            if now != warned_at {
-                warned_at = now;
-                elog!("webhook {id}: delivery failed ({last_err}); events are dropped until it is reachable again");
+        if !done.is_empty() {
+            let n = done.len() as u64;
+            stats.delivered.fetch_add(n, Ordering::Relaxed);
+            queue.len.fetch_sub(n.min(queue.len.load(Ordering::Relaxed)), Ordering::Relaxed);
+            stats.pending.fetch_sub(n.min(stats.pending.load(Ordering::Relaxed)), Ordering::Relaxed);
+            if let Err(e) = store.submit(crate::store::Op::DeleteEvents(done)).await {
+                elog!("webhook {id}: updating the event queue failed: {}", e.message);
+            }
+        }
+        match error {
+            None => {
+                if failing {
+                    elog!("webhook {id}: delivering again");
+                }
+                failing = false;
+                backoff = Duration::from_millis(500);
+            }
+            Some(e) => {
+                stats.failed.fetch_add(1, Ordering::Relaxed);
+                failing = true;
+                // At most one log line per minute per target.
+                let now = now_ms() / 60_000;
+                if now != warned_at {
+                    warned_at = now;
+                    elog!(
+                        "webhook {id}: delivery failed ({e}); {} event(s) queued, retrying in {}s",
+                        queue.len.load(Ordering::Relaxed),
+                        backoff.as_secs_f64().ceil()
+                    );
+                }
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(MAX_BACKOFF);
             }
         }
     }

@@ -11,6 +11,7 @@ import json
 import os
 import sys
 import time
+import traceback
 import urllib.parse
 import urllib.request
 import uuid
@@ -50,7 +51,9 @@ def check(name, fn):
         print(f"  ok    {name}")
     except Exception as e:  # noqa: BLE001
         failures.append(name)
-        print(f"  FAIL  {name}: {type(e).__name__}: {e}")
+        frames = [f for f in traceback.extract_tb(e.__traceback__) if f.filename == __file__][1:]
+        where = "; ".join(f"line {f.lineno}: {f.line}" for f in frames[-2:])
+        print(f"  FAIL  {name}: {type(e).__name__}: {e} ({where})")
 
 
 def expect_error(code, fn):
@@ -1283,7 +1286,10 @@ def t_notifications():
         assert back["Id"] == "images" and back["QueueArn"] == "arn:s3rs:webhook::test", back
 
         def next_event():
-            path, sig, body = got.get(timeout=15)
+            try:
+                path, sig, body = got.get(timeout=15)
+            except queue.Empty:
+                raise AssertionError("no event arrived within 15 s") from None
             secret = os.environ.get("S3RS_WEBHOOK_SECRET")
             if secret:
                 want = "sha256=" + hmac.new(secret.encode(), body, "sha256").hexdigest()
@@ -1532,8 +1538,9 @@ def t_cleanup():
 if __name__ == "__main__":
     start = time.time()
     print(f"s3rs e2e against {ENDPOINT} (bucket {B})")
+    only = os.environ.get("S3RS_E2E_ONLY", "").split(",")  # e.g. S3RS_E2E_ONLY=notifications
     for name, fn in list(globals().items()):
-        if name.startswith("t_") and callable(fn):
+        if name.startswith("t_") and callable(fn) and (only == [""] or name[2:] in only):
             check(name[2:], fn)
     print(f"{'FAILED' if failures else 'passed'} in {time.time() - start:.1f}s; failures: {failures}")
     sys.exit(1 if failures else 0)

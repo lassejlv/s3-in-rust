@@ -127,6 +127,11 @@ impl Metrics {
             "# TYPE s3rs_throttled_requests_total counter\ns3rs_throttled_requests_total {}",
             self.throttled.load(Relaxed)
         );
+        let _ = writeln!(
+            o,
+            "# TYPE s3rs_notifications_pending gauge\ns3rs_notifications_pending {}",
+            self.events.pending.load(Relaxed)
+        );
         let r = &self.replication;
         let _ = writeln!(o, "# TYPE s3rs_replication_total counter");
         for (name, v) in

@@ -95,6 +95,7 @@ Scrape `/_metrics` (Prometheus text format) and load
 | `s3rs_notifications_total{result}` | `failed`/`dropped` webhook deliveries |
 | `s3rs_access_log_dropped_total` | stdout not keeping up with the access log |
 | `s3rs_throttled_requests_total` | clients hitting `--rate-limit` / `--rate-limit-anonymous` |
+| `s3rs_notifications_pending` | events waiting for a webhook that is down or rejecting them |
 | `s3rs_replication_pending`, `s3rs_replication_lag_seconds` | a growing replication backlog (target down, or writes outpacing it) |
 | `s3rs_replication_total{result}` | `failed` replication attempts (the log says why) |
 | `s3rs_bucket_objects`, `s3rs_bucket_bytes` | growth per bucket (served only with a metrics token) |
@@ -163,5 +164,5 @@ A backup holds the state at the moment it started. Writes made during the backup
 | Suspected corruption (bad disk, restored from a filesystem snapshot) | Stop the server and run `s3rs fsck --deep --encryption-key-file …`. `--repair` removes orphaned files and rebuilds counters. It never deletes object data, and it does nothing at all if some metadata can't be read. |
 | A key or certificate must be revoked | Edit the credentials file or replace the certificate, then `systemctl reload s3rs` (SIGHUP). If the reload fails, the old keys and certificate stay in use and the log says so loudly. |
 | Replication lag grows | The log names the failing target and the reason. `unreachable` or a connection error means the target is down or blocked: changes stay queued on disk and are sent when it is back. `403` means the target's credentials can't write to the destination bucket. `404 NoSuchBucket` means the destination bucket doesn't exist. Fix the targets file and `systemctl reload s3rs`. |
-| Webhook deliveries fail | Check `s3rs_notifications_total` and the log. While a target is down, events get one attempt each and are then dropped. Events are not queued on disk. |
+| Webhook deliveries fail | The log says why. Events wait on disk (`s3rs_notifications_pending`) and are retried until the target accepts them, in order. Up to 100,000 events are kept per target; beyond that, new ones are dropped and counted. |
 | Many slow clients, connections at the limit | Slow clients don't tie up threads, but each holds a connection. Raise `LimitNOFILE` and `--max-connections`, or put a proxy in front. |

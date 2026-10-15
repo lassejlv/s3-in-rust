@@ -707,13 +707,21 @@ How delivery works:
   Object keys are URL-encoded, and the body includes the size, ETag, version id and a sequencer.
 - **Signature:** with `--webhook-secret`, the `X-S3rs-Signature: sha256=<HMAC-SHA256 of the body>`
   header lets receivers verify it.
-- **Ordering and retries:** each target gets its events in order, over a reused connection, with
-  5 attempts and backoff.
-- **Outages:** while a target is down, events get a single attempt each, so a backlog drains
-  quickly once it recovers. Writes never wait for deliveries.
-- **Full queue:** at 10,000 queued events, new ones are dropped.
-- **Monitoring:** `s3rs_notifications_total{result="delivered|failed|dropped"}` in `/_metrics`
-  counts outcomes.
+- **Delivery is durable and at least once:**
+  - Events are queued on disk, per target.
+  - An event is removed from the queue only after the target answered `2xx`.
+  - Until then it is retried with backoff (up to a minute), and the events behind it wait. Each
+    target therefore gets its events in order, also across outages and restarts.
+  - A crash between a delivery and its removal from the queue can deliver an event twice; the
+    sequencer identifies duplicates.
+  - Writes never wait for deliveries.
+- **Full queue:** a target that is down long enough to collect 100,000 events gets no new ones
+  until it catches up. Dropped events are counted.
+- **Removed targets:** queued events for a target that is no longer configured are dropped at
+  startup.
+- **Monitoring:**
+  - `s3rs_notifications_total{result="delivered|failed|dropped"}` counts outcomes;
+  - `s3rs_notifications_pending` counts queued events.
 
 With a `--features tls` build, webhook URLs can be `https://`. Receivers' certificates are verified
 against the Mozilla root certificates, plus any CA certificates in `--webhook-ca` (for receivers with

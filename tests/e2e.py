@@ -982,6 +982,12 @@ def t_encryption():
     expect_error("InvalidRequest", lambda: s3.get_object(Bucket=eb, Key="ssec/obj"))
     expect_error("AccessDenied", lambda: s3.get_object(Bucket=eb, Key="ssec/obj", SSECustomerAlgorithm="AES256", SSECustomerKey=other))
     expect_error("400", lambda: s3.head_object(Bucket=eb, Key="ssec/obj"))
+    # A customer key without the algorithm header is refused (not stored unencrypted).
+    c2 = client()
+    noalg = {"x-amz-server-side-encryption-customer-key": base64.b64encode(key).decode(),
+             "x-amz-server-side-encryption-customer-key-md5": base64.b64encode(hashlib.md5(key).digest()).decode()}
+    c2.meta.events.register("before-call.s3.PutObject", lambda params, **kw: params["headers"].update(noalg))
+    expect_error("InvalidArgument", lambda: c2.put_object(Bucket=eb, Key="ssec/noalg", Body=b"x"))
     g = s3.get_object(Bucket=eb, Key="ssec/obj", **ck)
     assert g["Body"].read() == data and g["SSECustomerKeyMD5"]
     # The ETag of an SSE-C object must not reveal the plaintext MD5, and conditional requests

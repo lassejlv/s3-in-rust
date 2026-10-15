@@ -2520,6 +2520,15 @@ impl Server {
     /// store with the object (which are also returned on reads, as S3 does).
     fn write_encryption(&self, h: &HeaderMap, bucket: &str, sse_field: Option<&str>) -> S3Result<Encryption> {
         let sse = sse_field.or_else(|| header(h, "x-amz-server-side-encryption"));
+        // A customer key without the algorithm must not quietly store the object unencrypted.
+        if header(h, "x-amz-server-side-encryption-customer-algorithm").is_none()
+            && (header(h, "x-amz-server-side-encryption-customer-key").is_some()
+                || header(h, "x-amz-server-side-encryption-customer-key-md5").is_some())
+        {
+            return Err(err::InvalidArgument().with_message(
+                "Requests specifying Server Side Encryption with Customer provided keys must provide a valid encryption algorithm.",
+            ));
+        }
         if let Some(alg) = header(h, "x-amz-server-side-encryption-customer-algorithm") {
             if alg != "AES256" {
                 return Err(err::InvalidArgument().with_message("The encryption algorithm specified is not supported."));

@@ -60,6 +60,7 @@ errors! {
     BucketAlreadyOwnedByYou => CONFLICT, "Your previous request to create the named bucket succeeded and you already own it.";
     BucketNotEmpty => CONFLICT, "The bucket you tried to delete is not empty";
     EntityTooLarge => BAD_REQUEST, "Your proposed upload exceeds the maximum allowed object size.";
+    RequestTimeout => BAD_REQUEST, "Your socket connection to the server was not read from or written to within the timeout period.";
     EntityTooSmall => BAD_REQUEST, "Your proposed upload is smaller than the minimum allowed object size.";
     IncompleteBody => BAD_REQUEST, "You did not provide the number of bytes specified by the Content-Length HTTP header.";
     InvalidAccessKeyId => FORBIDDEN, "The AWS Access Key Id you provided does not exist in our records.";

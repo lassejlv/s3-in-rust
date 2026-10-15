@@ -20,7 +20,8 @@ use std::collections::VecDeque;
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::sync::Arc;
-use tokio::sync::{mpsc, oneshot};
+use std::time::Duration;
+use tokio::sync::mpsc;
 
 /// Write batches handed to the disk thread.
 const WRITE_CHUNK: usize = 1024 * 1024;
@@ -287,7 +288,7 @@ pub async fn ingest(store: &Arc<Store>, mut body: impl Source, e: Expect) -> S3R
             buf.reserve(l as usize);
         }
         loop {
-            match body.next().await? {
+            match next_chunk(&mut body).await? {
                 None => {
                     let mut h = Hashers::new(&e);
                     h.update(&buf);
@@ -309,46 +310,25 @@ pub async fn ingest(store: &Arc<Store>, mut body: impl Source, e: Expect) -> S3R
         }
     }
 
-    // Spill to a data file written by a blocking thread.
+    // Spill to a data file. Disk work (hashing, encryption, writes) runs on the blocking pool one
+    // chunk at a time, overlapped with receiving the next chunk, so a slow client never holds a
+    // blocking thread while it trickles data.
     let id = util::new_id();
     let tmp = store.tmp_path(id);
     let fsync = store.fsync;
-    let (tx, mut rx) = mpsc::channel::<Bytes>(4);
-    let mut hashers = Hashers::new(&e);
-    let tmp2 = tmp.clone();
-    let mut encryptor = e.encrypt.as_ref().map(crypt::Encryptor::new);
-    let writer = tokio::task::spawn_blocking(move || -> io::Result<(Hashers, u64)> {
-        let mut f = File::create(&tmp2)?;
-        let mut n = 0u64;
-        let mut sealed = Vec::new();
-        while let Some(b) = rx.blocking_recv() {
-            hashers.update(&b);
-            match &mut encryptor {
-                Some(enc) => {
-                    sealed.clear();
-                    enc.update(&b, &mut sealed);
-                    f.write_all(&sealed)?;
-                }
-                None => f.write_all(&b)?,
-            }
-            n += b.len() as u64;
-        }
-        if let Some(enc) = encryptor {
-            sealed.clear();
-            enc.finish(&mut sealed);
-            f.write_all(&sealed)?;
-        }
-        if fsync {
-            f.sync_data()?;
-        }
-        Ok((hashers, n))
+    let mut pipe = WritePipe::new(WriteState {
+        path: tmp.clone(),
+        f: None,
+        hashers: Hashers::new(&e),
+        encryptor: e.encrypt.as_ref().map(crypt::Encryptor::new),
+        sealed: Vec::new(),
+        n: 0,
     });
-
     let feed = async {
         let mut total = buf.len() as u64;
         let mut next_space_check = SPACE_CHECK_EVERY;
         loop {
-            match body.next().await? {
+            match next_chunk(&mut body).await? {
                 Some(b) => {
                     total += b.len() as u64;
                     if total > e.max_len {
@@ -359,29 +339,30 @@ pub async fn ingest(store: &Arc<Store>, mut body: impl Source, e: Expect) -> S3R
                         next_space_check = total + SPACE_CHECK_EVERY;
                     }
                     buf.extend_from_slice(&b);
-                    if buf.len() >= WRITE_CHUNK && tx.send(buf.split().freeze()).await.is_err() {
-                        return Ok(false);
+                    if buf.len() >= WRITE_CHUNK {
+                        pipe.write(buf.split().freeze()).await?;
                     }
                 }
                 None => {
-                    if !buf.is_empty() && tx.send(buf.split().freeze()).await.is_err() {
-                        return Ok(false);
+                    if !buf.is_empty() {
+                        pipe.write(buf.split().freeze()).await?;
                     }
-                    return Ok(true);
+                    return Ok(());
                 }
             }
         }
     };
-    let fed: S3Result<bool> = feed.await;
-    drop(tx);
-    let written = writer.await.map_err(S3Error::internal)?;
+    let fed: S3Result<()> = feed.await;
+    let written = match fed {
+        Ok(()) => pipe.finish(fsync).await,
+        Err(e) => {
+            pipe.abort().await;
+            Err(e)
+        }
+    };
 
     let verified = (|| {
-        let fed = fed?;
         let (h, n) = written?;
-        if !fed {
-            return Err(S3Error::internal("writer stopped early"));
-        }
         let (md5, checksum) = verify(h, n, &e, &body)?;
         Ok(Ingested { size: n, md5, checksum, data: Data::File(id) })
     })();
@@ -401,6 +382,124 @@ pub async fn ingest(store: &Arc<Store>, mut body: impl Source, e: Expect) -> S3R
         let _ = std::fs::remove_file(&tmp);
     }
     result
+}
+
+/// How long an upload may go without sending any body data.
+const BODY_IDLE: Duration = Duration::from_secs(60);
+/// How long a download may go without the client accepting any data.
+const SEND_IDLE: Duration = Duration::from_secs(120);
+
+/// The next chunk of a request body, failing with RequestTimeout if the client goes quiet.
+async fn next_chunk(body: &mut impl Source) -> S3Result<Option<Bytes>> {
+    tokio::time::timeout(BODY_IDLE, body.next()).await.map_err(|_| err::RequestTimeout())?
+}
+
+/// The state of a data file being written, moved to the blocking pool for each chunk.
+struct WriteState {
+    path: std::path::PathBuf,
+    f: Option<File>,
+    hashers: Hashers,
+    encryptor: Option<crypt::Encryptor>,
+    sealed: Vec<u8>,
+    n: u64,
+}
+
+impl WriteState {
+    fn file(&mut self) -> io::Result<&mut File> {
+        if self.f.is_none() {
+            self.f = Some(File::create(&self.path)?);
+        }
+        Ok(self.f.as_mut().expect("just created"))
+    }
+
+    fn write(&mut self, b: &[u8]) -> io::Result<()> {
+        self.hashers.update(b);
+        self.n += b.len() as u64;
+        match self.encryptor.as_mut() {
+            Some(enc) => {
+                self.sealed.clear();
+                enc.update(b, &mut self.sealed);
+                let sealed = std::mem::take(&mut self.sealed);
+                let r = self.file()?.write_all(&sealed);
+                self.sealed = sealed;
+                r
+            }
+            None => self.file()?.write_all(b),
+        }
+    }
+
+    fn finish(mut self, fsync: bool) -> io::Result<(Hashers, u64)> {
+        if let Some(enc) = self.encryptor.take() {
+            self.sealed.clear();
+            enc.finish(&mut self.sealed);
+            let sealed = std::mem::take(&mut self.sealed);
+            self.file()?.write_all(&sealed)?;
+        }
+        let f = self.file()?;
+        if fsync {
+            f.sync_data()?;
+        }
+        Ok((self.hashers, self.n))
+    }
+}
+
+/// Feeds an upload's chunks to an async writer task, which writes whatever is queued in one
+/// blocking-pool call and then waits (without a thread) for more. Up to four chunks can be
+/// queued, so receiving and writing overlap.
+struct WritePipe {
+    tx: Option<mpsc::Sender<Bytes>>,
+    task: tokio::task::JoinHandle<io::Result<WriteState>>,
+}
+
+impl WritePipe {
+    fn new(state: WriteState) -> Self {
+        let (tx, mut rx) = mpsc::channel::<Bytes>(4);
+        let task = tokio::spawn(async move {
+            let mut st = state;
+            while let Some(first) = rx.recv().await {
+                let mut chunks = vec![first];
+                while let Ok(more) = rx.try_recv() {
+                    chunks.push(more);
+                }
+                st = tokio::task::spawn_blocking(move || {
+                    for c in &chunks {
+                        st.write(c)?;
+                    }
+                    Ok::<_, io::Error>(st)
+                })
+                .await
+                .map_err(io::Error::other)??;
+            }
+            Ok(st)
+        });
+        WritePipe { tx: Some(tx), task }
+    }
+
+    /// Queue a chunk (waits while four are already queued).
+    async fn write(&mut self, chunk: Bytes) -> S3Result<()> {
+        let tx = self.tx.as_ref().expect("not finished");
+        if tx.send(chunk).await.is_err() {
+            // The writer stopped on an error; finish() reports it.
+            self.tx = None;
+            return self.wait().await.map(|_| ());
+        }
+        Ok(())
+    }
+
+    async fn wait(&mut self) -> S3Result<WriteState> {
+        self.tx = None;
+        Ok((&mut self.task).await.map_err(S3Error::internal)??)
+    }
+
+    async fn finish(mut self, fsync: bool) -> S3Result<(Hashers, u64)> {
+        let st = self.wait().await?;
+        Ok(tokio::task::spawn_blocking(move || st.finish(fsync)).await.map_err(S3Error::internal)??)
+    }
+
+    /// Wait for writes in progress (so the caller can remove the file).
+    async fn abort(mut self) {
+        let _ = self.wait().await;
+    }
 }
 
 /// Move a finished temp file to its final data path. With fsync enabled the directory entry is
@@ -561,44 +660,67 @@ pub async fn read_body(
         return Ok(Body::full(data));
     }
 
+    // Open the first data file before answering, so a file that vanished (the object was just
+    // replaced) can be retried by the caller. Then stream: each chunk is read on the blocking
+    // pool and handed to the client from an async task, so a slow reader holds no thread.
+    let mut pieces = pieces.into_iter();
+    let (id, off0, n0, slen) = pieces.next().expect("a non-empty read has pieces");
+    let k = key.clone();
+    let st2 = st.clone();
+    let first = tokio::task::spawn_blocking(move || SegReader::open(&st2, id, slen, k.as_ref()))
+        .await
+        .map_err(|e| Some(S3Error::internal(e)))?
+        .map_err(not_found)?;
     let (tx, rx) = mpsc::channel::<io::Result<Bytes>>(4);
-    let (ready_tx, ready_rx) = oneshot::channel::<io::Result<()>>();
-    tokio::task::spawn_blocking(move || {
-        let mut ready = Some(ready_tx);
-        for (id, mut off, mut n, slen) in pieces {
-            let mut r = match SegReader::open(&st, id, slen, key.as_ref()) {
-                Ok(r) => r,
-                Err(e) => {
-                    match ready.take() {
-                        Some(r) => _ = r.send(Err(e)),
-                        None => _ = tx.blocking_send(Err(e)),
+    tokio::spawn(async move {
+        let mut current = Some((first, off0, n0));
+        loop {
+            let (mut r, mut off, mut n) = match current.take() {
+                Some(c) => c,
+                None => match pieces.next() {
+                    None => return,
+                    Some((id, off, n, slen)) => {
+                        let (st, k) = (st.clone(), key.clone());
+                        match tokio::task::spawn_blocking(move || SegReader::open(&st, id, slen, k.as_ref())).await {
+                            Ok(Ok(r)) => (r, off, n),
+                            Ok(Err(e)) => {
+                                let _ = tx.send(Err(e)).await;
+                                return;
+                            }
+                            Err(_) => return,
+                        }
                     }
-                    return;
-                }
+                },
             };
-            if let Some(r) = ready.take() {
-                let _ = r.send(Ok(()));
-            }
             while n > 0 {
                 let want = n.min(READ_CHUNK as u64);
-                let mut buf = Vec::with_capacity(want as usize);
-                if let Err(e) = r.read(off, want, &mut buf) {
-                    let _ = tx.blocking_send(Err(e));
-                    return;
+                let read = tokio::task::spawn_blocking(move || {
+                    let mut buf = Vec::with_capacity(want as usize);
+                    let res = r.read(off, want, &mut buf).map(|_| buf);
+                    (r, res)
+                })
+                .await;
+                let Ok((back, res)) = read else { return };
+                r = back;
+                let chunk = match res {
+                    Ok(buf) => Ok(Bytes::from(buf)),
+                    Err(e) => {
+                        let _ = tx.send(Err(e)).await;
+                        return;
+                    }
+                };
+                // A client that stops reading is cut off (the body ends early, so the
+                // connection is aborted rather than the object looking complete).
+                match tokio::time::timeout(SEND_IDLE, tx.send(chunk)).await {
+                    Ok(Ok(())) => {}
+                    _ => return,
                 }
                 off += want;
                 n -= want;
-                if tx.blocking_send(Ok(Bytes::from(buf))).is_err() {
-                    return; // client went away
-                }
             }
         }
     });
-    match ready_rx.await {
-        Ok(Ok(())) => Ok(Body::Stream { rx, remaining: len }),
-        Ok(Err(e)) => Err(not_found(e)),
-        Err(_) => Err(Some(S3Error::internal("reader failed"))),
-    }
+    Ok(Body::Stream { rx, remaining: len })
 }
 
 /// Copy plaintext `[start, start+len)` of an object into a new data file, decrypting with

@@ -116,6 +116,7 @@ Each flag can also be set with the environment variable shown (switches take `1`
 | `--website-domain` | `S3RS_WEBSITE_DOMAIN` | | On the website endpoint, `<bucket>.<domain>` serves that bucket |
 | `--inline-threshold` | `S3RS_INLINE_THRESHOLD` | `65536` | Objects up to this many bytes are stored inside the metadata DB |
 | `--cache-mb` | `S3RS_CACHE_MB` | `256` | Metadata cache size |
+| `--max-connections` | `S3RS_MAX_CONNECTIONS` | from the fd limit, ≤ 10000 | Stops accepting beyond this many open connections (see [Limits and timeouts](#limits-and-timeouts)) |
 | `--min-free-space` | `S3RS_MIN_FREE_SPACE` | 2% of the disk (16M–256M) | Refuses uploads when the data disk's free space would drop below this (e.g. `512M`, `2G`; `0` turns it off). See [Disk space](#disk-space). |
 | `--no-fsync` | `S3RS_NO_FSYNC` | off | Skips fsync. Faster, but a power loss can lose up to ~1s of acknowledged writes. |
 | `--access-log` | `S3RS_ACCESS_LOG` | off | Logs every request to stdout as `json` or `text` (see [Access logs](#access-logs)) |
@@ -128,10 +129,25 @@ and status, a latency histogram, bytes in and out, lifecycle activity, and the b
 endpoints are public unless you set `--metrics-token`, which applies to `/_metrics` only. Per-bucket
 series (which name every bucket) are included only when `/_metrics` is protected by a token.
 
-Connections that stay silent are closed: a new connection must send its first request within 30
-seconds, and every request's headers (including the next request on a kept-alive connection) must
-arrive within 30 seconds. HTTP/2 connections are pinged every 30 seconds and closed if the peer
-doesn't answer.
+### Limits and timeouts
+
+Slow or stalled clients cost only memory, never a thread. Uploads and downloads wait for the
+network asynchronously and use the blocking thread pool just for each chunk's disk work, so
+thousands of slow transfers don't starve anything else. On top of that:
+
+| What | Limit |
+|---|---|
+| New connection sends nothing | closed after 30 s |
+| Request headers (also the next request on a kept-alive connection) | 30 s |
+| TLS handshake | 10 s |
+| Upload body sends nothing | `400 RequestTimeout` after 60 s |
+| Download client reads nothing | connection aborted after 120 s |
+| HTTP/2 peer stops answering pings | closed (pinged every 30 s) |
+| Open connections | `--max-connections`. Beyond it s3rs stops accepting and new connections wait in the kernel's queue. |
+
+At startup s3rs raises its open-file limit to the hard limit. The default connection limit is half
+of that (each transfer needs a socket and a file), at most 10,000. `/_metrics` exports
+`s3rs_connections` and `s3rs_connections_max`.
 
 ### Access logs
 

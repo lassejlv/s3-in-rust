@@ -94,6 +94,9 @@ OPTIONS (each also settable through the environment variable shown):
         --inline-threshold <N>   Objects up to N bytes are stored inside the metadata DB
                                                                  [S3RS_INLINE_THRESHOLD, default 65536]
         --cache-mb <N>           Metadata cache size in MiB      [S3RS_CACHE_MB, default 256]
+        --max-connections <N>    Stop accepting connections beyond N (new ones wait in the
+                                 kernel's queue) [S3RS_MAX_CONNECTIONS, default from the
+                                 file descriptor limit, at most 10000]
         --min-free-space <SIZE>  Refuse uploads when the data disk's free space would drop below
                                  SIZE (e.g. 512M, 2G; 0 = off) [S3RS_MIN_FREE_SPACE,
                                  default 2% of the disk, 16M..256M]
@@ -134,6 +137,7 @@ struct Config {
     inline_threshold: usize,
     cache_mb: usize,
     min_free: Option<u64>,
+    max_connections: Option<usize>,
     fsync: bool,
     access_log: Option<accesslog::Format>,
     lifecycle_interval: u64,
@@ -188,6 +192,10 @@ fn parse_args() -> Result<Config, String> {
             .map_or(Ok(65536), |v| v.parse())
             .map_err(|e| format!("S3RS_INLINE_THRESHOLD: {e}"))?,
         cache_mb: env("S3RS_CACHE_MB").map_or(Ok(256), |v| v.parse()).map_err(|e| format!("S3RS_CACHE_MB: {e}"))?,
+        max_connections: env("S3RS_MAX_CONNECTIONS")
+            .map(|v| v.parse())
+            .transpose()
+            .map_err(|e| format!("S3RS_MAX_CONNECTIONS: {e}"))?,
         min_free: env("S3RS_MIN_FREE_SPACE")
             .map(|v| parse_size(&v))
             .transpose()
@@ -250,6 +258,7 @@ fn parse_args() -> Result<Config, String> {
             "--website-domain" => c.website_domain = Some(val()?.to_ascii_lowercase()),
             "--inline-threshold" => c.inline_threshold = val()?.parse().map_err(|e| format!("--inline-threshold: {e}"))?,
             "--cache-mb" => c.cache_mb = val()?.parse().map_err(|e| format!("--cache-mb: {e}"))?,
+            "--max-connections" => c.max_connections = Some(val()?.parse().map_err(|e| format!("--max-connections: {e}"))?),
             "--min-free-space" => c.min_free = Some(parse_size(&val()?).map_err(|e| format!("--min-free-space: {e}"))?),
             "--no-fsync" => c.fsync = false,
             "--lifecycle-interval" => c.lifecycle_interval = val()?.parse().map_err(|e| format!("--lifecycle-interval: {e}"))?,
@@ -635,6 +644,51 @@ async fn bind(addr: SocketAddr) -> TcpListener {
     }
 }
 
+/// Holds a connection slot and counts the connection while it is open.
+struct ConnGuard {
+    _slot: tokio::sync::OwnedSemaphorePermit,
+    count: Arc<std::sync::atomic::AtomicI64>,
+}
+
+impl ConnGuard {
+    fn new(slot: tokio::sync::OwnedSemaphorePermit, count: Arc<std::sync::atomic::AtomicI64>) -> Self {
+        count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        ConnGuard { _slot: slot, count }
+    }
+}
+
+impl Drop for ConnGuard {
+    fn drop(&mut self) {
+        self.count.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Raise the soft open-file limit to the hard limit (servers need far more than the common
+/// default of 1024). Returns the resulting limit.
+#[cfg(unix)]
+fn raise_fd_limit() -> Option<u64> {
+    let mut lim = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+    // SAFETY: getrlimit/setrlimit only read and write the struct passed to them.
+    unsafe {
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) != 0 {
+            return None;
+        }
+        if lim.rlim_cur < lim.rlim_max {
+            let want = libc::rlimit { rlim_cur: lim.rlim_max, rlim_max: lim.rlim_max };
+            if libc::setrlimit(libc::RLIMIT_NOFILE, &want) == 0 {
+                lim.rlim_cur = lim.rlim_max;
+            }
+        }
+    }
+    #[allow(clippy::unnecessary_cast)] // rlim_t is not u64 on every platform
+    Some(lim.rlim_cur as u64)
+}
+
+#[cfg(not(unix))]
+fn raise_fd_limit() -> Option<u64> {
+    None
+}
+
 /// Accept on an optional listener (never completes when there is none).
 async fn accept_opt(l: &Option<TcpListener>) -> std::io::Result<(tokio::net::TcpStream, SocketAddr)> {
     match l {
@@ -775,11 +829,28 @@ async fn serve(
         });
     }
 
+    // Each connection holds a socket and, while it transfers an object, a data file.
+    let nofile = raise_fd_limit();
+    let max_conns =
+        cfg.max_connections.unwrap_or_else(|| nofile.map_or(4096, |n| (n.saturating_sub(64) / 2) as usize).clamp(64, 10_000));
+    server.metrics.max_connections.store(max_conns as u64, std::sync::atomic::Ordering::Relaxed);
+    eprintln!(
+        "accepting up to {max_conns} connections{}",
+        nofile.map(|n| format!(" (file descriptor limit {n})")).unwrap_or_default()
+    );
+    let conn_slots = Arc::new(tokio::sync::Semaphore::new(max_conns));
+    let conn_count = server.metrics.connections.clone();
+
     // Tells connections still in their TLS handshake to give up, so they don't delay the drain.
     let (stopping_tx, stopping) = tokio::sync::watch::channel(false);
     let shutdown = shutdown_signal();
     tokio::pin!(shutdown);
     loop {
+        // At the connection limit, stop accepting until a connection closes.
+        let slot = tokio::select! {
+            _ = &mut shutdown => break,
+            s = conn_slots.clone().acquire_owned() => s.expect("semaphore is never closed"),
+        };
         let (accepted, website) = tokio::select! {
             _ = &mut shutdown => break,
             r = listener.accept() => (r, false),
@@ -795,12 +866,14 @@ async fn serve(
             }
         };
         let _ = stream.set_nodelay(true);
+        let open = ConnGuard::new(slot, conn_count.clone());
         let server = server.clone();
         let builder = builder.clone();
         let watcher = graceful.watcher();
         let acceptor = tls.as_ref().map(|t| t.acceptor());
         let mut stopping = stopping.clone();
         tokio::spawn(async move {
+            let _open = open;
             let svc = service_fn(move |req| {
                 let server = server.clone();
                 async move {

@@ -15,6 +15,10 @@ const BOUNDS: [f64; 12] = [0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1,
 pub struct Metrics {
     started: OnceLock<Instant>,
     inflight: AtomicI64,
+    /// Open client connections.
+    pub connections: std::sync::Arc<AtomicI64>,
+    /// The connection limit.
+    pub max_connections: AtomicU64,
     /// [method][status class 1xx..5xx]
     requests: [[AtomicU64; 5]; 7],
     latency: [AtomicU64; 13],
@@ -76,6 +80,8 @@ impl Metrics {
         let uptime = self.started.get().map_or(0.0, |s| s.elapsed().as_secs_f64());
         let _ = writeln!(o, "# TYPE s3rs_uptime_seconds gauge\ns3rs_uptime_seconds {uptime:.3}");
         let _ = writeln!(o, "# TYPE s3rs_requests_in_flight gauge\ns3rs_requests_in_flight {}", self.inflight.load(Relaxed));
+        let _ = writeln!(o, "# TYPE s3rs_connections gauge\ns3rs_connections {}", self.connections.load(Relaxed));
+        let _ = writeln!(o, "# TYPE s3rs_connections_max gauge\ns3rs_connections_max {}", self.max_connections.load(Relaxed));
         let _ = writeln!(o, "# TYPE s3rs_requests_total counter");
         for (mi, m) in METHODS.iter().enumerate() {
             for (ci, c) in self.requests[mi].iter().enumerate() {

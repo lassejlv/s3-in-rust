@@ -50,6 +50,16 @@ Kubernetes. Use `GET /_health` for liveness and readiness.
   256). A larger cache helps when there are millions of objects. In a 7-minute soak test (16
   clients of mixed PUT/GET/DELETE/LIST/multipart traffic plus a GET flood, `--cache-mb 64`), memory
   levelled off at about 120 MB, with constant thread and file counts.
+- **Scale:** measured with 1.1 million objects in one bucket (1M of 100 bytes and 100k of 20 KB,
+  default settings, 4 cores):
+  - The metadata database is about 400 MB, roughly 370 bytes per object including the inline data.
+  - A listing page of 1000 keys takes 2 ms, with a prefix 3 ms, and with a delimiter (1000 common
+    prefixes) 7 ms. Paging through all 1.1M keys takes 3.4 s.
+  - A clean restart takes 0.05 s. A restart after SIGKILL takes 1.2 s: it scans for orphaned files
+    and recounts usage. `fsck` takes 3.8 s.
+  - Memory peaked at 350 MB, with the 256 MiB cache full.
+  - With fsync on, 16 clients wrote about 4300 small objects/s; more concurrent clients share each
+    commit.
 - **Disk:** objects are stored as-is. Encryption adds 16 bytes per 64 KiB plus 73 bytes per
   object. Objects up to
   `--inline-threshold` (64 KiB) live in the metadata database, larger ones in data files. Versioned

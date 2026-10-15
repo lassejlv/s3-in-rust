@@ -18,7 +18,7 @@ A fast, lightweight, S3-compatible object storage server written in pure Rust.
 cargo build --release
 
 ./target/release/s3rs --data-dir ./data --access-key mykey --secret-key mysecret
-# s3rs listening on http://0.0.0.0:9000 (data: ./data, region: us-east-1, auth: sigv4, fsync: true)
+# s3rs 0.1.0 listening on http://0.0.0.0:9000 (data: ./data, region: us-east-1, auth: sigv4, ...)
 ```
 
 ```bash
@@ -45,6 +45,22 @@ docker run -p 9000:9000 -v $PWD/data:/data -e S3RS_ACCESS_KEY=mykey -e S3RS_SECR
 ```
 
 Add `--build-arg FEATURES=tls` for an image with [native HTTPS](#https-tls).
+
+### Releases
+
+Pushing a `vX.Y.Z` tag that matches `Cargo.toml`'s version runs `.github/workflows/release.yml`:
+- Linux binaries for x86_64 and arm64 (glibc 2.35+), each as a default and a `tls` build, are
+  smoke-tested and published to a GitHub release with a `SHA256SUMS` file.
+- Multi-arch container images are pushed to `ghcr.io/<owner>/s3rs:<version>` and `:latest`, plus
+  `-tls` variants.
+
+The release images run as an unprivileged user (uid 10001) and keep data in the `/data` volume:
+
+```bash
+docker run -p 9000:9000 -v s3rs-data:/data -e S3RS_ACCESS_KEY=mykey -e S3RS_SECRET_KEY=mysecret ghcr.io/<owner>/s3rs:0.1.0
+```
+
+`s3rs --version` prints the version, and `/_metrics` exports it as `s3rs_build_info`.
 
 ## Web console
 

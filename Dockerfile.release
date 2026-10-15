@@ -1,0 +1,16 @@
+# Release image, built by .github/workflows/release.yml from prebuilt binaries
+# (dist/<arch>/s3rs and dist/<arch>/s3rs-tls in the build context). For building from source,
+# use the Dockerfile next to this one.
+FROM debian:trixie-slim
+ARG TARGETARCH
+ARG BINARY=s3rs
+COPY dist/${TARGETARCH}/${BINARY} /usr/local/bin/s3rs
+# Runs as an unprivileged user. Named volumes mounted at /data inherit its ownership; for a bind
+# mount, make the directory writable by uid 10001 (or run with --user).
+RUN useradd --system --uid 10001 --home-dir /data --shell /usr/sbin/nologin s3rs \
+    && mkdir -p /data && chown s3rs:s3rs /data
+USER s3rs
+ENV S3RS_DATA_DIR=/data S3RS_LISTEN=0.0.0.0:9000
+VOLUME /data
+EXPOSE 9000
+ENTRYPOINT ["/usr/local/bin/s3rs"]

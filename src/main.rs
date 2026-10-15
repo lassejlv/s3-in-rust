@@ -103,6 +103,7 @@ OPTIONS (each also settable through the environment variable shown):
         --access-log <FORMAT>    Log every request to stdout: json or text
                                                                  [S3RS_ACCESS_LOG, default off]
     -v, --verbose                Same as --access-log text       [S3RS_VERBOSE=1]
+    -V, --version                Print the version
     -h, --help                   Show this help
 ";
 
@@ -256,6 +257,10 @@ fn parse_args() -> Result<Config, String> {
             "--access-log" => c.access_log = accesslog::Format::parse(&val()?).map_err(|e| format!("--access-log: {e}"))?,
             "-h" | "--help" => {
                 print!("{USAGE}");
+                std::process::exit(0);
+            }
+            "-V" | "--version" => {
+                println!("s3rs {}{}", env!("CARGO_PKG_VERSION"), if cfg!(feature = "tls") { " (tls)" } else { "" });
                 std::process::exit(0);
             }
             other => return Err(format!("unknown argument: {other}\n\n{USAGE}")),
@@ -685,7 +690,8 @@ async fn serve(
     }
     let scheme = if tls.is_some() { "https" } else { "http" };
     eprintln!(
-        "s3rs listening on {scheme}://{} (data: {}, region: {}, auth: {}, fsync: {}, encryption: {})",
+        "s3rs {} listening on {scheme}://{} (data: {}, region: {}, auth: {}, fsync: {}, encryption: {})",
+        env!("CARGO_PKG_VERSION"),
         cfg.listen,
         cfg.data_dir.display(),
         cfg.region,

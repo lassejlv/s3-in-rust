@@ -1,0 +1,137 @@
+name: Release
+
+# Pushing a tag vX.Y.Z (matching the version in Cargo.toml) builds Linux binaries for x86_64 and
+# arm64 (default and `tls` builds), publishes them with checksums as a GitHub release, and pushes
+# multi-arch container images to ghcr.io. Running the workflow by hand builds and checks
+# everything without publishing.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  packages: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build ${{ matrix.target }}
+    strategy:
+      matrix:
+        include:
+          # Built on Ubuntu 22.04 so the binaries run on glibc 2.35 and newer.
+          - { os: ubuntu-22.04, target: x86_64-unknown-linux-gnu, arch: amd64 }
+          - { os: ubuntu-22.04-arm, target: aarch64-unknown-linux-gnu, arch: arm64 }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Version
+        id: version
+        shell: bash
+        run: |
+          version=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          if [[ "$GITHUB_REF" == refs/tags/v* && "${GITHUB_REF#refs/tags/v}" != "$version" ]]; then
+            echo "tag ${GITHUB_REF#refs/tags/} does not match Cargo.toml version $version" >&2
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - name: Build
+        run: |
+          cargo build --release --locked
+          mkdir -p dist/${{ matrix.arch }}
+          cp target/release/s3rs dist/${{ matrix.arch }}/s3rs
+          cargo build --release --locked --features tls
+          cp target/release/s3rs dist/${{ matrix.arch }}/s3rs-tls
+      - name: Smoke test
+        run: |
+          for bin in s3rs s3rs-tls; do
+            b=dist/${{ matrix.arch }}/$bin
+            $b --version
+            rm -rf /tmp/smoke && $b -d /tmp/smoke -l 127.0.0.1:9000 --access-key k --secret-key secretsecret &
+            pid=$!
+            for i in $(seq 50); do curl -sf http://127.0.0.1:9000/_health && break; sleep 0.1; done
+            curl -sf http://127.0.0.1:9000/_health
+            kill $pid && wait $pid || true
+          done
+      - name: Package
+        shell: bash
+        run: |
+          v=${{ steps.version.outputs.version }}
+          for bin in s3rs s3rs-tls; do
+            name=$bin-$v-${{ matrix.target }}
+            mkdir -p pkg/$name
+            cp dist/${{ matrix.arch }}/$bin pkg/$name/s3rs
+            cp README.md pkg/$name/
+            tar -C pkg -czf $name.tar.gz $name
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: build-${{ matrix.arch }}
+          path: |
+            *.tar.gz
+            dist/
+          retention-days: 7
+
+  publish:
+    name: GitHub release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd artifacts
+          sha256sum *.tar.gz > SHA256SUMS
+          cat SHA256SUMS
+          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --title "s3rs $GITHUB_REF_NAME" \
+            --generate-notes *.tar.gz SHA256SUMS
+
+  image:
+    name: container images
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        if: startsWith(github.ref, 'refs/tags/v')
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - name: Build (and on a tag, push) the images
+        shell: bash
+        run: |
+          chmod +x artifacts/dist/*/*
+          image=ghcr.io/$(echo "$GITHUB_REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]')/s3rs
+          version=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          push=$([[ "$GITHUB_REF" == refs/tags/v* ]] && echo --push || echo --load)
+          platforms=linux/amd64,linux/arm64
+          # --load can only hold one platform; a dry run checks the amd64 image and runs it.
+          [[ $push == --load ]] && platforms=linux/amd64
+          for variant in "" "-tls"; do
+            docker buildx build -f Dockerfile.release --platform $platforms \
+              --build-arg BINARY=s3rs$variant \
+              -t $image:$version$variant -t $image:latest$variant $push artifacts
+          done
+          if [[ $push == --load ]]; then
+            docker run --rm $image:latest --version
+            docker run --rm $image:latest-tls --version
+          fi

@@ -2743,6 +2743,9 @@ fn apply(tx: &mut Tables, op: Op, garbage: &mut Vec<u128>, last_seq: &mut u64) -
             let mut out = Vec::with_capacity(items.len());
             for (i, (key, version)) in items.into_iter().enumerate() {
                 let cond = conds.get(i).cloned().flatten();
+                // A conditional delete of something that doesn't exist changes nothing (no
+                // delete marker is written for it).
+                let mut nothing = false;
                 let r = check_key_chars(&key).and_then(|_| {
                     if let Some(c) = &cond {
                         let target = match &version {
@@ -2755,13 +2758,15 @@ fn apply(tx: &mut Tables, op: Op, garbage: &mut Vec<u128>, last_seq: &mut u64) -
                                 None => newest_noncurrent(tx, &bucket, &key)?.map(|(_, m)| m).filter(|m| m.delete_marker),
                             },
                         };
-                        if let Some(m) = target {
-                            c.check(&m)?;
+                        match target {
+                            Some(m) => c.check(&m)?,
+                            None => nothing = true,
                         }
                     }
                     Ok(())
                 });
                 let r = r.and_then(|_| match version {
+                    _ if nothing => Ok(DeleteOutcome::default()),
                     Some(v) => delete_version(tx, &bucket, &key, &v, bypass, garbage).map(|mut o| {
                         if o.removed {
                             o.seq = next_seq(last_seq);

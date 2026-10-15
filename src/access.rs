@@ -452,10 +452,13 @@ pub fn parse_tagging_xml(doc: &xml::Node, max: usize) -> S3Result<Vec<(String, S
     Ok(tags)
 }
 
+/// A TagSet document, sorted by key (as S3-compatible servers return them).
 pub fn tagging_xml(tags: &[(String, String)]) -> String {
+    let mut sorted: Vec<&(String, String)> = tags.iter().collect();
+    sorted.sort();
     let mut x = Xml::new("Tagging");
     x.open("TagSet");
-    for (k, v) in tags {
+    for (k, v) in sorted {
         x.open("Tag").elem("Key", k).elem("Value", v).close("Tag");
     }
     x.close("TagSet");

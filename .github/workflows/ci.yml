@@ -174,6 +174,11 @@ jobs:
           curl -fsSL -o /tmp/rclone.zip https://github.com/rclone/rclone/releases/download/v1.71.1/rclone-v1.71.1-linux-amd64.zip
           unzip -q -o /tmp/rclone.zip -d /tmp
           python3 tests/rclone.py ./target/release/s3rs /tmp/rclone-v1.71.1-linux-amd64/rclone
+      - name: restic compatibility
+        run: |
+          curl -fsSL https://github.com/restic/restic/releases/download/v0.18.1/restic_0.18.1_linux_amd64.bz2 | bunzip2 > /tmp/restic
+          chmod +x /tmp/restic
+          python3 tests/restic.py ./target/release/s3rs /tmp/restic
       - name: HTTP fuzzing (mutated requests; no 500s, no panics)
         run: python3 tests/fuzz_http.py ./target/release/s3rs 20000
       - name: disk full (100 MB tmpfs)

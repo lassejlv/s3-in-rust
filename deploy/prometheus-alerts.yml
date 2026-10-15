@@ -68,6 +68,13 @@ groups:
           summary: "s3rs on {{ $labels.instance }} has changes waiting to be replicated for over 5 minutes"
           description: "{{ $value | humanizeDuration }} behind. The server log names the failing target and why; changes stay queued on disk."
 
+      - alert: S3rsDataDamaged
+        expr: increase(s3rs_scrub_corrupt_total[1d]) > 0
+        labels: { severity: critical }
+        annotations:
+          summary: "s3rs scrubbing on {{ $labels.instance }} found damaged object data"
+          description: "The server log lists each damaged object (\"scrub: DAMAGED\"). Restore those objects from a backup or replica, and check the disk."
+
       - alert: S3rsAccessLogDropping
         expr: increase(s3rs_access_log_dropped_total[15m]) > 0
         labels: { severity: warning }

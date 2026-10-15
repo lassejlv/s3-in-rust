@@ -31,6 +31,7 @@ pub struct Metrics {
     pub events: std::sync::Arc<crate::events::Stats>,
     pub replication: std::sync::Arc<crate::replication::Stats>,
     pub bucket_log: std::sync::Arc<crate::bucketlog::Stats>,
+    pub scrub: std::sync::Arc<crate::scrub::Stats>,
 }
 
 impl Metrics {
@@ -152,6 +153,15 @@ impl Metrics {
         );
         let r = &self.replication;
         let _ = writeln!(o, "# TYPE s3rs_replication_total counter");
+        for (name, help, v) in [
+            ("s3rs_scrub_verified_total", "Object versions verified by scrubbing", &self.scrub.verified),
+            ("s3rs_scrub_bytes_total", "Bytes verified by scrubbing", &self.scrub.bytes),
+            ("s3rs_scrub_corrupt_total", "Damaged object versions found by scrubbing", &self.scrub.corrupt),
+            ("s3rs_scrub_skipped_total", "Object versions scrubbing could not check (no key)", &self.scrub.skipped),
+            ("s3rs_scrub_passes_total", "Completed scrubbing passes", &self.scrub.passes),
+        ] {
+            let _ = writeln!(o, "# HELP {name} {help}\n# TYPE {name} counter\n{name} {}", v.load(Relaxed));
+        }
         for (name, v) in
             [("replicated", &r.replicated), ("unchanged", &r.unchanged), ("skipped", &r.skipped), ("failed", &r.failed)]
         {

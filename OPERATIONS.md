@@ -99,10 +99,20 @@ Scrape `/_metrics` (Prometheus text format) and load
 | `s3rs_replication_pending`, `s3rs_replication_lag_seconds` | a growing replication backlog (target down, or writes outpacing it) |
 | `s3rs_replication_total{result}` | `failed` replication attempts (the log says why) |
 | `s3rs_bucket_objects`, `s3rs_bucket_bytes` | growth per bucket (served only with a metrics token) |
+| `s3rs_scrub_corrupt_total`, `s3rs_scrub_passes_total` | damaged data found by `--scrub-interval`, and whether passes complete |
 | `s3rs_build_info{version,tls}`, `s3rs_uptime_seconds` | what is running, and unexpected restarts |
 
 Server diagnostics (startup, reloads, recovery, lifecycle, errors) go to stderr. Access logs go to
 stdout. Every response carries `x-amz-request-id`, which matches `request_id` in the access log.
+
+## Scrubbing
+
+`--scrub-interval 7d` re-reads all stored data once a week in the background, at up to
+`--scrub-rate` MiB/s (default 32), and checks every object version against its ETag. SSE-S3 data
+is decrypted on the way, which also checks its authentication tags. Damage is logged and counted;
+nothing is changed. Pick the rate so a pass fits in the interval with room to spare (32 MiB/s
+reads about 2.7 TB a day), and lower it on disks that also serve heavy traffic. SSE-C objects
+can't be checked without their keys and count as skipped. A restart starts a new pass.
 
 ## Backups
 
@@ -161,6 +171,7 @@ A backup holds the state at the moment it started. Writes made during the backup
 | Uploads fail with `507 StorageFull` | The disk is below the reserve. Delete objects (deletes always work), shorten lifecycle rules, abort stale multipart uploads (their parts count too), or grow the disk. Uploads resume on their own. A backup that is streaming holds back the deletion of data files until it finishes. |
 | `disk full: released the ballast file` in the log | The disk filled up despite the reserve, usually because another process wrote to it. Free space. The ballast is recreated automatically. |
 | The server crashed or was killed | Just start it again. The next start finds no clean-shutdown marker, scans for orphaned data files and recomputes usage counters. Acknowledged writes are never lost (see `tests/crash.py`). |
+| `scrub: DAMAGED <bucket>/<key>` in the log | The object's data on disk no longer matches what was written (the disk or something outside s3rs changed it). Reads of it may fail or return wrong data; nothing was changed. Restore the object from a backup or replica (upload it again), and check the disk's health (`smartctl`, kernel log). |
 | Suspected corruption (bad disk, restored from a filesystem snapshot) | Stop the server and run `s3rs fsck --deep --encryption-key-file …`. `--repair` removes orphaned files and rebuilds counters. It never deletes object data, and it does nothing at all if some metadata can't be read. |
 | A key or certificate must be revoked | Edit the credentials file or replace the certificate, then `systemctl reload s3rs` (SIGHUP). If the reload fails, the old keys and certificate stay in use and the log says so loudly. |
 | Replication lag grows | The log names the failing target and the reason. `unreachable` or a connection error means the target is down or blocked: changes stay queued on disk and are sent when it is back. `403` means the target's credentials can't write to the destination bucket. `404 NoSuchBucket` means the destination bucket doesn't exist. Fix the targets file and `systemctl reload s3rs`. |

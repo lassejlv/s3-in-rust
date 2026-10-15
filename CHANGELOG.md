@@ -14,6 +14,8 @@ First release.
 - Server-side encryption with SSE-S3 (master key) and SSE-C, using chunked AES-256-GCM.
 - Per-bucket usage accounting and quotas, including bytes in unfinished multipart uploads.
 - `s3rs fsck` checks a data directory, deeply with `--deep`, and `--repair` fixes it.
+- Online scrubbing (`--scrub-interval`): all stored data is re-read in the background at a
+  limited rate and checked against its ETags; damage is logged and counted.
 - Consistent online backups (`GET /_admin/backup`) and offline backups (`s3rs backup`) as tar
   archives.
 - Bucket replication to other S3-compatible servers (PutBucketReplication):

@@ -108,6 +108,8 @@ Each flag can also be set with the environment variable shown (switches take `1`
 | `--webhook-timeout` | `S3RS_WEBHOOK_TIMEOUT` | `10` | Seconds a webhook may take to answer |
 | `--webhook-ca` | `S3RS_WEBHOOK_CA` | | Extra PEM CA certificates trusted for `https://` webhooks |
 | `--lifecycle-interval` | `S3RS_LIFECYCLE_INTERVAL` | `3600` | Seconds between lifecycle sweeps. `0` turns lifecycle off. |
+| `--scrub-interval` | `S3RS_SCRUB_INTERVAL` | off | Re-read and verify all stored data in the background, a pass every interval (e.g. `7d`) |
+| `--scrub-rate` | `S3RS_SCRUB_RATE` | `32` | MiB/s read at most while scrubbing |
 | `--encryption-key` | `S3RS_ENCRYPTION_KEY` | | Master key for SSE-S3, as 64 hex characters or base64 (e.g. `openssl rand -hex 32`) |
 | `--encryption-key-file` | `S3RS_ENCRYPTION_KEY_FILE` | | Reads the master key from a file |
 | `--encrypt-by-default` | `S3RS_ENCRYPT_BY_DEFAULT` | off | Encrypts every new object with the master key |

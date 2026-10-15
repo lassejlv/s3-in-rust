@@ -35,6 +35,7 @@ mod post;
 mod ratelimit;
 mod replication;
 mod s3;
+mod scrub;
 mod store;
 mod tls;
 mod util;
@@ -135,6 +136,9 @@ OPTIONS (each also settable through the environment variable shown):
         --no-fsync               Do not fsync data or metadata (faster, less durable)
                                                                  [S3RS_NO_FSYNC=1]
         --lifecycle-interval <S> Seconds between lifecycle sweeps [S3RS_LIFECYCLE_INTERVAL, default 3600]
+        --scrub-interval <TIME>  Re-read and verify all stored data in the background, a pass
+                                 every TIME (e.g. 7d, 12h; 0 = off) [S3RS_SCRUB_INTERVAL, default off]
+        --scrub-rate <MIB>       Read at most MIB MiB/s while scrubbing [S3RS_SCRUB_RATE, default 32]
         --access-log <FORMAT>    Log every request to stdout: json or text
                                                                  [S3RS_ACCESS_LOG, default off]
     -v, --verbose                Same as --access-log text       [S3RS_VERBOSE=1]
@@ -177,6 +181,8 @@ struct Config {
     fsync: bool,
     access_log: Option<accesslog::Format>,
     lifecycle_interval: u64,
+    scrub_interval: Option<Duration>,
+    scrub_rate: u64,
     /// Length of a lifecycle "day" in seconds; only meant to be shortened for testing.
     lifecycle_day_secs: u64,
 }
@@ -263,6 +269,8 @@ fn parse_args() -> Result<Config, String> {
             None if env_flag("S3RS_VERBOSE")? => Some(accesslog::Format::Text),
             None => None,
         },
+        scrub_interval: env("S3RS_SCRUB_INTERVAL").map(|v| parse_duration("S3RS_SCRUB_INTERVAL", &v)).transpose()?.flatten(),
+        scrub_rate: env("S3RS_SCRUB_RATE").map_or(Ok(32), |v| v.parse()).map_err(|e| format!("S3RS_SCRUB_RATE: {e}"))?,
         lifecycle_interval: env("S3RS_LIFECYCLE_INTERVAL")
             .map_or(Ok(3600), |v| v.parse())
             .map_err(|e| format!("S3RS_LIFECYCLE_INTERVAL: {e}"))?,
@@ -324,6 +332,8 @@ fn parse_args() -> Result<Config, String> {
             "--max-connections" => c.max_connections = Some(val()?.parse().map_err(|e| format!("--max-connections: {e}"))?),
             "--min-free-space" => c.min_free = Some(parse_size(&val()?).map_err(|e| format!("--min-free-space: {e}"))?),
             "--no-fsync" => c.fsync = false,
+            "--scrub-interval" => c.scrub_interval = parse_duration("--scrub-interval", &val()?)?,
+            "--scrub-rate" => c.scrub_rate = val()?.parse().map_err(|e| format!("--scrub-rate: {e}"))?,
             "--lifecycle-interval" => c.lifecycle_interval = val()?.parse().map_err(|e| format!("--lifecycle-interval: {e}"))?,
             "-v" | "--verbose" => c.access_log = Some(accesslog::Format::Text),
             "--access-log" => c.access_log = accesslog::Format::parse(&val()?).map_err(|e| format!("--access-log: {e}"))?,
@@ -474,6 +484,27 @@ fn load_credentials(path: &std::path::Path, into: &mut Vec<auth::Credential>) ->
 }
 
 /// All access keys: the main one (flags / environment) plus the credentials file.
+/// A duration like `7d`, `12h`, `30m` or `45s` (a bare number is hours); `0` is `None` (off).
+fn parse_duration(what: &str, v: &str) -> Result<Option<Duration>, String> {
+    let v = v.trim();
+    let (num, unit) = match v.char_indices().find(|(_, c)| c.is_ascii_alphabetic()) {
+        Some((i, _)) => (&v[..i], &v[i..]),
+        None => (v, "h"),
+    };
+    let n: f64 = num.trim().parse().map_err(|_| format!("{what}: `{v}` is not a duration like 7d, 12h or 30m"))?;
+    let secs = match unit {
+        "s" => 1.0,
+        "m" => 60.0,
+        "h" => 3600.0,
+        "d" => 86_400.0,
+        _ => return Err(format!("{what}: unknown unit in `{v}` (use s, m, h or d)")),
+    };
+    if !(n >= 0.0 && n.is_finite()) {
+        return Err(format!("{what}: `{v}` must not be negative"));
+    }
+    Ok((n > 0.0).then(|| Duration::from_secs_f64(n * secs)))
+}
+
 fn collect_credentials(cfg: &Config) -> Result<Vec<auth::Credential>, String> {
     let mut creds = Vec::new();
     match (&cfg.access_key, &cfg.secret_key) {
@@ -1088,6 +1119,17 @@ async fn serve(
     // Tells connections still in their TLS handshake to give up, so they don't delay the drain.
     let (stopping_tx, stopping) = tokio::sync::watch::channel(false);
     tokio::spawn(server.replication.clone().run(stopping.clone()));
+    if let Some(interval) = cfg.scrub_interval {
+        let rate = cfg.scrub_rate.max(1) << 20;
+        elog!("scrubbing: a pass over all data every {}s, at up to {} MiB/s", interval.as_secs(), rate >> 20);
+        tokio::spawn(scrub::run(
+            store.clone(),
+            cfg.encryption_key.map(|k| crypt::WrapKey::new(crypt::KeyKind::Master, k)),
+            scrub::Config { interval, rate },
+            server.metrics.scrub.clone(),
+            stopping.clone(),
+        ));
+    }
     {
         let server = server.clone();
         let mut stopping = stopping.clone();

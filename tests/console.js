@@ -180,6 +180,22 @@ const shot = (page, name) => (out ? page.screenshot({ path: `${out}/${name}.png`
   const buckets = await page.textContent('#buckets');
   if (buckets.includes(BUCKET)) throw new Error('bucket still listed');
 
+  step('rename (unversioned bucket)');
+  await page.click('#new-bucket');
+  await page.fill('#f-name', BUCKET + '-plain');
+  await page.click('#modal-ok');
+  await page.waitForSelector(`#buckets li.active:has-text("${BUCKET}-plain")`);
+  await page.setInputFiles('#upload-input', [{ name: 'draft.txt', mimeType: 'text/plain', buffer: Buffer.from('to be renamed\n') }]);
+  await page.waitForSelector('tr:has-text("draft.txt")', { timeout: 10000 });
+  await page.click('a:has-text("draft.txt")');
+  await page.click('#details button:has-text("Rename")');
+  await page.fill('#f-newkey', 'final/report.txt');
+  await page.click('#modal-ok');
+  await page.waitForFunction(() => document.querySelector('#details-title').textContent === 'report.txt');
+  if (!(await page.textContent('#details pre')).includes('to be renamed')) throw new Error('renamed object content');
+  await page.waitForSelector('a:has-text("final/")');
+  if (await page.locator('tr:has-text("draft.txt")').count()) throw new Error('old name still listed');
+
   step('dark mode + mobile screenshot');
   await page.emulateMedia({ colorScheme: 'dark' });
   await page.setViewportSize({ width: 390, height: 760 });

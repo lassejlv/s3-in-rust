@@ -618,6 +618,8 @@ async function showDetails(key) {
     const actions = el("div", { class: "row-actions" },
       el("button", { class: "primary small", onclick: () => download(key) }, "Download"),
       el("button", { class: "small", onclick: () => share(key) }, "Share link"),
+      // Renaming moves only metadata; buckets with versioning can't (their history would split).
+      h.get("x-amz-version-id") ? null : el("button", { class: "small", onclick: () => renameObject(key) }, "Rename"),
       el("button", { class: "small danger", onclick: () => deleteKeys([key]) }, "Delete"));
     const preview = await renderPreview(key, h);
     const versions = await renderVersions(key);
@@ -652,6 +654,25 @@ async function renderVersions(key) {
       el("td", {}, el("div", { class: "row-actions tight" }, ...actions)));
   });
   return el("div", { class: "versions" }, el("h3", {}, `Versions (${versions.length})`), el("table", { class: "versions-table" }, ...rows));
+}
+
+async function renameObject(key) {
+  const target = await prompt("Rename", [
+    el("label", {}, "New name", el("input", { id: "f-newkey", value: key, required: true, autocomplete: "off" })),
+    el("p", { class: "muted" }, "Include folders in the name to move it (for example archive/2024/report.pdf)."),
+  ], "Rename", () => $("f-newkey").value.trim());
+  if (!target || target === key) return;
+  try {
+    await S3.request("PUT", objectPath(target), {
+      query: { renameObject: "" },
+      headers: { "x-amz-rename-source": `${state.bucket}/${uriEncode(key, true)}`, "if-none-match": "*" },
+    });
+    toast(`Renamed to ${target}`);
+    loadList(false);
+    showDetails(target);
+  } catch (e) {
+    toast(e.code === "PreconditionFailed" ? `“${target}” already exists.` : e.message, true);
+  }
 }
 
 async function restoreVersion(key, version) {

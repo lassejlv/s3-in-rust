@@ -72,6 +72,8 @@ key. From the console you can:
   URLs).
 - In versioned buckets, see an object's versions, download or delete any of them, and restore an
   older one as the current version.
+- Rename or move objects (in buckets without versioning; only metadata changes, so it is
+  instant whatever the size).
 - Delete objects and whole folders, and change a bucket's versioning, public access and website
   settings.
 

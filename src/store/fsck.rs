@@ -125,7 +125,7 @@ pub fn run(root: &Path, deep: bool, master: Option<[u8; 32]>, repair: bool) -> R
                 let stored_len = |plain: u64| if matches!(enc, Enc::Plain) { plain } else { crypt::encrypted_len(plain) };
                 let key_for_deep = match enc {
                     Enc::Plain => Some(None),
-                    Enc::Master => master.clone().map(Some),
+                    Enc::Master => master.as_ref().map(|m| crypt::server_key(&meta.headers, m)),
                     Enc::Customer => None,
                 };
                 let mut intact = true;

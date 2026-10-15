@@ -959,7 +959,7 @@ def t_encryption():
     if data_dir:
         assert on_disk_contains(b"PLAINTEXT-MARKER-PLAIN"), "control marker should be visible on disk"
         assert not on_disk_contains(b"PLAINTEXT-MARKER-BIG") and not on_disk_contains(b"PLAINTEXT-MARKER-SMALL")
-    expect_error("NotImplemented", lambda: s3.put_object(Bucket=eb, Key="kms", Body=b"x", ServerSideEncryption="aws:kms"))
+    expect_error("InvalidArgument", lambda: s3.put_object(Bucket=eb, Key="kms", Body=b"x", ServerSideEncryption="aws:fake"))
 
     # Bucket default encryption.
     expect_error("ServerSideEncryptionConfigurationNotFoundError", lambda: s3.get_bucket_encryption(Bucket=eb))

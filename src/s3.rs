@@ -471,7 +471,19 @@ impl Server {
             .and_then(|v| xml::parse(&String::from_utf8_lossy(&v)))
             .and_then(|d| access::parse_cors(&d).ok());
         let versioning = store::Versioning::parse(self.store.bucket_config(bucket, "versioning")?.as_deref());
-        let default_sse = self.store.bucket_config(bucket, "encryption")?.is_some();
+        let encryption = self.store.bucket_config(bucket, "encryption")?;
+        let default_sse = encryption.is_some();
+        let default_kms = encryption.and_then(|v| {
+            let doc = xml::parse(&String::from_utf8_lossy(&v))?;
+            let rule = doc.child("Rule")?.child("ApplyServerSideEncryptionByDefault")?;
+            rule.child_text("SSEAlgorithm")?.starts_with("aws:kms").then(|| {
+                rule.child_text("KMSMasterKeyID")
+                    .map(str::trim)
+                    .filter(|k| !k.is_empty())
+                    .unwrap_or(crypt::DEFAULT_KMS_KEY)
+                    .to_string()
+            })
+        });
         let lock = self.store.bucket_config(bucket, "object-lock")?.and_then(|v| lock::BucketLock::from_stored(&v));
         let website = self
             .store
@@ -504,6 +516,7 @@ impl Server {
             cors,
             versioning,
             default_sse,
+            default_kms,
             lock,
             website,
             lifecycle,
@@ -1625,22 +1638,28 @@ impl Server {
             }
             BucketOp::PutConfig("encryption") => {
                 let doc = self.read_xml(r).await?;
-                let alg = (doc.name == "ServerSideEncryptionConfiguration")
-                    .then(|| doc.child("Rule")?.child("ApplyServerSideEncryptionByDefault")?.child_text("SSEAlgorithm"))
-                    .flatten()
-                    .map(str::trim)
-                    .ok_or_else(err::MalformedXML)?;
+                let rule = (doc.name == "ServerSideEncryptionConfiguration").then(|| doc.child("Rule")).flatten();
+                let default = rule.and_then(|r| r.child("ApplyServerSideEncryptionByDefault"));
+                let alg = default.and_then(|d| d.child_text("SSEAlgorithm")).map(str::trim).ok_or_else(err::MalformedXML)?;
+                let kms_key = default.and_then(|d| d.child_text("KMSMasterKeyID")).map(str::trim).filter(|k| !k.is_empty());
+                let bucket_key = rule.and_then(|r| r.child_text("BucketKeyEnabled")).is_some_and(|v| v.trim() == "true");
                 match alg {
-                    "AES256" => {}
-                    a if a.starts_with("aws:kms") => {
-                        return Err(err::NotImplemented().with_message("SSE-KMS is not supported; use AES256"));
+                    "AES256" if kms_key.is_some() => {
+                        return Err(err::InvalidArgument().with_message("KMSMasterKeyID is only allowed with aws:kms"));
                     }
+                    "AES256" | "aws:kms" | "aws:kms:dsse" => {}
                     _ => return Err(err::MalformedXML()),
+                }
+                if let Some(k) = kms_key {
+                    check_kms_key_id(k)?;
                 }
                 self.master()?;
                 let mut x = Xml::new("ServerSideEncryptionConfiguration");
-                x.open("Rule").open("ApplyServerSideEncryptionByDefault").elem("SSEAlgorithm", "AES256");
-                x.close("ApplyServerSideEncryptionByDefault").elem("BucketKeyEnabled", "false").close("Rule");
+                x.open("Rule")
+                    .open("ApplyServerSideEncryptionByDefault")
+                    .elem("SSEAlgorithm", alg)
+                    .opt("KMSMasterKeyID", kms_key);
+                x.close("ApplyServerSideEncryptionByDefault").elem("BucketKeyEnabled", bucket_key.to_string()).close("Rule");
                 self.set_bucket_config(bucket, "encryption", Some(x.finish("ServerSideEncryptionConfiguration").into_bytes()))
                     .await?;
                 Ok(Resp::ok())
@@ -2609,18 +2628,56 @@ impl Server {
             let stored = vec![(SSE_C_ALG.to_string(), "AES256".to_string()), (SSE_C_MD5.to_string(), crypt::key_md5_b64(&key))];
             return Ok(Some((WrapKey::new(KeyKind::Customer, key), stored)));
         }
-        let requested = match sse {
-            Some("AES256") => true,
-            Some(other) if other.starts_with("aws:kms") => {
-                return Err(err::NotImplemented().with_message("SSE-KMS is not supported; use AES256 or SSE-C"));
+        let kms_id = header(h, crypt::KMS_KEY_ID).map(str::trim);
+        let kms = |alg: &str, id: Option<&str>| -> S3Result<Encryption> {
+            let id = id.unwrap_or(crypt::DEFAULT_KMS_KEY);
+            check_kms_key_id(id)?;
+            let mut stored = vec![(SSE.to_string(), alg.to_string()), (crypt::KMS_KEY_ID.to_string(), id.to_string())];
+            if let Some(c) = header(h, KMS_CONTEXT) {
+                // A base64 JSON object of strings, as S3 checks; kept and returned on reads.
+                let valid = unbase64(c).and_then(|b| access::parse_json(std::str::from_utf8(&b).ok()?)).is_some_and(
+                    |j| matches!(&j, access::Json::Obj(m) if m.iter().all(|(_, v)| matches!(v, access::Json::Str(_)))),
+                );
+                if !valid {
+                    return Err(err::InvalidArgument().with_message("The encryption context must be base64-encoded JSON"));
+                }
+                stored.push((KMS_CONTEXT.to_string(), c.trim().to_string()));
             }
-            Some(_) => return Err(err::InvalidArgument().with_message("The encryption method specified is not supported")),
-            None => self.encrypt_by_default || self.bucket_access(bucket)?.default_sse,
+            if header(h, BUCKET_KEY).is_some_and(|v| v.trim().eq_ignore_ascii_case("true")) {
+                stored.push((BUCKET_KEY.to_string(), "true".to_string()));
+            }
+            Ok(Some((crypt::kms_key(&self.master()?, id), stored)))
         };
-        if !requested {
-            return Ok(None);
+        match sse {
+            Some("AES256") if kms_id.is_none() => Ok(Some((self.master()?, vec![(SSE.to_string(), "AES256".to_string())]))),
+            Some(alg @ ("aws:kms" | "aws:kms:dsse")) => kms(alg, kms_id),
+            Some(_) if kms_id.is_some() => Err(err::InvalidArgument()
+                .with_message("x-amz-server-side-encryption-aws-kms-key-id is only valid with aws:kms encryption")),
+            Some(_) => Err(err::InvalidArgument().with_message("The encryption method specified is not supported")),
+            None if kms_id.is_some() => Err(err::InvalidArgument()
+                .with_message("x-amz-server-side-encryption-aws-kms-key-id is only valid with aws:kms encryption")),
+            None => {
+                let access = self.bucket_access(bucket)?;
+                match &access.default_kms {
+                    Some(id) => kms("aws:kms", Some(id)),
+                    None if self.encrypt_by_default || access.default_sse => {
+                        Ok(Some((self.master()?, vec![(SSE.to_string(), "AES256".to_string())])))
+                    }
+                    None => Ok(None),
+                }
+            }
         }
-        Ok(Some((self.master()?, vec![(SSE.to_string(), "AES256".to_string())])))
+    }
+
+    /// The encryption of an object written from a stored one (copies that don't choose their
+    /// own): server-side encryption carries over, with the same algorithm and KMS key.
+    fn same_server_encryption(&self, stored: &[(String, String)]) -> S3Result<Encryption> {
+        let key = match self.master_key.as_ref().and_then(|m| crypt::server_key(stored, m)) {
+            Some(k) => k,
+            None => return Ok(None),
+        };
+        let headers = stored.iter().filter(|(k, _)| k.starts_with(SSE) && !k.starts_with(SSE_C_PREFIX)).cloned().collect();
+        Ok(Some((key, headers)))
     }
 
     /// The key needed to read data stored with `stored` headers. SSE-C requires the request to
@@ -2641,11 +2698,11 @@ impl Server {
             return Ok(Some(WrapKey::new(KeyKind::Customer, key)));
         }
         if get(SSE).is_some() {
-            return Ok(Some(
-                self.master_key
-                    .clone()
-                    .ok_or_else(|| S3Error::internal("object is encrypted but no --encryption-key is configured"))?,
-            ));
+            let master = self
+                .master_key
+                .as_ref()
+                .ok_or_else(|| S3Error::internal("object is encrypted but no --encryption-key is configured"))?;
+            return Ok(crypt::server_key(stored, master));
         }
         Ok(None)
     }
@@ -3082,7 +3139,7 @@ impl Server {
             let dst_enc = match &requested_enc {
                 Some(e) => Some(e.clone()),
                 None if src_key.as_ref().is_some_and(|k| k.kind == KeyKind::Master) => {
-                    Some((self.master()?, vec![(SSE.to_string(), "AES256".to_string())]))
+                    self.same_server_encryption(&src.headers)?
                 }
                 None => None,
             };
@@ -3450,9 +3507,9 @@ impl Server {
         {
             headers.push(("content-type".into(), ct.clone()));
         }
-        // SSE-C: the customer key comes in form fields, like the other request headers.
+        // SSE-C keys and SSE-KMS settings come in form fields, like the other request headers.
         let mut sse_c = HeaderMap::new();
-        for (name, value) in f.iter().filter(|(k, _)| k.starts_with("x-amz-server-side-encryption-customer-")) {
+        for (name, value) in f.iter().filter(|(k, _)| k.starts_with(SSE) && k.as_str() != SSE) {
             let name = hyper::header::HeaderName::from_bytes(name.as_bytes()).map_err(|_| err::InvalidArgument())?;
             let value = HeaderValue::from_str(value).map_err(|_| err::InvalidArgument())?;
             sse_c.insert(name, value);
@@ -3770,6 +3827,17 @@ type Encryption = Option<(WrapKey, Vec<(String, String)>)>;
 
 const SSE: &str = "x-amz-server-side-encryption";
 const SSE_C_ALG: &str = "x-amz-server-side-encryption-customer-algorithm";
+const SSE_C_PREFIX: &str = "x-amz-server-side-encryption-customer-";
+const KMS_CONTEXT: &str = "x-amz-server-side-encryption-context";
+const BUCKET_KEY: &str = "x-amz-server-side-encryption-bucket-key-enabled";
+
+/// KMS key ids are names or ARNs; they become part of stored headers.
+fn check_kms_key_id(id: &str) -> S3Result<()> {
+    if id.is_empty() || id.len() > 2048 || !id.bytes().all(|b| b.is_ascii_graphic()) {
+        return Err(err::InvalidArgument().with_message("Invalid KMS key id"));
+    }
+    Ok(())
+}
 const SSE_C_MD5: &str = "x-amz-server-side-encryption-customer-key-md5";
 
 /// Quoted ETag for an object with this plaintext MD5 (keyed for SSE-C; see crypt::etag_digest).

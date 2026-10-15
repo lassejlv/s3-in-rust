@@ -293,6 +293,7 @@ const KNOWN_KEYS: &[&str] = &[
     "s3:x-amz-acl",
     "s3:x-amz-server-side-encryption",
     "s3:x-amz-server-side-encryption-customer-algorithm",
+    "s3:x-amz-server-side-encryption-aws-kms-key-id",
     "s3:x-amz-copy-source",
     "s3:x-amz-metadata-directive",
     "s3:x-amz-storage-class",
@@ -326,6 +327,7 @@ impl Ctx<'_> {
             "s3:x-amz-server-side-encryption" => header("x-amz-server-side-encryption"),
             "s3:x-amz-copy-source" => header("x-amz-copy-source"),
             "s3:x-amz-server-side-encryption-customer-algorithm" => header("x-amz-server-side-encryption-customer-algorithm"),
+            "s3:x-amz-server-side-encryption-aws-kms-key-id" => header("x-amz-server-side-encryption-aws-kms-key-id"),
             _ if k.starts_with("s3:existingobjecttag/") => {
                 let tag = &key["s3:ExistingObjectTag/".len()..];
                 let tags = (self.object_tags?)()?;

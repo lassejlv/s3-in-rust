@@ -1,4 +1,4 @@
-//! Encryption at rest (SSE-S3 and SSE-C).
+//! Encryption at rest (SSE-S3, SSE-KMS and SSE-C).
 //!
 //! Encrypted object data (a data file or an inline blob) is self-describing:
 //!
@@ -53,6 +53,26 @@ impl WrapKey {
 impl std::fmt::Debug for WrapKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "WrapKey({:?}, id={})", self.kind, crate::util::hex(&self.id))
+    }
+}
+
+pub const KMS_KEY_ID: &str = "x-amz-server-side-encryption-aws-kms-key-id";
+/// The KMS key of SSE-KMS requests that name none (S3's AWS-managed key).
+pub const DEFAULT_KMS_KEY: &str = "alias/aws/s3";
+
+/// SSE-KMS without an external KMS: each KMS key id gets its own wrapping key, derived from
+/// the master key. Objects under different key ids can't be read with each other's key.
+pub fn kms_key(master: &WrapKey, key_id: &str) -> WrapKey {
+    WrapKey::new(KeyKind::Master, crate::auth::hmac(&master.key, format!("s3rs-kms-key\0{key_id}").as_bytes()))
+}
+
+/// The server-side key that reads data stored with `headers`: the master key (SSE-S3) or the
+/// key of its KMS key id (SSE-KMS). `None` if the data is not encrypted by the server.
+pub fn server_key(headers: &[(String, String)], master: &WrapKey) -> Option<WrapKey> {
+    let get = |name: &str| headers.iter().find(|(k, _)| k == name).map(|(_, v)| v.as_str());
+    match get("x-amz-server-side-encryption")? {
+        a if a.starts_with("aws:kms") => Some(kms_key(master, get(KMS_KEY_ID).unwrap_or(DEFAULT_KMS_KEY))),
+        _ => Some(master.clone()),
     }
 }
 

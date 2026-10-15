@@ -768,7 +768,10 @@ impl Replicator {
         }
         let sse = stored("x-amz-server-side-encryption").is_some();
         let wrap = match sse {
-            true => Some(self.master.clone().ok_or("the object is encrypted but no master key is configured")?),
+            true => {
+                let master = self.master.as_ref().ok_or("the object is encrypted but no master key is configured")?;
+                crate::crypt::server_key(&meta.headers, master)
+            }
             false => None,
         };
         let what = |m: &str| format!("{}: {m} {bucket}/{key}", t.id);

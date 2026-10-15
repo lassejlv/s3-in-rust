@@ -497,8 +497,10 @@ impl CannedAcl {
 pub struct BucketAccess {
     pub acl: CannedAcl,
     pub versioning: crate::store::Versioning,
-    /// Bucket default encryption (PutBucketEncryption with AES256).
+    /// Bucket default encryption (PutBucketEncryption).
     pub default_sse: bool,
+    /// The KMS key id when the bucket default is SSE-KMS.
+    pub default_kms: Option<String>,
     pub policy: Option<crate::iam::Policy>,
     pub cors: Option<Vec<CorsRule>>,
     /// Object Lock configuration (present = Object Lock enabled).

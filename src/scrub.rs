@@ -86,7 +86,7 @@ fn verify(store: &Store, meta: &ObjectMeta, inline: Option<&Bytes>, master: Opti
         return Outcome::Skipped;
     } else if header("x-amz-server-side-encryption") {
         match master {
-            Some(k) => Some(k),
+            Some(k) => crypt::server_key(&meta.headers, k),
             None => return Outcome::Skipped,
         }
     } else {
@@ -96,7 +96,7 @@ fn verify(store: &Store, meta: &ObjectMeta, inline: Option<&Bytes>, master: Opti
     match &meta.storage {
         Storage::Inline(_) => {
             let Some(data) = inline else { return Outcome::Missing("inline data is missing".into()) };
-            match key {
+            match &key {
                 Some(k) => match crypt::decrypt_range(k, data, 0, meta.size, meta.size) {
                     Ok(p) => digests.push(md5(&p)),
                     Err(e) => return Outcome::Corrupt(format!("cannot decrypt: {}", e.message)),
@@ -110,7 +110,7 @@ fn verify(store: &Store, meta: &ObjectMeta, inline: Option<&Bytes>, master: Opti
         Storage::Segments(segs) => {
             for (id, len) in segs {
                 let path = store.data_path(*id);
-                match crate::io::segment_md5_paced(&path, *len, key, &mut |n| pacer.pace(n)) {
+                match crate::io::segment_md5_paced(&path, *len, key.as_ref(), &mut |n| pacer.pace(n)) {
                     Ok(d) => digests.push(d),
                     Err(e) if e.kind() == std::io::ErrorKind::Interrupted => return Outcome::Stopped,
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {

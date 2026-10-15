@@ -11,7 +11,8 @@ First release.
   the next start removes orphaned files and recomputes usage counters.
 - Versioning (enabled and suspended), lifecycle rules (expiration, noncurrent versions, incomplete
   uploads) and Object Lock (governance and compliance retention, legal holds).
-- Server-side encryption with SSE-S3 (master key) and SSE-C, using chunked AES-256-GCM.
+- Server-side encryption with SSE-S3 (master key), SSE-KMS (per key id keys derived from the
+  master key, no external KMS needed) and SSE-C, using chunked AES-256-GCM.
 - Per-bucket usage accounting and quotas, including bytes in unfinished multipart uploads.
 - `s3rs fsck` checks a data directory, deeply with `--deep`, and `--repair` fixes it.
 - Online scrubbing (`--scrub-interval`): all stored data is re-read in the background at a

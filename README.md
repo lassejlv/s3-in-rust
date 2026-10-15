@@ -455,12 +455,24 @@ versioning-enabled bucket, expiring the current version adds a delete marker, as
 
 ## Encryption at rest
 
-s3rs supports two kinds of server-side encryption.
+s3rs supports three kinds of server-side encryption.
 
 **SSE-S3** uses a server master key, set with `--encryption-key`:
 - A client requests it per object with `x-amz-server-side-encryption: AES256`.
 - `PutBucketEncryption` makes it the default for a bucket.
 - `--encrypt-by-default` makes it the default for every bucket.
+
+**SSE-KMS** (`x-amz-server-side-encryption: aws:kms`, also `aws:kms:dsse`) works without an
+external KMS: each KMS key id gets its own key, derived from the master key, so clients and
+tools that insist on SSE-KMS work unchanged:
+- `x-amz-server-side-encryption-aws-kms-key-id` picks the key id (any name or ARN; `alias/aws/s3`
+  when none is given). The key id, encryption context and bucket-key flag are stored and returned
+  on reads, as on S3.
+- `PutBucketEncryption` with `aws:kms` and `KMSMasterKeyID` makes it the default for a bucket.
+- Copies keep their source's SSE-S3 or SSE-KMS encryption unless the request asks for another.
+- Key ids are not access controls: anyone allowed to read an object reads it, whatever its key
+  id (use policies, for example on `s3:x-amz-server-side-encryption-aws-kms-key-id`). Replicas
+  of SSE-KMS objects are written with SSE-S3.
 
 **SSE-C** uses a key the client supplies with every request
 (`x-amz-server-side-encryption-customer-*`):
@@ -484,7 +496,6 @@ How it works:
 - Copies and UploadPartCopy decrypt with the source's key (`x-amz-copy-source-server-side-encryption-customer-*`
   for SSE-C sources) and re-encrypt for the destination. When the source and destination keys
   match, a copy just shares the stored bytes.
-- SSE-KMS is not supported.
 
 Costs on the benchmark machine: 1 MiB GETs run at about 2.4 GiB/s instead of 4.4 GiB/s, and
 small objects lose under 10%. **Keep the master key safe:** without it, SSE-S3 objects cannot be
@@ -865,7 +876,7 @@ direct uploads from web apps.
 | STS | AssumeRole (with session policies), GetCallerIdentity |
 | Transport | HTTP/1.1 keep-alive, HTTP/2 (h2c), path-style and virtual-hosted-style addressing |
 
-Not implemented: SSE-KMS, storage class transitions and SigV4A. These
+Not implemented: storage class transitions and SigV4A. These
 requests return `NotImplemented` or the matching "not found" configuration error.
 
 ## Architecture

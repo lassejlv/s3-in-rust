@@ -49,7 +49,10 @@ malicious. It does not defend against someone who controls the host.
 - **STS sessions** can never do more than the key they came from, and stop working when it is
   revoked or expires. Their tokens are signed with a random key kept in the metadata database
   (so backups contain it): anyone with that database can mint sessions for existing keys, just
-  as they can read the keys' secrets.
+  as they can read the keys' secrets. Servers restored from the same backup accept each other's
+  sessions. `DELETE /_admin/sessions` replaces the key and ends every session.
+- **Event streams** (ListenBucketNotification) end within ten seconds of their key expiring or
+  being revoked, and follow changes to its permissions.
 - **Public buckets:** `--block-public-access` makes sure no bucket can be made public by mistake
   (public ACLs and public bucket policies are refused, and existing ones have no effect).
 - **Secrets in logs:** access logs redact signatures, credentials and tokens in query strings.

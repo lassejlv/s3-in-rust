@@ -160,6 +160,15 @@ def t_not_found():
     expect_error("404", lambda: s3.head_object(Bucket=B, Key="missing"))
 
 
+def t_expected_bucket_owner():
+    s3.put_object(Bucket=B, Key="owned", Body=b"o", ExpectedBucketOwner="s3rs")
+    expect_error("AccessDenied", lambda: s3.put_object(Bucket=B, Key="owned", Body=b"x", ExpectedBucketOwner="123456789012"))
+    expect_error("AccessDenied", lambda: s3.copy_object(Bucket=B, Key="owned2", CopySource={"Bucket": B, "Key": "owned"},
+                                                        ExpectedSourceBucketOwner="123456789012"))
+    assert s3.get_object(Bucket=B, Key="owned", ExpectedBucketOwner="s3rs")["Body"].read() == b"o"
+    s3.delete_object(Bucket=B, Key="owned")
+
+
 def t_listing():
     for k in ["dir/a", "dir/b", "dir/sub/c", "dir/sub/d", "other/e", "top", "space key", "plus+key", "uni/ä€"]:
         s3.put_object(Bucket=B, Key=k, Body=k.encode())
@@ -348,6 +357,11 @@ def t_multipart_small_part():
         "Parts": [{"PartNumber": 1, "ETag": e1}, {"PartNumber": 2, "ETag": e2}]}))
     s3.abort_multipart_upload(Bucket=B, Key=key, UploadId=uid)
     expect_error("NoSuchUpload", lambda: s3.abort_multipart_upload(Bucket=B, Key=key, UploadId=uid))
+    # Completing an aborted upload fails right away (it must not wait for other completions).
+    t0 = time.time()
+    expect_error("NoSuchUpload", lambda: s3.complete_multipart_upload(Bucket=B, Key=key, UploadId=uid,
+                                                                      MultipartUpload={"Parts": [{"PartNumber": 1, "ETag": '"0"'}]}))
+    assert time.time() - t0 < 5, time.time() - t0
 
 
 def t_upload_part_copy():
@@ -579,6 +593,11 @@ def t_policy_object_tags():
     expect_error("AccessDenied", lambda: s3.get_object(Bucket=tb, Key="closed"))
     expect_error("AccessDenied", lambda: s3.put_object(Bucket=tb, Key="untagged", Body=b"x"))
     s3.put_object(Bucket=tb, Key="tagged", Body=b"x", Tagging="class=public")
+    # The source's tags count for copies: a secret object can't be copied out from under its tag.
+    expect_error("AccessDenied", lambda: s3.copy_object(Bucket=tb, Key="leak", CopySource={"Bucket": tb, "Key": "closed"},
+                                                        TaggingDirective="REPLACE", Tagging="class=public"))
+    s3.copy_object(Bucket=tb, Key="tagged", CopySource={"Bucket": tb, "Key": "open"}, TaggingDirective="REPLACE",
+                   Tagging="class=public")
     s3.delete_bucket_policy(Bucket=tb)
     for k in ("open", "closed", "tagged"):
         s3.delete_object(Bucket=tb, Key=k)

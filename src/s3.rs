@@ -1055,6 +1055,24 @@ impl Server {
         Ok(())
     }
 
+    /// `DELETE /_admin/sessions`: end every STS session by replacing the key that signs them.
+    async fn admin_sessions(&self, parts: &Parts, peer: SocketAddr) -> S3Result<Resp> {
+        self.check_admin(parts, peer)?;
+        let Some(a) = &self.auth else {
+            return Err(err::InvalidRequest().with_message("Authentication is disabled (--anonymous)"));
+        };
+        if parts.method != Method::DELETE {
+            return Err(err::MethodNotAllowed());
+        }
+        let mut key = [0u8; 32];
+        getrandom::fill(&mut key).map_err(S3Error::internal)?;
+        self.store.submit(Op::SetSessionKey(key)).await?;
+        self.store.submit(Op::Flush).await?;
+        a.set_session_key(key);
+        elog!("admin: replaced the STS signing key; all sessions ended");
+        Ok(Resp::new(StatusCode::NO_CONTENT))
+    }
+
     /// STS (`POST /` with a form body): AssumeRole. Errors use STS's own XML format.
     async fn sts(&self, parts: &Parts, body: Incoming, peer: SocketAddr, rid: &str, rec: &mut crate::accesslog::Record) -> Resp {
         let result = self.assume_role(parts, body, peer, rid, rec).await;
@@ -1102,7 +1120,7 @@ impl Server {
         if let Some(t) = c.expires_ms {
             expires = expires.min(t);
         }
-        let issued = crate::sts::issue(key, &c.access_key, &req.name, req.policy.as_deref(), expires);
+        let issued = crate::sts::issue(&key, &c.access_key, &c.secret, &req.name, req.policy.as_deref(), expires);
         Ok(crate::sts::response_xml(&issued, &c.access_key, &req.name, rid))
     }
 
@@ -1326,6 +1344,9 @@ impl Server {
         if !vhost && parts.uri.path() == "/_admin/backup" {
             return self.admin_backup(&parts, peer).await;
         }
+        if !vhost && parts.uri.path() == "/_admin/sessions" {
+            return self.admin_sessions(&parts, peer).await;
+        }
         if !vhost && (parts.uri.path() == "/_admin/keys" || parts.uri.path().starts_with("/_admin/keys/")) {
             return self.admin_keys(&parts, body, peer).await;
         }
@@ -1378,6 +1399,13 @@ impl Server {
         let auth_type = if r_has_auth_header(&parts) { "REST-HEADER" } else { "REST-QUERY-STRING" };
         let client = self.client(&parts.headers, peer);
         let mut r = Req { parts, query, payload, body, principal, client, auth_type, rid: rid.to_string(), replica: false };
+        // Every bucket here belongs to the one account: a request expecting another owner (for
+        // the bucket, or a copy source's bucket) is refused, as S3 does.
+        for name in ["x-amz-expected-bucket-owner", "x-amz-source-expected-bucket-owner"] {
+            if r.header(name).is_some_and(|o| o.trim() != crate::OWNER_ID) {
+                return Err(err::AccessDenied());
+            }
+        }
         let m = r.parts.method.clone();
         // One classification decides both what is authorized and what runs.
         let op = match (&bucket, &key) {
@@ -2524,17 +2552,18 @@ impl Server {
         // Every event is re-authorized for the subscriber (its bucket limits, policies and
         // bucket policies, which may change while the stream is open); decisions are cached
         // per bucket for a few seconds.
-        let (principal, headers, query, client, auth_type) =
+        let (mut principal, headers, query, client, auth_type) =
             (r.principal.clone(), r.parts.headers.clone(), r.query.clone(), r.client, r.auth_type);
         let mut allowed: HashMap<String, (bool, Instant)> = HashMap::new();
-        let mut may_see = move |bucket: &str| -> bool {
+        let srv = server.clone();
+        let mut may_see = move |principal: &Principal, bucket: &str| -> bool {
             if let Some((ok, at)) = allowed.get(bucket)
                 && at.elapsed() < std::time::Duration::from_secs(5)
             {
                 return *ok;
             }
-            let ctx = server.ctx(&principal, &headers, &query, client, auth_type);
-            let ok = server.authorize(&principal, "s3:ListenBucketNotification", Some(bucket), None, &ctx).is_ok();
+            let ctx = srv.ctx(principal, &headers, &query, client, auth_type);
+            let ok = srv.authorize(principal, "s3:ListenBucketNotification", Some(bucket), None, &ctx).is_ok();
             if allowed.len() > 10_000 {
                 allowed.clear();
             }
@@ -2548,7 +2577,7 @@ impl Server {
             loop {
                 let chunk = tokio::select! {
                     ev = rx.recv() => match ev {
-                        Ok(ev) if filter.matches(&ev) && may_see(&ev.bucket) => {
+                        Ok(ev) if filter.matches(&ev) && may_see(&principal, &ev.bucket) => {
                             let mut line = ev.to_json(&region, "");
                             line.push('\n');
                             Bytes::from(line)
@@ -2556,7 +2585,17 @@ impl Server {
                         Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                     },
-                    _ = ping.tick() => Bytes::from_static(b" "),
+                    _ = ping.tick() => {
+                        // The stream ends when the subscriber's key expires or is revoked, and
+                        // follows changes to its limits.
+                        if let (Principal::User(c), Some(a)) = (&principal, &server.auth) {
+                            match a.current(c) {
+                                Some(now) => principal = Principal::User(now),
+                                None => break,
+                            }
+                        }
+                        Bytes::from_static(b" ")
+                    }
                     _ = closing.wait_for(|v| *v) => break,
                 };
                 // The client went away: stop listening.
@@ -3043,7 +3082,11 @@ impl Server {
             Some((b, k)) if !b.is_empty() && !k.is_empty() => {
                 check_key(k)?;
                 let action = if version.is_some() { "s3:GetObjectVersion" } else { "s3:GetObject" };
-                self.authorize(&r.principal, action, Some(b), Some(k), &self.req_ctx(r))
+                // s3:ExistingObjectTag conditions look at the source's tags.
+                let mut ctx = self.req_ctx(r);
+                let tags = || self.lookup(b, k, version.as_deref()).ok().map(|(m, _)| m.tags);
+                ctx.object_tags = Some(&tags);
+                self.authorize(&r.principal, action, Some(b), Some(k), &ctx)
                     .map_err(|e| e.with_message("Access to the copy source was denied"))?;
                 Ok((b.to_string(), k.to_string(), version))
             }
@@ -3073,7 +3116,9 @@ impl Server {
             })?
             .to_string();
         check_key(&src)?;
-        let ctx = self.req_ctx(r);
+        let mut ctx = self.req_ctx(r);
+        let tags = || self.lookup(bucket, &src, None).ok().map(|(m, _)| m.tags);
+        ctx.object_tags = Some(&tags);
         for action in ["s3:GetObject", "s3:DeleteObject"] {
             self.authorize(&r.principal, action, Some(bucket), Some(&src), &ctx)?;
         }
@@ -3653,7 +3698,7 @@ impl Server {
         let op = Op::Complete { bucket: bucket.into(), key: key.into(), upload, parts, checksum, cond };
         let template = self.event(&r.principal, r.client.ip, &r.rid, "ObjectCreated:CompleteMultipartUpload", bucket, key);
         let (op, notify) = self.created_events(template, bucket, op);
-        let completing = Completing::start(&self.completed, upload);
+        let mut completing = Completing::start(&self.completed, upload);
         let meta = match self.store.submit(op).await {
             Ok(OpOut::Object(meta)) => {
                 completing.finish(bucket, key, &meta);
@@ -3877,10 +3922,19 @@ fn upload_checksum_algo(headers: &[(String, String)]) -> Option<ChecksumAlgo> {
 #[derive(Default)]
 struct Completed {
     done: HashMap<u128, (String, String, ObjectMeta)>,
-    /// Completions being written. A request completing the same upload at the same time gets
-    /// `NoSuchUpload` from the writer, possibly before the winner has called `remember`; it
-    /// waits for the winner's result here instead.
-    inflight: HashMap<u128, tokio::sync::watch::Receiver<Option<ObjectMeta>>>,
+    /// Completions being written, with how many requests use each entry. A request completing
+    /// the same upload at the same time gets `NoSuchUpload` from the writer, possibly before
+    /// the winner has called `remember`; it waits for the winner's result here instead.
+    inflight: HashMap<u128, (Arc<tokio::sync::watch::Sender<Race>>, usize)>,
+}
+
+/// The state of concurrent completions of one upload.
+#[derive(Default)]
+struct Race {
+    /// Published by whichever request completed the upload.
+    result: Option<ObjectMeta>,
+    /// Requests whose completion has not come back from the writer yet.
+    writing: usize,
 }
 
 impl Completed {
@@ -3896,54 +3950,62 @@ impl Completed {
     }
 }
 
-/// An in-flight completion registered in `Completed`; removed when dropped.
+/// A completion registered in `Completed` while it runs.
 struct Completing<'a> {
     completed: &'a std::sync::Mutex<Completed>,
     upload: u128,
-    tx: Option<tokio::sync::watch::Sender<Option<ObjectMeta>>>,
+    race: Arc<tokio::sync::watch::Sender<Race>>,
+    /// Still counted in `Race::writing`.
+    writing: bool,
 }
 
 impl<'a> Completing<'a> {
     fn start(completed: &'a std::sync::Mutex<Completed>, upload: u128) -> Self {
-        let mut c = completed.lock().unwrap();
-        let tx = match c.inflight.entry(upload) {
-            std::collections::hash_map::Entry::Occupied(_) => None,
-            std::collections::hash_map::Entry::Vacant(v) => {
-                let (tx, rx) = tokio::sync::watch::channel(None);
-                v.insert(rx);
-                Some(tx)
-            }
+        let race = {
+            let mut c = completed.lock().unwrap();
+            let e = c.inflight.entry(upload).or_insert_with(|| (Arc::new(tokio::sync::watch::channel(Race::default()).0), 0));
+            e.1 += 1;
+            e.0.clone()
         };
-        Completing { completed, upload, tx }
+        race.send_modify(|r| r.writing += 1);
+        Completing { completed, upload, race, writing: true }
     }
 
-    fn finish(&self, bucket: &str, key: &str, meta: &ObjectMeta) {
-        self.completed.lock().unwrap().remember(self.upload, bucket, key, meta);
-        if let Some(tx) = &self.tx {
-            let _ = tx.send(Some(meta.clone()));
+    fn written(&mut self) {
+        if std::mem::take(&mut self.writing) {
+            self.race.send_modify(|r| r.writing -= 1);
         }
     }
 
-    /// The result of this upload's completion, by this request or a concurrent one.
-    async fn result(&self, bucket: &str, key: &str) -> Option<ObjectMeta> {
-        let rx = {
-            let c = self.completed.lock().unwrap();
-            if let Some(m) = c.get(self.upload, bucket, key) {
-                return Some(m);
-            }
-            c.inflight.get(&self.upload).cloned()
-        };
-        let mut rx = rx?;
-        // Ends with the winner's result, or when it gave up (failed or was cancelled).
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(30), rx.wait_for(Option::is_some)).await;
+    /// This request completed the upload.
+    fn finish(&mut self, bucket: &str, key: &str, meta: &ObjectMeta) {
+        self.completed.lock().unwrap().remember(self.upload, bucket, key, meta);
+        self.race.send_modify(|r| r.result = Some(meta.clone()));
+        self.written();
+    }
+
+    /// The writer found no such upload: the result of a concurrent request that completed it,
+    /// if there is one (waiting while other completions are still being written).
+    async fn result(&mut self, bucket: &str, key: &str) -> Option<ObjectMeta> {
+        self.written();
+        let mut rx = self.race.subscribe();
+        let _ =
+            tokio::time::timeout(std::time::Duration::from_secs(30), rx.wait_for(|r| r.result.is_some() || r.writing == 0)).await;
+        drop(rx);
         self.completed.lock().unwrap().get(self.upload, bucket, key)
     }
 }
 
 impl Drop for Completing<'_> {
     fn drop(&mut self) {
-        if self.tx.is_some() {
-            self.completed.lock().unwrap().inflight.remove(&self.upload);
+        // Cancelled requests stop counting as writing, so nobody waits for them.
+        self.written();
+        let mut c = self.completed.lock().unwrap();
+        if let Some(e) = c.inflight.get_mut(&self.upload) {
+            e.1 -= 1;
+            if e.1 == 0 {
+                c.inflight.remove(&self.upload);
+            }
         }
     }
 }

@@ -144,7 +144,15 @@ try:
     s3.put_object(Bucket="files", Key="tmp/t", Body=b"t")
     assert code(lambda: lim.rename_object(Bucket="files", Key="mine/k", RenameSource="files/keep/k")) == "AccessDenied"
     lim.rename_object(Bucket="files", Key="mine/t", RenameSource="files/tmp/t")
-    print("the source needs s3:GetObject and s3:DeleteObject")
+    # Tag conditions apply to the source: a protected object can't be moved away.
+    s3.put_object(Bucket="files", Key="guarded", Body=b"g", Tagging="class=protected")
+    s3.put_bucket_policy(Bucket="files", Policy=json.dumps({"Statement": [
+        {"Effect": "Deny", "Principal": "*", "Action": "s3:DeleteObject", "Resource": "arn:aws:s3:::files/*",
+         "Condition": {"StringEquals": {"s3:ExistingObjectTag/class": "protected"}}}]}))
+    assert code(lambda: s3.rename_object(Bucket="files", Key="unguarded", RenameSource="files/guarded")) == "AccessDenied"
+    s3.delete_bucket_policy(Bucket="files")
+    s3.delete_object(Bucket="files", Key="guarded")
+    print("the source needs s3:GetObject and s3:DeleteObject, with its own tag conditions")
 
     # Readers of the old key see a complete object or none; usage still matches the listing.
     data = os.urandom(6 << 20)

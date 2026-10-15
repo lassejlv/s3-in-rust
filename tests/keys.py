@@ -159,6 +159,23 @@ try:
         sys.exit("the expired key was not removed")
     assert admin("POST", body={"expires_in": 0})[0] == 400
 
+    # An event stream opened with a temporary key ends when the key expires.
+    from botocore.auth import SigV4Auth
+    from botocore.awsrequest import AWSRequest
+    from botocore.credentials import Credentials
+    status, tmp = admin("POST", body={"expires_in": 2})
+    client("root", "rootsecret").create_bucket(Bucket="listened")
+    url = f"{EP}/listened?events=s3%3AObjectCreated%3A%2A"
+    req = AWSRequest(method="GET", url=url, headers={"x-amz-content-sha256": "UNSIGNED-PAYLOAD"})
+    SigV4Auth(Credentials(tmp["access_key"], tmp["secret_key"]), "s3", "us-east-1").add_auth(req)
+    started = time.time()
+    with urllib.request.urlopen(urllib.request.Request(url, headers=dict(req.headers)), timeout=30) as stream:
+        assert stream.status == 200
+        stream.read()  # returns when the server closes the stream
+    took = time.time() - started
+    assert took < 20, took
+    print(f"an event stream ended {took:.0f}s after its key's 2 s lifetime began")
+
     # Guessing the admin token is slowed down.
     codes = [admin("GET", token=f"guess{i}")[0] for i in range(14)]
     assert codes[0] == 403 and 503 in codes, codes

@@ -33,6 +33,8 @@ pub struct Session {
     pub parent: String,
     /// The RoleSessionName it was requested with.
     pub name: String,
+    /// The session token, to look the session up again later (long-lived event streams).
+    pub token: String,
     /// The session may only do what this policy allows (on top of the parent's limits).
     pub policy: Option<Arc<Policy>>,
 }
@@ -42,6 +44,8 @@ pub struct Session {
 pub struct Claims {
     pub access_key: String,
     pub parent: String,
+    /// `parent_fingerprint` of the parent's secret when the session was issued.
+    pub fingerprint: String,
     pub name: String,
     pub expires_ms: u64,
     pub policy: Option<String>,
@@ -73,11 +77,18 @@ pub fn is_session_key(access_key: &str) -> bool {
     access_key.starts_with("ASIA")
 }
 
-pub fn issue(key: &[u8; 32], parent: &str, name: &str, policy: Option<&str>, expires_ms: u64) -> Issued {
+/// Identifies the parent key's secret, so a session ends when its key is rotated or re-created
+/// with another secret (not only when it is deleted).
+pub fn parent_fingerprint(key: &[u8; 32], parent_secret: &str) -> String {
+    b64url(&hmac(key, format!("s3rs-sts-parent\0{parent_secret}").as_bytes())[..12])
+}
+
+pub fn issue(key: &[u8; 32], parent: &str, parent_secret: &str, name: &str, policy: Option<&str>, expires_ms: u64) -> Issued {
     let access_key = format!("ASIA{}", &crate::keys::generate_access_key()[4..]);
     let mut claims = vec![
         ("a".to_string(), Json::Str(access_key.clone())),
         ("p".to_string(), Json::Str(parent.to_string())),
+        ("f".to_string(), Json::Str(parent_fingerprint(key, parent_secret))),
         ("n".to_string(), Json::Str(name.to_string())),
         ("e".to_string(), Json::Num(expires_ms as f64)),
     ];
@@ -113,6 +124,7 @@ pub fn open(key: &[u8; 32], access_key: &str, token: &str, now_ms: u64) -> S3Res
     let claims = Claims {
         access_key: s("a").ok_or_else(invalid_token)?,
         parent: s("p").ok_or_else(invalid_token)?,
+        fingerprint: s("f").ok_or_else(invalid_token)?,
         name: s("n").unwrap_or_default(),
         expires_ms: match j.get("e") {
             Some(Json::Num(n)) => *n as u64,
@@ -269,7 +281,7 @@ mod tests {
     #[test]
     fn tokens_round_trip_and_are_tamper_proof() {
         let key = [7u8; 32];
-        let i = issue(&key, "parent", "job", Some(r#"{"Statement":[]}"#), 5_000);
+        let i = issue(&key, "parent", "secret", "job", Some(r#"{"Statement":[]}"#), 5_000);
         assert!(is_session_key(&i.access_key) && i.access_key.len() == 20);
         assert_eq!(i.secret, secret_for(&key, &i.access_key));
         let c = open(&key, &i.access_key, &i.token, 1_000).unwrap();
@@ -278,6 +290,7 @@ mod tests {
             Claims {
                 access_key: i.access_key.clone(),
                 parent: "parent".into(),
+                fingerprint: parent_fingerprint(&key, "secret"),
                 name: "job".into(),
                 expires_ms: 5_000,
                 policy: Some(r#"{"Statement":[]}"#.into())
@@ -285,7 +298,7 @@ mod tests {
         );
         assert_eq!(open(&key, &i.access_key, &i.token, 5_000).unwrap_err().code, "ExpiredToken");
         // Another key's token, another server's key, or a changed payload are refused.
-        let other = issue(&key, "parent", "", None, 5_000);
+        let other = issue(&key, "parent", "secret", "", None, 5_000);
         assert_eq!(open(&key, &i.access_key, &other.token, 1_000).unwrap_err().code, "InvalidToken");
         assert_eq!(open(&[8u8; 32], &i.access_key, &i.token, 1_000).unwrap_err().code, "InvalidToken");
         let (payload, sig) = i.token[TOKEN_PREFIX.len()..].split_once('.').unwrap();

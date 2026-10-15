@@ -337,8 +337,10 @@ s3 = boto3.client("s3", endpoint_url="https://s3.example.com", aws_access_key_id
 `aws sts assume-role --endpoint-url ...` and `aws sts get-caller-identity` work the same way.
 Nothing is stored per session: the token carries its claims, signed with a key s3rs generates in
 the metadata database on first start, so sessions survive restarts. A session works only while the
-key it came from exists and is not expired, so revoking that key ends its sessions, and changes to
-the key's limits apply to them at once. Sessions can't assume roles themselves. In policies, rate
+key it came from exists with the same secret and is not expired, so revoking or rotating that key
+ends its sessions, and changes to the key's limits apply to them at once. `curl -X DELETE -H
+"Authorization: Bearer $S3RS_ADMIN_TOKEN" https://s3.example.com/_admin/sessions` ends every
+session by replacing the signing key. Sessions can't assume roles themselves. In policies, rate
 limits and logs a session is the key it came from (`${aws:username}` is that key).
 
 **Per-key policies** use IAM's JSON format. Paths are relative to the credentials file. For example,

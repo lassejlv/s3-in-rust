@@ -56,7 +56,8 @@ First release.
 - Keys can also be created, listed and revoked at runtime through the admin API
   (`/_admin/keys`), including temporary keys that expire on their own (`expires_in`).
 - STS AssumeRole and GetCallerIdentity: short-lived session credentials (with session tokens)
-  for any key, optionally narrowed by a session policy, ending with the key they came from.
+  for any key, optionally narrowed by a session policy, ending with the key they came from (when
+  it is revoked or rotated); `DELETE /_admin/sessions` ends them all.
 
 **Operations**
 - Web console at `/_console/`, including object version history (download, restore, delete). It

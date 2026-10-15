@@ -168,6 +168,13 @@ try:
     kc.list_buckets()
     admin("DELETE", f"/{k['access_key']}")
     assert code(lambda: kc.list_buckets()) == "InvalidToken"
+    # Rotating a key (re-created under the same name with a new secret) ends its old sessions.
+    admin("POST", body={"access_key": "ROTATEDKEY1", "secret_key": "first-secret-123"})
+    rc = as_client(session(sts("ROTATEDKEY1", "first-secret-123")))
+    rc.list_buckets()
+    admin("DELETE", "/ROTATEDKEY1")
+    admin("POST", body={"access_key": "ROTATEDKEY1", "secret_key": "second-secret-456"})
+    assert code(lambda: rc.list_buckets()) == "InvalidToken"
     t = admin("POST", body={"expires_in": 2})
     tc = session(sts(t["access_key"], t["secret_key"]))
     assert tc["Expiration"].timestamp() - time.time() < 3
@@ -175,6 +182,17 @@ try:
     time.sleep(2.5)
     assert code(lambda: as_client(tc).list_buckets()) == "ExpiredToken"
     print("sessions end with their key")
+
+    # The admin API can end every session at once.
+    ended = session(sts("root", "rootsecret"))
+    as_client(ended).list_buckets()
+    req = urllib.request.Request(f"{EP}/_admin/sessions", method="DELETE", headers={"authorization": f"Bearer {TOKEN}"})
+    assert urllib.request.urlopen(req).status == 204
+    assert code(lambda: as_client(ended).list_buckets()) == "InvalidToken"
+    creds = session(sts("root", "rootsecret"))
+    tmp = as_client(creds)
+    tmp.put_object(Bucket="data", Key="by-session.txt", Body=b"hi")
+    print("all sessions can be ended at once")
 
     # Sessions survive a restart (the signing key is kept with the data).
     procs[-1].terminate()

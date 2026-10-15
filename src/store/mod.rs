@@ -594,6 +594,8 @@ pub enum Op {
     },
     /// Remove an access key created through the admin API.
     DeleteKey(String),
+    /// Replace the key that signs STS session tokens (ending every session).
+    SetSessionKey([u8; 32]),
     /// Remove an access key if its record is still exactly this one (expiry clean-up, which
     /// must not remove a key re-created under the same name meanwhile).
     DeleteKeyIf {
@@ -1884,6 +1886,7 @@ fn run_batch(
             repl_wait: txn.open_table(REPL_WAIT)?,
             events: txn.open_table(EVENTS)?,
             keys: txn.open_table(KEYS)?,
+            secrets: txn.open_table(SECRETS)?,
         };
         // Replication rule prefixes per bucket, looked up once per batch.
         let mut repl_rules: HashMap<String, Vec<String>> = HashMap::new();
@@ -1963,6 +1966,7 @@ struct Tables<'t> {
     repl_wait: redb::Table<'t, &'static [u8], (u64, u64)>,
     events: redb::Table<'t, &'static [u8], &'static [u8]>,
     keys: redb::Table<'t, &'static str, &'static [u8]>,
+    secrets: redb::Table<'t, &'static str, &'static [u8]>,
 }
 
 fn usage_add(tx: &mut Tables, bucket: &str, objects: i64, bytes: i64) -> S3Result<()> {
@@ -2543,6 +2547,10 @@ fn apply(tx: &mut Tables, op: Op, garbage: &mut Vec<u128>, last_seq: &mut u64) -
                 tx.keys.remove(access_key.as_str())?;
             }
             Ok(OpOut::More(same))
+        }
+        Op::SetSessionKey(k) => {
+            tx.secrets.insert("sts", k.as_slice())?;
+            Ok(OpOut::Done)
         }
         Op::DeleteKey(access_key) => match tx.keys.remove(access_key.as_str())? {
             Some(_) => Ok(OpOut::Done),

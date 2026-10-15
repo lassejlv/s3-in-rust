@@ -142,7 +142,7 @@ pub struct Auth {
     /// old secret by a request racing the reload is never served afterwards.
     generation: std::sync::atomic::AtomicU64,
     /// Signs session tokens (STS); set once the metadata database is open.
-    session_key: std::sync::OnceLock<[u8; 32]>,
+    session_key: RwLock<Option<[u8; 32]>>,
     /// Session credentials already checked: access key -> (token, generation, credential).
     sessions: Mutex<HashMap<String, CachedSession>>,
 }
@@ -215,7 +215,7 @@ impl Auth {
             creds: RwLock::new(Arc::new(HashMap::new())),
             key_cache: Mutex::new(HashMap::new()),
             generation: std::sync::atomic::AtomicU64::new(0),
-            session_key: std::sync::OnceLock::new(),
+            session_key: RwLock::new(None),
             sessions: Mutex::new(HashMap::new()),
         };
         auth.replace(creds);
@@ -232,12 +232,16 @@ impl Auth {
     }
 
     /// The key that signs session tokens (kept in the metadata database).
+    /// Set (or replace: every session issued before then stops working) the key that signs
+    /// session tokens.
     pub fn set_session_key(&self, key: [u8; 32]) {
-        let _ = self.session_key.set(key);
+        *self.session_key.write().unwrap() = Some(key);
+        self.generation.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.sessions.lock().unwrap().clear();
     }
 
-    pub fn session_key(&self) -> Option<&[u8; 32]> {
-        self.session_key.get()
+    pub fn session_key(&self) -> Option<[u8; 32]> {
+        *self.session_key.read().unwrap()
     }
 
     fn credential(&self, access_key: &str, token: Option<&str>) -> S3Result<Arc<Credential>> {
@@ -260,8 +264,9 @@ impl Auth {
     /// key, applied to the key it was issued for as that key is now.
     fn session(&self, access_key: &str, token: &str, now: u64) -> S3Result<Arc<Credential>> {
         use std::sync::atomic::Ordering::SeqCst;
-        let key = self.session_key.get().ok_or_else(err::InvalidAccessKeyId)?;
+        // The generation first: a key replaced after it was read can't be cached as current.
         let generation = self.generation.load(SeqCst);
+        let key = &self.session_key().ok_or_else(err::InvalidAccessKeyId)?;
         if let Some((t, g, c)) = self.sessions.lock().unwrap().get(access_key)
             && *g == generation
             && ct_eq(t.as_bytes(), token.as_bytes())
@@ -270,6 +275,9 @@ impl Auth {
         }
         let claims = crate::sts::open(key, access_key, token, now)?;
         let parent = self.creds.read().unwrap().get(&claims.parent).cloned().ok_or_else(crate::sts::invalid_token)?;
+        if !ct_eq(crate::sts::parent_fingerprint(key, &parent.secret).as_bytes(), claims.fingerprint.as_bytes()) {
+            return Err(crate::sts::invalid_token());
+        }
         let policy = match &claims.policy {
             Some(p) => Some(Arc::new(
                 crate::iam::Policy::parse(p, crate::iam::Kind::Identity, None).map_err(|_| crate::sts::invalid_token())?,
@@ -283,7 +291,12 @@ impl Auth {
             buckets: parent.buckets.clone(),
             policy: parent.policy.clone(),
             expires_ms: Some(parent.expires_ms.map_or(claims.expires_ms, |t| t.min(claims.expires_ms))),
-            session: Some(Arc::new(crate::sts::Session { parent: claims.parent, name: claims.name, policy })),
+            session: Some(Arc::new(crate::sts::Session {
+                parent: claims.parent,
+                name: claims.name,
+                token: token.to_string(),
+                policy,
+            })),
         });
         let mut cache = self.sessions.lock().unwrap();
         // A reload since `generation` was read may have changed the parent: don't cache then.
@@ -294,6 +307,13 @@ impl Auth {
             cache.insert(access_key.to_string(), (token.to_string(), generation, c.clone()));
         }
         Ok(c)
+    }
+
+    /// `c` as it is now (limits changed by a reload), or `None` if it no longer works: expired,
+    /// revoked, rotated to another secret, or a session whose key went away.
+    pub fn current(&self, c: &Credential) -> Option<Arc<Credential>> {
+        let now = self.credential(&c.access_key, c.session.as_ref().map(|s| s.token.as_str())).ok()?;
+        ct_eq(now.secret.as_bytes(), c.secret.as_bytes()).then_some(now)
     }
 
     fn principal(&self, access_key: &str, token: Option<&str>) -> Principal {
@@ -822,7 +842,8 @@ mod tests {
         let auth = doc_auth();
         let parent = "AKIAIOSFODNN7EXAMPLE";
         let now = util::now_ms();
-        let i = crate::sts::issue(&[3; 32], parent, "job", None, now + 60_000);
+        let secret = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
+        let i = crate::sts::issue(&[3; 32], parent, secret, "job", None, now + 60_000);
         // Without the server's key (not loaded) or without the token, the key is unknown.
         assert_eq!(auth.credential(&i.access_key, Some(&i.token)).unwrap_err().code, "InvalidAccessKeyId");
         auth.set_session_key([3; 32]);
@@ -831,11 +852,15 @@ mod tests {
         assert_eq!((c.secret.as_str(), c.identity()), (i.secret.as_str(), parent));
         // Cached, and still checked against the token.
         assert!(auth.credential(&i.access_key, Some(&i.token)).is_ok());
-        let other = crate::sts::issue(&[3; 32], parent, "job", None, now + 60_000);
+        let other = crate::sts::issue(&[3; 32], parent, secret, "job", None, now + 60_000);
         assert_eq!(auth.credential(&i.access_key, Some(&other.token)).unwrap_err().code, "InvalidToken");
         // The parent's limits apply, and the session goes away with the parent.
-        auth.replace(vec![Credential { read_only: true, ..(*auth.credential(parent, None).unwrap()).clone() }]);
+        let parent_cred = (*auth.credential(parent, None).unwrap()).clone();
+        auth.replace(vec![Credential { read_only: true, ..parent_cred.clone() }]);
         assert!(auth.credential(&i.access_key, Some(&i.token)).unwrap().read_only);
+        // Rotating the parent's secret ends its sessions.
+        auth.replace(vec![Credential { secret: "rotated".into(), ..parent_cred }]);
+        assert_eq!(auth.credential(&i.access_key, Some(&i.token)).unwrap_err().code, "InvalidToken");
         auth.replace(vec![]);
         assert_eq!(auth.credential(&i.access_key, Some(&i.token)).unwrap_err().code, "InvalidToken");
     }

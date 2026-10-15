@@ -153,6 +153,8 @@ jobs:
         run: python3 tests/backup.py ./target/release/s3rs
       - name: replication between two servers
         run: python3 tests/replication.py ./target/release/s3rs
+      - name: rate limits
+        run: python3 tests/ratelimit.py ./target/release/s3rs
       - name: HTTP fuzzing (mutated requests; no 500s, no panics)
         run: python3 tests/fuzz_http.py ./target/release/s3rs 20000
       - name: disk full (100 MB tmpfs)

@@ -117,6 +117,9 @@ Each flag can also be set with the environment variable shown (switches take `1`
 | `--inline-threshold` | `S3RS_INLINE_THRESHOLD` | `65536` | Objects up to this many bytes are stored inside the metadata DB |
 | `--cache-mb` | `S3RS_CACHE_MB` | `256` | Metadata cache size |
 | `--max-connections` | `S3RS_MAX_CONNECTIONS` | from the fd limit, ≤ 10000 | Stops accepting beyond this many open connections (see [Limits and timeouts](#limits-and-timeouts)) |
+| `--rate-limit` | `S3RS_RATE_LIMIT` | off | Requests per second per access key |
+| `--rate-limit-anonymous` | `S3RS_RATE_LIMIT_ANONYMOUS` | off | Requests per second per client address for unsigned requests |
+| `--replication-targets` | `S3RS_REPLICATION_TARGETS` | | Remote servers for bucket replication (see [Replication](#replication)) |
 | `--min-free-space` | `S3RS_MIN_FREE_SPACE` | 2% of the disk (16M–256M) | Refuses uploads when the data disk's free space would drop below this (e.g. `512M`, `2G`; `0` turns the reserve off, but after the ballast file was used, uploads still wait until it can be recreated). See [Disk space](#disk-space). |
 | `--no-fsync` | `S3RS_NO_FSYNC` | off | Skips fsync. Faster, but a crash or power loss can lose about the last second of acknowledged writes. |
 | `--access-log` | `S3RS_ACCESS_LOG` | off | Logs every request to stdout as `json` or `text` (see [Access logs](#access-logs)) |
@@ -148,6 +151,7 @@ thousands of slow transfers don't starve anything else. On top of that:
 | Client accepts no response data | connection closed after 120 s with no progress (a slow but steady reader is fine) |
 | HTTP/2 peer stops answering pings | closed (pinged every 30 s) |
 | Open connections | `--max-connections`. Beyond it s3rs stops accepting and new connections wait in the kernel's queue. |
+| Request rate (optional) | `--rate-limit` per access key and `--rate-limit-anonymous` per client address for unsigned requests: public reads, websites and browser uploads. Bursts of two seconds' worth pass. Beyond that, requests get `503 SlowDown` with `Retry-After`, which AWS SDKs retry automatically. `/_health` and `/_metrics` are never limited. |
 
 At startup s3rs raises its open-file limit to the hard limit. The default connection limit is half
 of that (each transfer needs a socket and a file), at most 10,000. `/_metrics` exports

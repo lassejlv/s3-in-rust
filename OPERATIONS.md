@@ -94,6 +94,7 @@ Scrape `/_metrics` (Prometheus text format) and load
 | `s3rs_requests_in_flight` | stuck or piling-up requests |
 | `s3rs_notifications_total{result}` | `failed`/`dropped` webhook deliveries |
 | `s3rs_access_log_dropped_total` | stdout not keeping up with the access log |
+| `s3rs_throttled_requests_total` | clients hitting `--rate-limit` / `--rate-limit-anonymous` |
 | `s3rs_replication_pending`, `s3rs_replication_lag_seconds` | a growing replication backlog (target down, or writes outpacing it) |
 | `s3rs_replication_total{result}` | `failed` replication attempts (the log says why) |
 | `s3rs_bucket_objects`, `s3rs_bucket_bytes` | growth per bucket (served only with a metrics token) |

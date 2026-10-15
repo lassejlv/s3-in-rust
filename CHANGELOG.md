@@ -44,6 +44,7 @@ First release.
   Docker `HEALTHCHECK` use it.
 - Native HTTPS with certificate reload, as the optional `tls` build feature.
 - Idle timeouts, a connection limit, and slow clients that never hold threads.
+- Optional request rate limits per access key and per client address (`503 SlowDown`).
 - Release binaries for Linux x86_64 and arm64, container images, a hardened systemd unit and
   Prometheus alert rules.
 

@@ -25,6 +25,8 @@ pub struct Metrics {
     latency_sum_us: AtomicU64,
     bytes_in: AtomicU64,
     bytes_out: AtomicU64,
+    /// Requests refused by the rate limits.
+    pub throttled: AtomicU64,
     pub lifecycle: std::sync::Arc<crate::lifecycle::Stats>,
     pub events: std::sync::Arc<crate::events::Stats>,
     pub replication: std::sync::Arc<crate::replication::Stats>,
@@ -120,6 +122,11 @@ impl Metrics {
         {
             let _ = writeln!(o, "s3rs_notifications_total{{result=\"{name}\"}} {}", v.load(Relaxed));
         }
+        let _ = writeln!(
+            o,
+            "# TYPE s3rs_throttled_requests_total counter\ns3rs_throttled_requests_total {}",
+            self.throttled.load(Relaxed)
+        );
         let r = &self.replication;
         let _ = writeln!(o, "# TYPE s3rs_replication_total counter");
         for (name, v) in

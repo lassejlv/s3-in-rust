@@ -58,6 +58,10 @@ pub struct Options {
     pub events: Arc<events::Bus>,
     /// Bucket replication to remote servers.
     pub replication: Arc<crate::replication::Replicator>,
+    /// Requests per second allowed per access key, and per client address for unsigned
+    /// requests (`None`: unlimited).
+    pub rate_limit: Option<u32>,
+    pub rate_limit_anonymous: Option<u32>,
 }
 
 pub struct Server {
@@ -85,6 +89,8 @@ pub struct Server {
     tls: bool,
     pub events: Arc<events::Bus>,
     pub replication: Arc<crate::replication::Replicator>,
+    key_limit: Option<crate::ratelimit::Limiter>,
+    anon_limit: Option<crate::ratelimit::Limiter>,
     /// Weak self-reference, for background tasks that must re-check permissions.
     me: std::sync::OnceLock<std::sync::Weak<Server>>,
     req_counter: AtomicU64,
@@ -383,6 +389,8 @@ impl Server {
             tls: opts.tls,
             events: opts.events,
             replication: opts.replication,
+            key_limit: opts.rate_limit.map(crate::ratelimit::Limiter::new),
+            anon_limit: opts.rate_limit_anonymous.map(crate::ratelimit::Limiter::new),
             me: std::sync::OnceLock::new(),
             req_counter: AtomicU64::new(1),
             rid_base: util::new_id() as u64,
@@ -772,8 +780,12 @@ impl Server {
     async fn website(&self, parts: &Parts, rid: &str, peer: SocketAddr) -> Resp {
         let head = parts.method == Method::HEAD;
         let anon = Principal::Anonymous;
-        let ctx = self.ctx(&anon, &parts.headers, &[], self.client(&parts.headers, peer), "REST-HEADER");
+        let client = self.client(&parts.headers, peer);
+        let ctx = self.ctx(&anon, &parts.headers, &[], client, "REST-HEADER");
         let page = |e: S3Error| website_error(&e, head, rid);
+        if let Err(e) = self.throttle(&anon, client.ip) {
+            return page(e);
+        }
         if !matches!(parts.method, Method::GET | Method::HEAD) {
             return page(err::MethodNotAllowed());
         }
@@ -1057,6 +1069,7 @@ impl Server {
         if let Principal::User(c) = &principal {
             rec.user = Some(c.access_key.clone());
         }
+        self.throttle(&principal, self.client(&parts.headers, peer).ip)?;
         let query = parse_query(raw_query);
         let body = BodyStream::new(body, &mut payload);
         let auth_type = if r_has_auth_header(&parts) { "REST-HEADER" } else { "REST-QUERY-STRING" };
@@ -2146,6 +2159,23 @@ impl Server {
         Ok(None)
     }
 
+    /// Enforce the request rate limits: per access key for signed requests, per client address
+    /// otherwise.
+    fn throttle(&self, principal: &Principal, ip: IpAddr) -> S3Result<()> {
+        let refused = match principal {
+            Principal::User(c) => self.key_limit.as_ref().map(|l| l.check(&c.access_key)),
+            _ => self.anon_limit.as_ref().map(|l| l.check(&ip.to_string())),
+        };
+        match refused {
+            Some(Err(wait)) => {
+                self.metrics.throttled.fetch_add(1, Ordering::Relaxed);
+                Err(S3Error::new("SlowDown", StatusCode::SERVICE_UNAVAILABLE, "Please reduce your request rate.")
+                    .with_header("retry-after", wait.as_secs().max(1).to_string()))
+            }
+            _ => Ok(()),
+        }
+    }
+
     /// The current object, or a specific version when `version` is given.
     fn lookup(&self, bucket: &str, key: &str, version: Option<&str>) -> S3Result<(ObjectMeta, Option<Bytes>)> {
         match version {
@@ -2615,6 +2645,8 @@ impl Server {
         rid: &str,
     ) -> S3Result<Resp> {
         let client = self.client(&parts.headers, peer);
+        // Browser uploads authenticate only after the form is read: limit them per address.
+        self.throttle(&Principal::Anonymous, client.ip)?;
         let mut payload = Payload::Unsigned;
         let stream = BodyStream::new(body, &mut payload);
         let (form, file) = crate::post::parse_form(stream, boundary).await?;

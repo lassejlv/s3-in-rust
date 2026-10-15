@@ -29,6 +29,7 @@ mod lock;
 mod metrics;
 mod ops;
 mod post;
+mod ratelimit;
 mod replication;
 mod s3;
 mod store;
@@ -115,6 +116,11 @@ OPTIONS (each also settable through the environment variable shown):
         --inline-threshold <N>   Objects up to N bytes are stored inside the metadata DB
                                                                  [S3RS_INLINE_THRESHOLD, default 65536]
         --cache-mb <N>           Metadata cache size in MiB      [S3RS_CACHE_MB, default 256]
+        --rate-limit <N>         Requests per second per access key (bursts of 2 s worth;
+                                 more get 503 SlowDown)          [S3RS_RATE_LIMIT, default off]
+        --rate-limit-anonymous <N> Requests per second per client address for unsigned
+                                 requests (public buckets, websites, browser uploads)
+                                                                 [S3RS_RATE_LIMIT_ANONYMOUS, default off]
         --max-connections <N>    Stop accepting connections beyond N (new ones wait in the
                                  kernel's queue) [S3RS_MAX_CONNECTIONS, default from the
                                  file descriptor limit, at most 10000]
@@ -148,6 +154,8 @@ struct Config {
     webhook_secret: Option<String>,
     webhook_ca: Option<PathBuf>,
     replication_targets: Option<PathBuf>,
+    rate_limit: Option<u32>,
+    rate_limit_anonymous: Option<u32>,
     tls_cert: Option<PathBuf>,
     tls_key: Option<PathBuf>,
     encryption_key: Option<[u8; 32]>,
@@ -211,6 +219,11 @@ fn parse_args() -> Result<Config, String> {
         webhook_secret: env("S3RS_WEBHOOK_SECRET"),
         webhook_ca: env("S3RS_WEBHOOK_CA").map(PathBuf::from),
         replication_targets: env("S3RS_REPLICATION_TARGETS").map(PathBuf::from),
+        rate_limit: env("S3RS_RATE_LIMIT").map(|v| parse_rate("S3RS_RATE_LIMIT", &v)).transpose()?.flatten(),
+        rate_limit_anonymous: env("S3RS_RATE_LIMIT_ANONYMOUS")
+            .map(|v| parse_rate("S3RS_RATE_LIMIT_ANONYMOUS", &v))
+            .transpose()?
+            .flatten(),
         tls_cert: env("S3RS_TLS_CERT").map(PathBuf::from),
         tls_key: env("S3RS_TLS_KEY").map(PathBuf::from),
         encryption_key: env_key()?,
@@ -276,6 +289,8 @@ fn parse_args() -> Result<Config, String> {
             "--webhook-secret" => c.webhook_secret = Some(val()?),
             "--webhook-ca" => c.webhook_ca = Some(val()?.into()),
             "--replication-targets" => c.replication_targets = Some(val()?.into()),
+            "--rate-limit" => c.rate_limit = parse_rate("--rate-limit", &val()?)?,
+            "--rate-limit-anonymous" => c.rate_limit_anonymous = parse_rate("--rate-limit-anonymous", &val()?)?,
             "--tls-cert" => c.tls_cert = Some(val()?.into()),
             "--tls-key" => c.tls_key = Some(val()?.into()),
             "--encryption-key" => c.encryption_key = Some(parse_key(&val()?).map_err(|e| format!("--encryption-key: {e}"))?),
@@ -355,6 +370,12 @@ fn parse_size(v: &str) -> Result<u64, String> {
 }
 
 /// `S3RS_WEBHOOKS`: comma-separated `id=url` entries with unique ids.
+/// A requests-per-second limit; 0 means none.
+fn parse_rate(what: &str, v: &str) -> Result<Option<u32>, String> {
+    let n: u32 = v.trim().parse().map_err(|_| format!("{what}: expected a number of requests per second, got `{v}`"))?;
+    Ok((n > 0).then_some(n))
+}
+
 fn parse_webhooks(v: &str) -> Result<Vec<(String, events::Url)>, String> {
     let mut out: Vec<(String, events::Url)> = Vec::new();
     for w in split_list(v) {
@@ -897,6 +918,8 @@ async fn serve(
             repl_tls,
             cfg.encryption_key.map(|k| crypt::WrapKey::new(crypt::KeyKind::Master, k)),
         ),
+        rate_limit: cfg.rate_limit,
+        rate_limit_anonymous: cfg.rate_limit_anonymous,
     };
     let server = Arc::new(s3::Server::new(store.clone(), auth, opts));
     server.set_self();

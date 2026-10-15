@@ -456,6 +456,8 @@ serves TLS, and with `--behind-proxy` they use the scheme from `X-Forwarded-Prot
 - sizing, plus Prometheus alert rules ([`deploy/prometheus-alerts.yml`](deploy/prometheus-alerts.yml))
 - backup schedules, upgrades and downgrades, and incident runbooks
 
+[SECURITY.md](SECURITY.md) has the threat model and how to report a vulnerability.
+
 ## Usage and quotas
 
 The server keeps a running count of each bucket's stored object versions and bytes. It is updated

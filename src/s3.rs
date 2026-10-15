@@ -62,6 +62,8 @@ pub struct Options {
     /// requests (`None`: unlimited).
     pub rate_limit: Option<u32>,
     pub rate_limit_anonymous: Option<u32>,
+    /// Apply a public access block with all settings on to every bucket.
+    pub block_public_access: bool,
 }
 
 pub struct Server {
@@ -101,6 +103,7 @@ pub struct Server {
     next_key_expiry: AtomicU64,
     completed: std::sync::Mutex<Completed>,
     anon_limit: Option<crate::ratelimit::Limiter>,
+    block_public_access: bool,
     /// Weak self-reference, for background tasks that must re-check permissions.
     me: std::sync::OnceLock<std::sync::Weak<Server>>,
     req_counter: AtomicU64,
@@ -427,6 +430,7 @@ impl Server {
             next_key_expiry: AtomicU64::new(u64::MAX),
             completed: std::sync::Mutex::new(Completed::default()),
             anon_limit: opts.rate_limit_anonymous.map(crate::ratelimit::Limiter::new),
+            block_public_access: opts.block_public_access,
             me: std::sync::OnceLock::new(),
             req_counter: AtomicU64::new(1),
             rid_base: util::new_id() as u64,
@@ -487,7 +491,9 @@ impl Server {
             .bucket_config(bucket, "public-access-block")?
             .and_then(|v| xml::parse(&String::from_utf8_lossy(&v)))
             .and_then(|d| access::PublicAccessBlock::parse(&d).ok())
-            .unwrap_or_default();
+            .unwrap_or_default()
+            // The server-wide block applies on top of the bucket's own (the stricter wins).
+            .or(self.block_public_access.then_some(access::PublicAccessBlock::ALL));
         let ownership = self
             .store
             .bucket_config(bucket, "ownership")?

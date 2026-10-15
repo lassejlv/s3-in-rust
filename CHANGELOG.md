@@ -43,7 +43,8 @@ First release.
 
 **Access control**
 - Public access blocks (BlockPublicAcls, IgnorePublicAcls, BlockPublicPolicy,
-  RestrictPublicBuckets) and bucket ownership controls, as set by tools such as Terraform.
+  RestrictPublicBuckets) and bucket ownership controls, as set by tools such as Terraform;
+  `--block-public-access` applies the block to every bucket.
 - Several access keys from a credentials file (reloaded on SIGHUP): read-only keys,
   bucket-limited keys, and IAM-style policies per key or bucket (conditions, variables, explicit
   Deny).

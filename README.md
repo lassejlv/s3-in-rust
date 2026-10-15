@@ -108,6 +108,7 @@ Each flag can also be set with the environment variable shown (switches take `1`
 | `--webhook-timeout` | `S3RS_WEBHOOK_TIMEOUT` | `10` | Seconds a webhook may take to answer |
 | `--webhook-ca` | `S3RS_WEBHOOK_CA` | | Extra PEM CA certificates trusted for `https://` webhooks |
 | `--lifecycle-interval` | `S3RS_LIFECYCLE_INTERVAL` | `3600` | Seconds between lifecycle sweeps. `0` turns lifecycle off. |
+| `--block-public-access` | `S3RS_BLOCK_PUBLIC_ACCESS=1` | off | Treat every bucket as having a public access block with all four settings on: nothing can be made public |
 | `--scrub-interval` | `S3RS_SCRUB_INTERVAL` | off | Re-read and verify all stored data in the background, a pass every interval (e.g. `7d`) |
 | `--scrub-rate` | `S3RS_SCRUB_RATE` | `32` | MiB/s read at most while scrubbing |
 | `--encryption-key` | `S3RS_ENCRYPTION_KEY` | | Master key for SSE-S3, as 64 hex characters or base64 (e.g. `openssl rand -hex 32`) |
@@ -394,7 +395,8 @@ in `x-amz-acl` on uploads), `IgnorePublicAcls` makes a public ACL behave as priv
 `BlockPublicPolicy` refuses bucket policies that grant public access, and `RestrictPublicBuckets`
 stops a public policy from giving anonymous callers anything. With the `BucketOwnerEnforced`
 ownership control, ACLs other than `bucket-owner-full-control` are refused
-(`AccessControlListNotSupported`).
+(`AccessControlListNotSupported`). `--block-public-access` applies all four settings to every bucket
+on top of its own, like S3's account-level block.
 
 **CORS.** `PutBucketCors`, `GetBucketCors` and `DeleteBucketCors` are supported. `OPTIONS` preflight
 requests are answered without authentication. Matching responses get `Access-Control-*` headers, and

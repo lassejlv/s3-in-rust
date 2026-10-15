@@ -522,6 +522,22 @@ pub struct PublicAccessBlock {
     pub restrict: bool,
 }
 
+impl PublicAccessBlock {
+    pub const ALL: PublicAccessBlock =
+        PublicAccessBlock { block_acls: true, ignore_acls: true, block_policy: true, restrict: true };
+
+    /// Both blocks combined (each setting on if it is on in either).
+    pub fn or(self, other: Option<PublicAccessBlock>) -> PublicAccessBlock {
+        let o = other.unwrap_or_default();
+        PublicAccessBlock {
+            block_acls: self.block_acls || o.block_acls,
+            ignore_acls: self.ignore_acls || o.ignore_acls,
+            block_policy: self.block_policy || o.block_policy,
+            restrict: self.restrict || o.restrict,
+        }
+    }
+}
+
 const PAB_FIELDS: [&str; 4] = ["BlockPublicAcls", "IgnorePublicAcls", "BlockPublicPolicy", "RestrictPublicBuckets"];
 
 impl PublicAccessBlock {

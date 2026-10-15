@@ -124,6 +124,8 @@ OPTIONS (each also settable through the environment variable shown):
         --cache-mb <N>           Metadata cache size in MiB      [S3RS_CACHE_MB, default 256]
         --rate-limit <N>         Requests per second per access key (bursts of 2 s worth;
                                  more get 503 SlowDown)          [S3RS_RATE_LIMIT, default off]
+        --block-public-access    Block public access to every bucket, as if each had a public
+                                 access block with all four settings on [S3RS_BLOCK_PUBLIC_ACCESS=1]
         --rate-limit-anonymous <N> Requests per second per client address for unsigned
                                  requests (public buckets, websites, browser uploads)
                                                                  [S3RS_RATE_LIMIT_ANONYMOUS, default off]
@@ -166,6 +168,7 @@ struct Config {
     replication_targets: Option<PathBuf>,
     rate_limit: Option<u32>,
     rate_limit_anonymous: Option<u32>,
+    block_public_access: bool,
     tls_cert: Option<PathBuf>,
     tls_key: Option<PathBuf>,
     encryption_key: Option<[u8; 32]>,
@@ -227,6 +230,7 @@ fn parse_args() -> Result<Config, String> {
         admin_token: env("S3RS_ADMIN_TOKEN"),
         console: !env_flag("S3RS_NO_CONSOLE")?,
         behind_proxy: env_flag("S3RS_BEHIND_PROXY")?,
+        block_public_access: env_flag("S3RS_BLOCK_PUBLIC_ACCESS")?,
         webhooks: env("S3RS_WEBHOOKS").map(|v| parse_webhooks(&v)).transpose()?.unwrap_or_default(),
         webhook_secret: env("S3RS_WEBHOOK_SECRET"),
         webhook_timeout: env("S3RS_WEBHOOK_TIMEOUT")
@@ -297,6 +301,7 @@ fn parse_args() -> Result<Config, String> {
             "--admin-token" => c.admin_token = Some(val()?),
             "--no-console" => c.console = false,
             "--behind-proxy" => c.behind_proxy = true,
+            "--block-public-access" => c.block_public_access = true,
             "--webhook" => {
                 let w = parse_webhook(&val()?)?;
                 if c.webhooks.iter().any(|(id, _)| *id == w.0) {
@@ -977,6 +982,7 @@ async fn serve(
         ),
         rate_limit: cfg.rate_limit,
         rate_limit_anonymous: cfg.rate_limit_anonymous,
+        block_public_access: cfg.block_public_access,
     };
     let file_keys = if auth.is_some() { creds } else { Vec::new() };
     let server = Arc::new(s3::Server::new(store.clone(), auth, opts));
